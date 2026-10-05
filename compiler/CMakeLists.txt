@@ -4,8 +4,8 @@ project(rxcc CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# ANTLR 运行时（已装在 ~/antlr4-4.13.1）
-find_package(antlr4-runtime 4.13.1 REQUIRED)
+# ANTLR 运行时（已装在 ~/antlr4-4.13.1；HINTS 让 VSCode 插件不带 -DCMAKE_PREFIX_PATH 时也能找到）
+find_package(antlr4-runtime 4.13.1 REQUIRED HINTS "$ENV{HOME}/antlr4-4.13.1")
 find_package(Java REQUIRED COMPONENTS Runtime)
 
 # 生成 C++ 解析器到构建目录
@@ -34,8 +34,7 @@ add_custom_command(
     COMMENT "Generating ANTLR C++ sources")
 
 file(GLOB_RECURSE MY_SRCS CONFIGURE_DEPENDS src/*.cpp)
-file(GLOB_RECURSE MY_SRCS CONFIGURE_DEPENDS src/ast/*.cpp)
 
 add_executable(rxcc ${MY_SRCS} ${GEN_SRCS})
-target_include_directories(rxcc PRIVATE ${GEN_DIR} ${ANTLR4_INCLUDE_DIR})
+target_include_directories(rxcc PRIVATE ${GEN_DIR} ${ANTLR4_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(rxcc PRIVATE antlr4_static)

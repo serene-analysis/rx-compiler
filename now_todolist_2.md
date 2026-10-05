@@ -140,6 +140,44 @@ struct BinaryExpr : Expr {
 
 写一条规则就现场做一次三问，把结论记在一个 notes 文件里；两条规则能共用同一节点就合并。不要一次规划全部 147 条。
 
+**worked example：`functionDefinition` 的每个孩子**
+
+```
+functionDefinition
+  : FN identifier genericParams? LPAREN functionParameters? RPAREN
+    (ARROW typeRef)? whereClause? blockExpression ;
+```
+
+| 孩子 | 属于哪类 | 怎么处理 |
+|---|---|---|
+| `identifier` | 名字 | `ctx->identifier()->getText()` 存字符串 |
+| `genericParams` | 无 | 忽略（Rx 的泛型参数只有 lifetime，规范允许丢） |
+| `functionParameters` | 一串值（脚手架） | **不 override**；在 `visitFunctionDefinition` 里遍历 `fp->selfParam()` / `fp->functionParam()`，拼成 `std::vector<Param>` 存进 `FnDef` |
+| `typeRef` | `Type` | `anyType(visit(ctx->typeRef()))`；注意这里是**返回类型**，参数的 `typeRef` 嵌在 `functionParam` 里，取不到 |
+| `whereClause` | 无 | 忽略 |
+| `blockExpression` | `Expr`（实际是 `Block`） | `anyExpr(visit(ctx->blockExpression()))`；需要 `Block*` 时 `static_cast<Block*>`（语法保证它一定是块） |
+
+`selfParam` 也在这个表里一并处理（不 override）：名字固定 `"self"`，`AMP()` 判断是否引用，`MUT()` 判断 mut，`SELF_VALUE()` 忽略；类型按 `Self` / `&Self` / `&mut Self` 构造，`lifetime` 丢弃。
+
+**worked example：`structDefinition` 的每个孩子**
+
+```
+structDefinition
+  : outerAttribute* STRUCT identifier genericParams? whereClause?
+    LBRACE (structField (COMMA structField)* COMMA?)? RBRACE ;
+```
+
+| 孩子 | 属于哪类 | 怎么处理 |
+|---|---|---|
+| `outerAttribute` | 语义信息，**不能丢** | 不 override；`for (auto* attr : ctx->outerAttribute()) for (auto* d : attr->deriveName()) derives.push_back(d->getText())`，存 `"Copy"`/`"Clone"`/`"PartialEq"`/`"Eq"` |
+| `identifier` | 名字 | `getText()` |
+| `genericParams` / `whereClause` | 无 | 忽略（只有 lifetime） |
+| `structField` | 一串值（脚手架） | 不 override；每个字段 `f->identifier()->getText()` + `anyType(visit(f->typeRef()))`，拼成 `std::vector<StructField>` |
+
+> 区分：`use`、`lifetime`、`genericParams`、`whereClause` 可以丢；**attribute 里装的是 derive 能力，必须保留名字**。
+
+判断口诀：**有语义的值 → 按六类映射；一串值 → 父节点里读；纯语法脚手架 → 忽略。**
+
 ### 1.8 名字的两种身份（声明 vs 使用）
 
 `let mut x = 3;` 里的 `x` **不是节点**，只是 `LetStmt` 上的字符串字段：
@@ -223,6 +261,35 @@ Crate
 
 块尾表达式不属于 `Stmt`，存在 `Block.tail`。
 
+**`statement` 里的 `expressionWithBlock` / `statementExpression` 是什么**：它们是"表达式语句"——Rust/Rx 里一个表达式后面加分号、丢弃值，就是一个语句。所以 `Stmt` 只有两种：`Let` 和 `Expr`（包一个表达式）。具体分工：
+
+- `expressionWithBlock`：块状表达式（`{...}`、`if`、`loop`、`while`），分号可省；
+- `statementExpression`：普通表达式链在"语句开头"位置的副本（消歧义用），必须有分号；
+- 单独一个 `;` 是空语句，AST 直接跳过。
+
+**块尾的特殊规则（容易写错）**：规范原文：*"Even though the formal grammar permits parsing an un-semicoloned ExpressionWithBlock under statement sequences, in the final position of a block it acts as the block's tail expression and determines the block's value."* 实测：
+
+```rust
+let x: i32 = { if true { 1 } else { 2 } };  // x = 1
+let y: i32 = { loop { break 5; } };          // y = 5
+```
+
+所以 `visitBlockExpression` 不能只看 `statementExpression?` 那个孩子：最后一个 `statement` 如果是 **无分号的 `expressionWithBlock`**（`st->SEMI() == nullptr`）且后面没有 `statementExpression`，它其实是块的 `tail_`，不是语句。算法：
+
+```
+for (i, st) in ctx->statement():
+    if st 是 letStatement          -> Stmt(LET)
+    elif st 是 statementExpression -> Stmt(EXPR)（这种必有分号）
+    elif st 是 expressionWithBlock:
+        if st->SEMI() == nullptr 且 i 是最后一个 且 ctx->statementExpression() 为空
+            -> block->tail_ = visit(expressionWithBlock)
+        else -> Stmt(EXPR, visit(expressionWithBlock))
+    else（只有分号）               -> 跳过
+if ctx->statementExpression() 非空 -> block->tail_ = visit(它)
+```
+
+`visitExpressionWithBlock` 和 `visitStatementExpression` 都返回 `Expr*`（前者分发给 block/if/loop/while，后者是包装规则直接转发）。
+
 #### Type（一个节点 + kind 就够）
 
 | kind | 字段 | 例子 |
@@ -236,6 +303,58 @@ Crate
 
 `&&T` 是两层 `REF`。例：`&mut Vec<Box<i32>>` → `REF(mut, VEC(BOX(BUILTIN i32)))`。
 
+`&&T` / `&&mut T`：`ANDAND` 产生两层 `REF`，`MUT` 属于**内层**——`&&mut T` = `&(&mut T)`，`&&T` = `&(&T)`；`lifetime`（`&'a T`）丢弃。表达式里的前缀 `&&x` 同理。
+
+**`typePath` 的文法怎么读**（`typePath : typePathSegment (PATHSEP typePathSegment)*`，`typePathSegment : pathIdentSegment (PATHSEP? genericArgs)?`）：
+
+- 一段就是一个名字（`pathIdentSegment`，`::` 连接多段，像 Python 的 `a.b.c` 换成 `::`）；
+- 名字后面可以跟尖括号类型参数 `genericArgs`（像 C++ 的 `vector<int>`），`PATHSEP?` 表示 `Vec::<i32>` 和 `Vec<i32>` 两种写法都合法；
+- `genericArg : lifetime | typeRef`，所以 `Vec<&'a i32>` 里混的 `'a` 要丢掉。
+
+例子与 `Type` 节点对应：
+
+| 写法 | 解析结果 |
+|---|---|
+| `i32`、`bool` | `BUILTIN(name)` |
+| `Point`、`Self` | `STRUCT(name)` |
+| `Box<i32>` | `BOX(elem=i32)` |
+| `Vec::<Point>` | `VEC(elem=Point)`（`::` 有无都一样） |
+| `Vec<Box<i32>>` | `VEC(elem=BOX(i32))`（递归） |
+| `std::boxed::Box<i32>` | 多段路径，取最后一段 `Box` + 它的实参（Rx 无模块/导入解析，测试不用多段路径引名） |
+
+所以 `visitTypePath` 只要"取最后一段的名字 + 该段的类型实参（跳过 lifetime）"，归一化成 `BUILTIN/STRUCT/BOX/VEC`，不需要为路径建 vector 字段。
+
+**`genericClose` 是干什么的**：泛型的右尖括号收尾。`Vec<Box<i32>>` 末尾的 `>>` 会被 lexer 拆成 `GT` + `GT_SECOND` 两个 token，`genericClose : GT | GT_SECOND` 就是吃这个收尾的语法包装（同时也让 `Vec<i32>=...` 里的 `>=` 拆成 `>` + `=` 各归各家）。纯标点，AST 里直接忽略，`visitGenericClose` 不用写。
+
+**`closedCastType` 是什么**：`as` 转换目标的一种"受限类型写法"，用来消解 `x as T < y` 的歧义（`<` 到底是泛型实参开头还是比较运算）。文法里只有这几种"收口"写法能安全地后跟 `<` 或 `<<`：
+
+```
+closedCastType
+  : LPAREN typeRef? RPAREN                         // (T) / ()
+  | arrayType                                       // [T; N]
+  | (AMP | ANDAND) lifetime? MUT? closedCastType    // &T / &&mut T
+  | (typePathSegment PATHSEP)* pathIdentSegment PATHSEP? genericArgs   // 必须以泛型实参收尾，如 Vec<i32>
+  ;
+```
+
+- 注意最后一条 `genericArgs` 是**必须的**：`x as Vec<i32> < y` 解析为 `(x as Vec<i32>) < y`；而裸名字 `x as T < y` 会把 `<` 当泛型实参开头（负例就是考这个：链式比较 `a < b < c` 不允许，必须加括号）。
+- 它只出现在 cast 系列规则里（`castExpression ... AS closedCastType`、`closedCastExpression`、condition/statement/conditionBreak 的对应变体）。
+- AST 里当普通 `Type*` 处理即可：`LPAREN typeRef? RPAREN` → 有 `typeRef` 就递归、否则 `UNIT`；`arrayType` → 递归；`&/&&` → 包 `REF`（`&&` 两层、`MUT` 属内层）；最后一条 → 和 `typePath` 同样的"名字 + 泛型实参"归一化。
+
+**路径前缀段为什么不重要**：类型路径的前缀是**模块限定**（`std::boxed::Box` 里 `std::boxed` 是模块），而 Rx 没有模块、没有导入解析（`use` 丢弃、测试也不靠它引入名字），类型的身份就是最后一段的名字。所以 `typePath` / `closedCastType` 都只看最后一段。
+
+表达式路径不一样：`Self::LIMIT`、`Box::<i32>::new`、`Config::COUNT` 里的前缀是语义的一部分（限定到某个类型/命名空间），所以 `PathExpr` 必须保存完整段表 `vector<PathSeg>`。
+
+**写 `visitPathInExpression` 和 `visitClosedCastType` 的要点**：
+
+- `visitPathInExpression` **不能照 typePath 归一化**：表达式路径保留全部段，`vector<PathSeg>`，每段 `name = seg->pathIdentSegment()->getText()`，`typeArgs` 从 `seg->genericArgs()` 取（`genericArg()->typeRef()`，lifetime 跳过）；返回 `static_cast<Expr*>`。
+- `visitClosedCastType` 是 `visitTypeRef` + `visitReferenceType` 的合体：
+  - `ctx->typeRef()` 非空 → 直接 `visit`（括号里的类型）；否则若 `ctx->LPAREN()` 存在 → `UNIT`；
+  - `ctx->arrayType()` 非空 → 直接 `visit`；
+  - `ctx->closedCastType()` 非空 → 递归后包 `REF`（`ANDAND` 两层，`MUT` 属内层）；
+  - 其余是 path 分支：取 `ctx->pathIdentSegment()` + 直接孩子的 `ctx->genericArgs()`，按 typePath 的方式归一化（前缀 `typePathSegment` 忽略）。
+- 把"名字 + 类型实参 → `BUILTIN/STRUCT/BOX/VEC`"抽成私有 helper（例如 `Type* namedType(const std::string&, std::vector<Type*>)`），`visitTypePath` 和 `visitClosedCastType` 共用。
+
 #### ConstVal
 
 | kind | 字段 | 例子 |
@@ -244,6 +363,8 @@ Crate
 | `NEG` | `inner` | `-1`、`-N` |
 
 用在：const 项初始化式、数组类型长度、`[v; N]` 的长度。
+
+`constValue` 里的 `pathInExpression` 是**常量路径**（`N`、`Config::LIMIT`、`Self::LIMIT`），不是普通表达式：**不要 `visitPathInExpression`**，直接 `ctx->pathInExpression()->getText()` 存进 `ConstVal` 的 PATH（文本；sema 再做限定/解析）。`MINUS magnitude` → `NEG(inner)`；`( constValue )` 剥掉括号直接递归；整数字面量存原文（含后缀/进制/下划线），数值留到 sema 求。`magnitude` 同理（整数字面量 / 常量路径 / 括号）。
 
 #### Expr（最多的一类）
 
@@ -274,10 +395,24 @@ Crate
 | `Continue` | — | `continue;` |
 | `Return` | `Expr* value`（可空） | `return;`、`return 1;` |
 
+**结合性怎么处理**：
+
+- 二元链规则（`logicalOr`…`multiplicative` 及各家族）：`操作数 (op 操作数)*`，**左结合**，用左折叠：`left = visit(parts[0])`，然后 `for i: left = Binary(op=ops[i], lhs=left, rhs=visit(parts[i+1]))`。`a - b - c` 得到 `Binary(-, Binary(-, a, b), c)`：**左儿子是"已经折好的左半段"，右儿子是单个操作数**。
+- `assignmentExpression`：`logicalOr (assignmentOperator expression)?`，**右结合**，最多一个 op；有 op 就建 `Assign(lhs, op, rhs=visit(expression))`，没有就转发 `logicalOr`。
+- `comparisonExpression`：最多一个比较。`LT()` 非空时 lhs 是 `closedBitOrExpression()`、rhs 是 `bitOrExpression(0)`；否则 lhs = `bitOrExpression(0)`，有 `comparisonExceptLt()` 时 op = 它的 `getText()`、rhs = `bitOrExpression(1)`，没有比较符就直接转发。
+- `castExpression`：`unary (AS type)*` **左折叠**，每层包 `Cast`（`x as u32 as i32` = `Cast(Cast(x, u32), i32)`）；`closedCastExpression` 是 `unaryExpression | castExpression AS closedCastType`，最多在末尾再包一层 `Cast`。`as` 比乘除结合更紧：`a * b as u32` = `a * (b as u32)`。
+- `unaryExpression`：`unaryOperator unaryExpression | postfixExpression`，**前缀一元、右递归**，天然可叠（`!!x`、`-*p`、`&mut *p`）。`*` → `Deref`；`-`/`!` → `Unary`；`&`/`&mut` → `Ref`；`&&` → 两层 `Ref`（`MUT` 属内层）；没有前缀就转发 `postfixExpression`。后缀（调用/索引/字段）比一元绑得更紧，所以基准是 `postfixExpression`。
+- `postfixExpression`：`primary postfixSuffix*`，**从左往右叠后缀**：`callArguments` → `Call`（当前表达式当 callee）、`[e]` → `Index`、`dotSuffix` 带 `callArguments` → `MethodCall`、`dotSuffix` 只有 `identifier` → `Field`。`f(x)[0].y` 依次包成 `Field(Index(Call(f, x), 0), y)`。condition/postfix、statement/postfix 变体形状相同。
+- `nonBlockPrimary` 的 `pathInExpression (LBRACE structExprFields? RBRACE)?`：带 `{...}` 是**结构体构造**（`Point { x: 1, y: 2 }`、`Self { ... }`），字段值取 `structExprField()->expression()`（Rx 没有字段简写，必须写 `name: expr`）；不带就是普通路径表达式，交给 `visitPathInExpression`。提取路径段的代码抽成 helper，与 `visitPathInExpression` 共用。条件位置不允许不带括号的结构体构造（`conditionPrimaryWithoutBareBlock` 里没有这个分支），文法已经处理，你不用管。
+- `nonBlockPrimary` 其余分支：`literalExpression` → `IntLit`/`BoolLit`（存原文，含后缀/进制/下划线，数值留 sema）；`(e)` 透明透传、`()` → `Unit`；`arrayExpression` 靠 `SEMI()` 区分 `[a, b]`（Array）和 `[v; N]`（RepeatArray，N 是 `constValue`，用 `anyConstValue` 取）；`BREAK`/`RETURN` 操作数可空（`break;`/`return`），`CONTINUE` 无操作数。`conditionPrimaryWithoutBareBlock` 是条件版：操作数换成 `conditionBreakExpression` / `conditionExpression`，多出 if/loop/while 分支、没有结构体构造。
+- 条件/语句/conditionBreak 家族形状相同，照抄换 Context 类型。
+
 公共辅助结构：
 
 - `PathSeg { std::string name; std::vector<Type*> typeArgs; }`（`PathExpr` 和 `StructInit` 共用；`Vec::<i32>::new` 的 `<i32>` 在这里）
 - `FieldInit { std::string name; Expr* value; }`
+
+`Param` / `StructField` / `PathSeg` / `FieldInit` 都是**普通 struct，不是 Node 子类**：它们不会被 `visit`，也不放进 `std::any`，只是挂在某个节点上的数据字段。只有六类语义值才需要继承 `Node`。
 
 几个对照例子：
 
@@ -348,6 +483,70 @@ private:
 ```
 
 实现顺序仍是 1.5 的最小竖切：先让 `visitCrate` / `visitFunctionDefinition` / `visitBlockExpression` 三个跑通 `fn main() -> () {}`，再按第 7 节的顺序一类类加。
+
+**三个容易踩的坑（写第一个具体节点时就要定下来）**：
+
+1. 单孩子包装规则直接转发，不要套壳。`item`、`associatedItem` 这类规则只有一个非空孩子，直接 `return visit(那个孩子);`，不需要 `make<Item>()` 再记 type——具体子类（`FnDef` 等）自己就是 `Item` 的子类。判断哪个非空用生成的访问器：`ctx->functionDefinition()` 等。
+2. `std::any` 按**静态类型精确匹配**：具体规则的 return 必须把指针转成基类，例如 `return static_cast<Item*>(now);`（或 `Expr*`/`Stmt*`/`Type*`/`ConstValue*`/`Crate*`）。如果返回 `FnDef*`，父节点 `anyItem(...)` 会抛 `std::bad_any_cast`——即使 `FnDef` 继承自 `Item`，`any_cast` 也不做派生类到基类的转换。
+3. 被丢弃的规则（`useDeclaration`）返回 `static_cast<Item*>(nullptr)`，不要返回空 `std::any()`，否则父节点 cast 抛异常。父节点（如 `visitCrate`）拿到空指针后要判空或跳过。
+
+### 1.12 `use` 和 lifetime（含 `whereClause`）为什么可以丢
+
+规范原文依据：
+
+- Parser conventions 的 "Syntax that may be discarded after parsing"：`use` 声明整条丢弃；**lifetime 语法整段丢弃**，包括 lifetime 参数声明、引用上的 lifetime 标注、显式 lifetime 实参、outlives 约束、**where 子句里的 lifetime 约束**；不需要名称解析、推断、elision 检查或借用检查。
+- Language scope：`Type parameters and general generics` 被排除在外；`Lifetime syntax is supported, but its validity is guaranteed rather than checked.`
+- Lifetime validity 一节：编译器可以在解析后丢弃 lifetime 语法，不必带进语义分析和 IR；测试保证程序里的 lifetime 都合法。
+
+所以 `genericParams` 和 `whereClause` 可以整个忽略：Rx 里 `whereClauseItem` 只可能是 `lifetime : lifetimeBounds` 或 `typeRef : ...`，而 `TypeParamBounds` 最终也只由 lifetime 组成——没有 trait、没有真正的类型约束。
+
+**哪些 visitor 方法因此不用实现**（留着桩也行，纯死代码；想干净就把头文件那行和 `.cpp` 桩一起删）：
+
+`visitGenericParams`、`visitLifetimeParam`、`visitLifetime`、`visitLifetimeBounds`、`visitTypeParamBounds`、`visitWhereClause`、`visitWhereClauseItem`、`visitGenericClose`。
+
+**注意区分 `genericArgs`/`genericArg`**：`Vec::<i32>` 里的 `i32` 是有用的类型实参，不是 lifetime。处理方式同参数表：父节点（`typePathSegment` / `pathExprSegment` 的读取处）直接遍历 `genericArgs()->genericArg()`，遇到 `typeRef` 就 `visit` 成 `Type*`；不要给 `visitGenericArgs` 设计返回类型。
+
+规范（Language scope / use compatibility）对 `use` 的保证：
+
+- 测试里的 `use` 只是为了让同一份源码也能被参考 rustc 编译（如 `use rx::core::*;`），**不会靠它引入 Rx 里本来没有的名字**；
+- 程序用到的 `get_i32` / `print_i32` / `println_i32`、`Box` / `Vec` 在 Rx 里本来就是内建，不导入也能用；
+- 别名（`use ... as x;`）允许出现，但测试不会使用别名；
+- 违反这些保证的写法属于 UB，不会出现在正例、负例或性能测试里。
+
+所以丢弃 `use` 不会把合法测试程序误判成 CE。两个注意点：
+
+1. **语法错误仍要报**：`use` 的语法必须由 parser 正常解析，解析失败（malformed use syntax）就是语法错误、`exit 1`；我们只是"解析成功后"不把它放进 AST。
+2. **不要顺手放开未定义名字**：负例靠普通名称/类型错误来 `exit 1`，如果因为"也许来自 use"就接受未定义名字，负例会误通过。
+
+---
+
+### 1.13 AST 的"儿子"在哪里：边是字段，不是 children 数组
+
+**parse tree 和 AST 都是树，区别在"边怎么表示"：**
+
+- parse tree：每个节点有一个通用的 `children` 数组，儿子就是数组元素（连标点 token 也在里面）；
+- AST：节点用**命名字段**存子节点（或子节点 vector），这些字段就是边。例如：
+
+```
+LetStmt : name_ + init_            → init_ 指向表达式子树
+Binary  : op_ + lhs_ + rhs_        → lhs_/rhs_ 指向左右子树
+Call    : callee_ + args_(vector)  → callee_ 和每个实参是儿子
+FnDef   : parameter_(vector<Param>) + body_(Block*)
+Block   : stmts_(vector<Stmt*>) + tail_(Expr*)
+```
+
+**树是"存字段"那一刻建起来的**，不是 visitor 的调用顺序建起来的：
+
+1. visitor 是后序遍历（自底向上）：先 `visit(子)` 拿到子树根；
+2. 父节点 `make<自己>()`，把子树根存进自己的字段（`node->lhs_ = anyExpr(visit(...))`）；
+3. 父节点把自己 return 给爷爷节点，爷爷再存进自己的字段；
+4. 最后 `visitCrate` 返回根，从 `Crate*` 顺着字段能走到所有节点。
+
+**`pool_` 与树的关系**：`pool_` 只是所有节点的平铺内存（负责释放），不是树；树是那些**指针字段**构成的结构。每个节点只会被一个父字段（或一个 vector）引用，所以从 `Crate*` 可达的图就是一棵树，不会成环。
+
+**为什么现在"找不到儿子"**：因为大部分方法还是 `return visitChildren(ctx);` 的桩——字段没填，边就不存在。等 `visitBinaryExpression` 之类实现后，字段填上，树自然成形。
+
+**想看见儿子**：写 dump（打印自己 → 递归 dump 字段里的每个子节点），就是第 1.6 节的写法；或者调试时从 `Crate*` 一层层展开字段。
 
 ---
 

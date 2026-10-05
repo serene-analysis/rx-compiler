@@ -7,6 +7,10 @@
 #include "RxLexer.h"
 #include "RxParser.h"
 
+#include "ast/ast.h"
+#include "ast/ast_dump.h"
+#include "frontend/ast_builder.h"
+
 using namespace antlr4;
 
 // 只要词法/语法报错，就把 hasError 置 true
@@ -21,14 +25,17 @@ struct ErrorListener : public BaseErrorListener {
 };
 
 int main(int argc, char** argv) {
-    // 用法：rxcc [--dump-tree] --stage semantic <源文件>
-    bool dump = false;
+    // 用法：rxcc [--dump-tree] [--dump-ast] --stage semantic <源文件>
+    bool dumpTree = false;
+    bool dumpAst = false;
     std::string stage;
     std::string sourcePath;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--dump-tree") {
-            dump = true;
+            dumpTree = true;
+        } else if (arg == "--dump-ast") {
+            dumpAst = true;
         } else if (arg == "--stage" && i + 1 < argc) {
             stage = argv[++i];
         } else {
@@ -36,7 +43,7 @@ int main(int argc, char** argv) {
         }
     }
     if (stage != "semantic" || sourcePath.empty()) {
-        std::cerr << "usage: rxcc --stage semantic [--dump-tree] <source.rx>\n";
+        std::cerr << "usage: rxcc --stage semantic [--dump-tree] [--dump-ast] <source.rx>\n";
         return 1;
     }
 
@@ -67,8 +74,13 @@ int main(int argc, char** argv) {
         if (listener.hasError) {
             return 1;                              // 语法错误 → 拒绝
         }
-        if (dump) {
+        if (dumpTree) {
             std::cout << root->toStringTree(&parser) << "\n";
+        }
+        if (dumpAst) {
+            ASTVisitor visitor;
+            auto* crate = std::any_cast<Crate*>(visitor.visit(root));
+            dumpCrate(crate);
         }
 
         // TODO：下一步在这里做语义检查（名称解析 + 类型检查），先直接接受

@@ -1,6 +1,9 @@
 # Rust
 /target
 
+# VSCode CMake Tools 构建目录
+/build/
+
 # REIMU build configuration
 /.xmake/
 
