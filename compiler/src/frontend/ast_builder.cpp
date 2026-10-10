@@ -638,18 +638,22 @@ statement
 */
 
 std::any ASTVisitor::visitExpressionWithBlock(RxParser::ExpressionWithBlockContext *ctx) {
-    if (auto blk = ctx->blockExpression(); blk) { return anyExpr(visit(blk)); }
-    if (auto f = ctx->ifExpression(); f) {return anyExpr(visit(f)); }
     if (ctx->LOOP()) {
         auto now = make<loopExpr>();
         now->block_ = static_cast<blockExpr*>(anyExpr(visit(ctx->blockExpression())));
         return static_cast<Expr*>(now);
     }
-    else {
+    if (ctx->WHILE()) {
         auto now = make<whileExpr>();
         now->cond_ = anyExpr(visit(ctx->conditionExpression()));
         now->block_ = static_cast<blockExpr*>(anyExpr(visit(ctx->blockExpression())));
         return static_cast<Expr*>(now);
+    }
+    if (auto f = ctx->ifExpression()) {
+        return anyExpr(visit(f));
+    }
+    if (auto blk = ctx->blockExpression()) {
+        return anyExpr(visit(blk));
     }
     return visitChildren(ctx);
 }
@@ -2731,13 +2735,13 @@ std::any ASTVisitor::visitConditionPrimaryWithoutBareBlock(RxParser::ConditionPr
     }
     if (ctx->LOOP()) {
         auto now = make<loopExpr>();
-        now->block_ = std::any_cast<blockExpr*>(visit(ctx->blockExpression()));
+        now->block_ = static_cast<blockExpr*>(anyExpr(visit(ctx->blockExpression())));
         return static_cast<Expr*>(now);
     }
     if (ctx->WHILE()) {
         auto now = make<whileExpr>();
         now->cond_ = anyExpr(visit(ctx->conditionExpression()));
-        now->block_ = std::any_cast<blockExpr*>(visit(ctx->blockExpression()));
+        now->block_ = static_cast<blockExpr*>(anyExpr(visit(ctx->blockExpression())));
         return static_cast<Expr*>(now);
     }
     if (ctx->BREAK()) {
