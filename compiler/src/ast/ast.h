@@ -146,9 +146,9 @@ struct Type : Node {
     enum kTypeKind { BUILTIN, STRUCT, BOX, VEC, REF, ARRAY, UNIT } ;
     kTypeKind kind_;
     std::string name_;
-    Type* elem_;
-    bool isMut_;
-    ConstValue* arrayLength_;
+    Type* elem_ = nullptr;
+    bool isMut_ = false;
+    ConstValue* arrayLength_ = nullptr;
 };
 
 struct Stmt : Node {

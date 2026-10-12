@@ -5,13 +5,17 @@
             "includePath": [
                 "${workspaceFolder}/**",
                 "${workspaceFolder}/compiler/src",
+                "${workspaceFolder}/target/build/generated",
                 "${env:HOME}/antlr4-4.13.1/include/antlr4-runtime"
             ],
             "defines": [],
             "compilerPath": "/usr/bin/g++",
             "cStandard": "gnu17",
             "cppStandard": "gnu++17",
-            "intelliSenseMode": "linux-gcc-x64"
+            "intelliSenseMode": "linux-gcc-x64",
+            "compileCommands": [
+                "${workspaceFolder}/target/build/compile_commands.json"
+            ]
         }
     ],
     "version": 4

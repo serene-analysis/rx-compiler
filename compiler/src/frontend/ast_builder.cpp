@@ -911,37 +911,41 @@ closedBitAndExpression
     ;
 */
 
+template <typename Fn>
+Expr* ASTVisitor::buildShiftChain(antlr4::ParserRuleContext* ctx, Fn visitOperand) {
+    Expr* left = nullptr;
+    std::string pending;
+    for (auto* child : ctx->children) {
+        if (auto* right = dynamic_cast<RxParser::ShiftRightContext*>(child)) {
+            pending = right->getText();
+        }
+        else if (dynamic_cast<antlr4::tree::TerminalNode*>(child)) {
+            pending = child->getText();
+        }
+        else {
+            Expr* operand = visitOperand(child);
+            if (left == nullptr) {
+                left = operand;
+            }
+            else {
+                auto now = make<binaryExpr>();
+                now->op_ = pending;
+                now->lhs_ = left;
+                now->rhs_ = operand;
+                left = now;
+            }
+        }
+    }
+    return left;
+}
+
 std::any ASTVisitor::visitShiftExpression(RxParser::ShiftExpressionContext *ctx) {
-    if (ctx->SHL().size() != 0u) {
-        auto operands = ctx->closedAdditiveExpression();
-        auto ops = ctx->SHL();
-        Expr* left = anyExpr(visit(operands[0]));
-        for (int i = 0; i < ops.size() - 1; i++) {
-            auto now = make<binaryExpr>();
-            now->op_ = ops[i]->getText();
-            now->lhs_ = left;
-            now->rhs_ = anyExpr(visit(operands[i + 1]));
-            left = now;
+    return static_cast<Expr*>(buildShiftChain(ctx, [this](antlr4::tree::ParseTree* child) -> Expr* {
+        if (auto* closed = dynamic_cast<RxParser::ClosedAdditiveExpressionContext*>(child)) {
+            return anyExpr(visit(closed));
         }
-        auto now = make<binaryExpr>();
-        now->op_ = ops[ops.size() - 1]->getText();
-        now->lhs_ = left;
-        now->rhs_ = anyExpr(visit(ctx->additiveExpression(0)));
-        return static_cast<Expr*>(now);
-    }
-    else {
-        auto operands = ctx->additiveExpression();
-        auto ops = ctx->shiftRight();
-        Expr* left = anyExpr(visit(operands[0]));
-        for (int i = 0; i < ops.size(); i++) {
-            auto now = make<binaryExpr>();
-            now->op_ = ops[i]->getText();
-            now->lhs_ = left;
-            now->rhs_ = anyExpr(visit(operands[i + 1]));
-            left = now;
-        }
-        return static_cast<Expr*>(left);
-    }
+        return anyExpr(visit(dynamic_cast<RxParser::AdditiveExpressionContext*>(child)));
+    }));
 }
 /*
 shiftExpression
@@ -950,36 +954,12 @@ shiftExpression
 */
 
 std::any ASTVisitor::visitClosedShiftExpression(RxParser::ClosedShiftExpressionContext *ctx) {
-    if (ctx->shiftRight().size() != 0u) {
-        auto operands = ctx->additiveExpression();
-        auto ops = ctx->shiftRight();
-        Expr* left = anyExpr(visit(operands[0]));
-        for (int i = 0; i < ops.size() - 1; i++) {
-            auto now = make<binaryExpr>();
-            now->op_ = ops[i]->getText();
-            now->lhs_ = left;
-            now->rhs_ = anyExpr(visit(operands[i + 1]));
-            left = now;
+    return static_cast<Expr*>(buildShiftChain(ctx, [this](antlr4::tree::ParseTree* child) -> Expr* {
+        if (auto* closed = dynamic_cast<RxParser::ClosedAdditiveExpressionContext*>(child)) {
+            return anyExpr(visit(closed));
         }
-        auto now = make<binaryExpr>();
-        now->op_ = ops[ops.size() - 1]->getText();
-        now->lhs_ = left;
-        now->rhs_ = anyExpr(visit(ctx->closedAdditiveExpression(0)));
-        return static_cast<Expr*>(now);
-    }
-    else {
-        auto operands = ctx->closedAdditiveExpression();
-        auto ops = ctx->SHL();
-        Expr* left = anyExpr(visit(operands[0]));
-        for (int i = 0; i < ops.size(); i++) {
-            auto now = make<binaryExpr>();
-            now->op_ = ops[i]->getText();
-            now->lhs_ = left;
-            now->rhs_ = anyExpr(visit(operands[i + 1]));
-            left = now;
-        }
-        return static_cast<Expr*>(left);
-    }
+        return anyExpr(visit(dynamic_cast<RxParser::AdditiveExpressionContext*>(child)));
+    }));
 }
 /*
 closedShiftExpression
@@ -1378,36 +1358,12 @@ conditionClosedBitAndExpression
 */
 
 std::any ASTVisitor::visitConditionShiftExpression(RxParser::ConditionShiftExpressionContext *ctx) {
-    if (ctx->SHL().size() != 0u) {
-        auto operands = ctx->conditionClosedAdditiveExpression();
-        auto ops = ctx->SHL();
-        Expr* left = anyExpr(visit(operands[0]));
-        for (int i = 0; i < ops.size() - 1; i++) {
-            auto now = make<binaryExpr>();
-            now->op_ = ops[i]->getText();
-            now->lhs_ = left;
-            now->rhs_ = anyExpr(visit(operands[i + 1]));
-            left = now;
+    return static_cast<Expr*>(buildShiftChain(ctx, [this](antlr4::tree::ParseTree* child) -> Expr* {
+        if (auto* closed = dynamic_cast<RxParser::ConditionClosedAdditiveExpressionContext*>(child)) {
+            return anyExpr(visit(closed));
         }
-        auto now = make<binaryExpr>();
-        now->op_ = ops[ops.size() - 1]->getText();
-        now->lhs_ = left;
-        now->rhs_ = anyExpr(visit(ctx->conditionAdditiveExpression(0)));
-        return static_cast<Expr*>(now);
-    }
-    else {
-        auto operands = ctx->conditionAdditiveExpression();
-        auto ops = ctx->shiftRight();
-        Expr* left = anyExpr(visit(operands[0]));
-        for (int i = 0; i < ops.size(); i++) {
-            auto now = make<binaryExpr>();
-            now->op_ = ops[i]->getText();
-            now->lhs_ = left;
-            now->rhs_ = anyExpr(visit(operands[i + 1]));
-            left = now;
-        }
-        return static_cast<Expr*>(left);
-    }
+        return anyExpr(visit(dynamic_cast<RxParser::ConditionAdditiveExpressionContext*>(child)));
+    }));
 }
 /*
 conditionShiftExpression
@@ -1416,36 +1372,12 @@ conditionShiftExpression
 */
 
 std::any ASTVisitor::visitConditionClosedShiftExpression(RxParser::ConditionClosedShiftExpressionContext *ctx) {
-    if (ctx->shiftRight().size() != 0u) {
-        auto operands = ctx->conditionAdditiveExpression();
-        auto ops = ctx->shiftRight();
-        Expr* left = anyExpr(visit(operands[0]));
-        for (int i = 0; i < ops.size() - 1; i++) {
-            auto now = make<binaryExpr>();
-            now->op_ = ops[i]->getText();
-            now->lhs_ = left;
-            now->rhs_ = anyExpr(visit(operands[i + 1]));
-            left = now;
+    return static_cast<Expr*>(buildShiftChain(ctx, [this](antlr4::tree::ParseTree* child) -> Expr* {
+        if (auto* closed = dynamic_cast<RxParser::ConditionClosedAdditiveExpressionContext*>(child)) {
+            return anyExpr(visit(closed));
         }
-        auto now = make<binaryExpr>();
-        now->op_ = ops[ops.size() - 1]->getText();
-        now->lhs_ = left;
-        now->rhs_ = anyExpr(visit(ctx->conditionClosedAdditiveExpression(0)));
-        return static_cast<Expr*>(now);
-    }
-    else {
-        auto operands = ctx->conditionClosedAdditiveExpression();
-        auto ops = ctx->SHL();
-        Expr* left = anyExpr(visit(operands[0]));
-        for (int i = 0; i < ops.size(); i++) {
-            auto now = make<binaryExpr>();
-            now->op_ = ops[i]->getText();
-            now->lhs_ = left;
-            now->rhs_ = anyExpr(visit(operands[i + 1]));
-            left = now;
-        }
-        return static_cast<Expr*>(left);
-    }
+        return anyExpr(visit(dynamic_cast<RxParser::ConditionAdditiveExpressionContext*>(child)));
+    }));
 }
 /*
 conditionClosedShiftExpression
@@ -1856,39 +1788,18 @@ conditionBreakClosedBitAndExpression
 */
 
 std::any ASTVisitor::visitConditionBreakShiftExpression(RxParser::ConditionBreakShiftExpressionContext *ctx) {
-    if (ctx->conditionAdditiveExpression().size() == 0u) {
-        return anyExpr(visit(ctx->conditionBreakAdditiveExpression()));
-    }
-    if (ctx->SHL().size() != 0u) {
-        auto operands = ctx->conditionClosedAdditiveExpression();
-        auto ops = ctx->SHL();
-        Expr* left = anyExpr(visit(ctx->conditionBreakClosedAdditiveExpression()));
-        for (int i = 0; i < ops.size() - 1; i++) {
-            auto now = make<binaryExpr>();
-            now->op_ = ops[i]->getText();
-            now->lhs_ = left;
-            now->rhs_ = anyExpr(visit(operands[i]));
-            left = now;
+    return static_cast<Expr*>(buildShiftChain(ctx, [this](antlr4::tree::ParseTree* child) -> Expr* {
+        if (auto* a = dynamic_cast<RxParser::ConditionBreakClosedAdditiveExpressionContext*>(child)) {
+            return anyExpr(visit(a));
         }
-        auto now = make<binaryExpr>();
-        now->op_ = ops[ops.size() - 1]->getText();
-        now->lhs_ = left;
-        now->rhs_ = anyExpr(visit(ctx->conditionAdditiveExpression(0)));
-        return static_cast<Expr*>(now);
-    }
-    else {
-        auto operands = ctx->conditionAdditiveExpression();
-        auto ops = ctx->shiftRight();
-        Expr* left = anyExpr(visit(ctx->conditionBreakAdditiveExpression()));
-        for (int i = 0; i < ops.size(); i++) {
-            auto now = make<binaryExpr>();
-            now->op_ = ops[i]->getText();
-            now->lhs_ = left;
-            now->rhs_ = anyExpr(visit(operands[i]));
-            left = now;
+        if (auto* b = dynamic_cast<RxParser::ConditionBreakAdditiveExpressionContext*>(child)) {
+            return anyExpr(visit(b));
         }
-        return static_cast<Expr*>(left);
-    }
+        if (auto* c = dynamic_cast<RxParser::ConditionClosedAdditiveExpressionContext*>(child)) {
+            return anyExpr(visit(c));
+        }
+        return anyExpr(visit(dynamic_cast<RxParser::ConditionAdditiveExpressionContext*>(child)));
+    }));
 }
 /*
 conditionBreakShiftExpression
@@ -1899,39 +1810,18 @@ conditionBreakShiftExpression
 */
 
 std::any ASTVisitor::visitConditionBreakClosedShiftExpression(RxParser::ConditionBreakClosedShiftExpressionContext *ctx) {
-    if (ctx->conditionClosedAdditiveExpression().size() == 0u) {
-        return anyExpr(visit(ctx->conditionBreakAdditiveExpression()));
-    }
-    if (ctx->shiftRight().size() != 0u) {
-        auto operands = ctx->conditionAdditiveExpression();
-        auto ops = ctx->shiftRight();
-        Expr* left = anyExpr(visit(ctx->conditionBreakAdditiveExpression()));
-        for (int i = 0; i < ops.size() - 1; i++) {
-            auto now = make<binaryExpr>();
-            now->op_ = ops[i]->getText();
-            now->lhs_ = left;
-            now->rhs_ = anyExpr(visit(operands[i]));
-            left = now;
+    return static_cast<Expr*>(buildShiftChain(ctx, [this](antlr4::tree::ParseTree* child) -> Expr* {
+        if (auto* a = dynamic_cast<RxParser::ConditionBreakClosedAdditiveExpressionContext*>(child)) {
+            return anyExpr(visit(a));
         }
-        auto now = make<binaryExpr>();
-        now->op_ = ops[ops.size() - 1]->getText();
-        now->lhs_ = left;
-        now->rhs_ = anyExpr(visit(ctx->conditionClosedAdditiveExpression(0)));
-        return static_cast<Expr*>(now);
-    }
-    else {
-        auto operands = ctx->conditionClosedAdditiveExpression();
-        auto ops = ctx->SHL();
-        Expr* left = anyExpr(visit(ctx->conditionBreakClosedAdditiveExpression()));
-        for (int i = 0; i < ops.size(); i++) {
-            auto now = make<binaryExpr>();
-            now->op_ = ops[i]->getText();
-            now->lhs_ = left;
-            now->rhs_ = anyExpr(visit(operands[i]));
-            left = now;
+        if (auto* b = dynamic_cast<RxParser::ConditionBreakAdditiveExpressionContext*>(child)) {
+            return anyExpr(visit(b));
         }
-        return static_cast<Expr*>(left);
-    }
+        if (auto* c = dynamic_cast<RxParser::ConditionClosedAdditiveExpressionContext*>(child)) {
+            return anyExpr(visit(c));
+        }
+        return anyExpr(visit(dynamic_cast<RxParser::ConditionAdditiveExpressionContext*>(child)));
+    }));
 }
 /*
 conditionBreakClosedShiftExpression
@@ -2350,39 +2240,18 @@ statementClosedBitAndExpression
 */
 
 std::any ASTVisitor::visitStatementShiftExpression(RxParser::StatementShiftExpressionContext *ctx) {
-    if (ctx->additiveExpression().size() == 0u) {
-        return anyExpr(visit(ctx->statementAdditiveExpression()));
-    }
-    if (ctx->SHL().size() != 0u) {
-        auto operands = ctx->closedAdditiveExpression();
-        auto ops = ctx->SHL();
-        Expr* left = anyExpr(visit(ctx->statementClosedAdditiveExpression()));
-        for (int i = 0; i < ops.size() - 1; i++) {
-            auto now = make<binaryExpr>();
-            now->op_ = ops[i]->getText();
-            now->lhs_ = left;
-            now->rhs_ = anyExpr(visit(operands[i]));
-            left = now;
+    return static_cast<Expr*>(buildShiftChain(ctx, [this](antlr4::tree::ParseTree* child) -> Expr* {
+        if (auto* a = dynamic_cast<RxParser::StatementClosedAdditiveExpressionContext*>(child)) {
+            return anyExpr(visit(a));
         }
-        auto now = make<binaryExpr>();
-        now->op_ = ops[ops.size() - 1]->getText();
-        now->lhs_ = left;
-        now->rhs_ = anyExpr(visit(ctx->additiveExpression(0)));
-        return static_cast<Expr*>(now);
-    }
-    else {
-        auto operands = ctx->additiveExpression();
-        auto ops = ctx->shiftRight();
-        Expr* left = anyExpr(visit(ctx->statementAdditiveExpression()));
-        for (int i = 0; i < ops.size(); i++) {
-            auto now = make<binaryExpr>();
-            now->op_ = ops[i]->getText();
-            now->lhs_ = left;
-            now->rhs_ = anyExpr(visit(operands[i]));
-            left = now;
+        if (auto* b = dynamic_cast<RxParser::StatementAdditiveExpressionContext*>(child)) {
+            return anyExpr(visit(b));
         }
-        return static_cast<Expr*>(left);
-    }
+        if (auto* c = dynamic_cast<RxParser::ClosedAdditiveExpressionContext*>(child)) {
+            return anyExpr(visit(c));
+        }
+        return anyExpr(visit(dynamic_cast<RxParser::AdditiveExpressionContext*>(child)));
+    }));
 }
 /*
 statementShiftExpression
@@ -2393,39 +2262,18 @@ statementShiftExpression
 */
 
 std::any ASTVisitor::visitStatementClosedShiftExpression(RxParser::StatementClosedShiftExpressionContext *ctx) {
-    if (ctx->closedAdditiveExpression().size() == 0u) {
-        return anyExpr(visit(ctx->statementClosedAdditiveExpression()));
-    }
-    if (ctx->shiftRight().size() != 0u) {
-        auto operands = ctx->additiveExpression();
-        auto ops = ctx->shiftRight();
-        Expr* left = anyExpr(visit(ctx->statementAdditiveExpression()));
-        for (int i = 0; i < ops.size() - 1; i++) {
-            auto now = make<binaryExpr>();
-            now->op_ = ops[i]->getText();
-            now->lhs_ = left;
-            now->rhs_ = anyExpr(visit(operands[i]));
-            left = now;
+    return static_cast<Expr*>(buildShiftChain(ctx, [this](antlr4::tree::ParseTree* child) -> Expr* {
+        if (auto* a = dynamic_cast<RxParser::StatementClosedAdditiveExpressionContext*>(child)) {
+            return anyExpr(visit(a));
         }
-        auto now = make<binaryExpr>();
-        now->op_ = ops[ops.size() - 1]->getText();
-        now->lhs_ = left;
-        now->rhs_ = anyExpr(visit(ctx->closedAdditiveExpression(0)));
-        return static_cast<Expr*>(now);
-    }
-    else {
-        auto operands = ctx->closedAdditiveExpression();
-        auto ops = ctx->SHL();
-        Expr* left = anyExpr(visit(ctx->statementClosedAdditiveExpression()));
-        for (int i = 0; i < ops.size(); i++) {
-            auto now = make<binaryExpr>();
-            now->op_ = ops[i]->getText();
-            now->lhs_ = left;
-            now->rhs_ = anyExpr(visit(operands[i]));
-            left = now;
+        if (auto* b = dynamic_cast<RxParser::StatementAdditiveExpressionContext*>(child)) {
+            return anyExpr(visit(b));
         }
-        return static_cast<Expr*>(left);
-    }
+        if (auto* c = dynamic_cast<RxParser::ClosedAdditiveExpressionContext*>(child)) {
+            return anyExpr(visit(c));
+        }
+        return anyExpr(visit(dynamic_cast<RxParser::AdditiveExpressionContext*>(child)));
+    }));
 }
 /*
 statementClosedShiftExpression

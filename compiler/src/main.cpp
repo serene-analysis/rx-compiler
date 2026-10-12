@@ -10,6 +10,7 @@
 #include "ast/ast.h"
 #include "ast/ast_dump.h"
 #include "frontend/ast_builder.h"
+#include "semantic/checker.h"
 
 using namespace antlr4;
 
@@ -77,13 +78,16 @@ int main(int argc, char** argv) {
         if (dumpTree) {
             std::cout << root->toStringTree(&parser) << "\n";
         }
+        ASTVisitor visitor;
+        auto* crate = std::any_cast<Crate*>(visitor.visit(root));
         if (dumpAst) {
-            ASTVisitor visitor;
-            auto* crate = std::any_cast<Crate*>(visitor.visit(root));
             dumpCrate(crate);
         }
 
-        // TODO：下一步在这里做语义检查（名称解析 + 类型检查），先直接接受
+        Checker checker;
+        checker.checkCrate(crate);
+        return checker.reject_ ? 1 : 0;
+
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "internal error: " << e.what() << "\n";

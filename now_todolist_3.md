@@ -528,17 +528,20 @@ fn set(&mut self, v: i32) -> () { .. } // params={i32}, ret=(), isMethod, selfMu
 
 `self` 不放进 `params`，用三个 bool 表示——后面方法调用检查接收者可变性时直接看它们。返回类型省略时 `ret = ()`。
 
-**分两小遍，解决"结构体后用"**：
+**分三小步，解决"结构体/常量后用"**：
 
 ```rust
 struct A { b: B }      // 引用后面才声明的 B
 struct B { x: i32 }
+const K: usize = M;    // 引用后面才声明的 M
+const M: usize = 3;
 ```
 
-1. **登记名字**：所有 struct 名（fields 先空）、函数名、常量名、每个 impl 的方法名/关联常量名（值占位）；遇到重名立即报错。
-2. **解析类型**：再走一遍，用 `resolveType(astType)` 填字段类型、参数/返回类型、常量声明类型。`resolveType` 只查 `structs` 的名字表，所以第 1 步完成后就没问题。
+1. **登记名字**：所有 struct 名（fields 先空）、函数名、常量名、每个 impl 的方法名/关联常量名；**同时把每个常量的 `syntax_` 指针和所属 owner 存进表里**（后面一切求值都靠它）；遇到重名立即报错。
+2. **求值全部常量**：遍历所有 const / 关联常量，递归求值 + `state_` 环检测，填 `ivalue_/bvalue_`。为什么必须"全部"而不是用到才算：`constant-errors` 里有**没人引用**的循环依赖常量，懒求值会漏掉负例。
+3. **解析类型**：用 `transformType(astType)` 填字段类型、参数/返回类型、常量声明类型。ARRAY 分支调用 `evalConstInt` 拿长度——此时常量都已是 `DONE`，等价于查表；没算过的也会按需递归，同一个函数。
 
-（`Self`：在 impl 里解析成 impl 的目标结构体名，collect 时记录 `currentImpl`。数组长度的常量求值可以延迟到常量阶段，`resolveType` 先留 AST 长度节点或跳过。）
+顺序上没有循环依赖：`evalConstInt` 只依赖"名字表 + `syntax_` 指针"，**不依赖 `transformType`**；`transformType` 里调用它只是复用同一个求值入口。`Self` 在 impl 里解析成目标结构体名，collect 时记录 `currentStruct_` 即可。
 
 **collect 阶段能抓的负例**：
 
@@ -692,6 +695,18 @@ std::string typeToString(const Type* t);        // 报错信息用
 ```
 
 内存管理：sema 类型 `new` 出来不释放也没事（编译器进程短命），内置类型存单例。它和 AST 的 `Type*` 是两回事：AST 的 Type 是"写法"（可能写着 `Self`、`Box<T>`），sema 的 Type 是"解析后的规范类型"。
+
+> **`Type` 记什么、不记什么**（容易混淆的点）
+>
+> - **记**：类型的结构——`kind_`、自带的名字（内置名 / 结构体名）、嵌套类型 `elem_`（`&T`/`[T;N]`/`Box<T>`/`Vec<T>` 的元素）、引用的 `isMut_`、数组长度 `arrayLength_`。
+> - **不记**：它是谁的。变量、字段、表达式的"类型"都指向共享的 Type 对象——类型是"形状"，不是"变量属性"。
+> - **不记绑定可变性**：`let mut p` 的 mut 存在 `LocalSym::isMut`；`&mut T` 的 mut 是类型的一部分（`Type::isMut_`）。两者是不同概念。
+> - **不记结构体字段表**：Type 里只存"是哪个结构体"（名字），字段在 `GlobalTable::structs`。
+> - **没有函数类型**：Rx 函数不能当值（规范列为 UB），所以 Type 里没有 Fn；调用只看符号表里的 `FnSig`。
+>
+> 例：`let mut p: &mut Point;`
+> 符号 `p` = `{ type = REF(isMut=true, elem=STRUCT("Point")), isMut=true }`
+> —— 前半是"类型"，后半是"绑定"。
 
 **`symbol.h`**（表 + 表项）：
 

@@ -75,6 +75,11 @@ private:
     return static_cast<Expr*>(value);
   }
 
+  // 按源码顺序折叠 shift 链（<< 与 >> 交替出现）。visitOperand 负责把
+  // 操作数 child 转成 Expr*，各 condition/statement 家族传各自的上下文类型。
+  template <typename Fn>
+  Expr* buildShiftChain(antlr4::ParserRuleContext* ctx, Fn visitOperand);
+
 public:
 
   virtual std::any visitCrate(RxParser::CrateContext *ctx) override;
