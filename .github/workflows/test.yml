@@ -8,7 +8,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
         with:
@@ -17,7 +17,20 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential
+          sudo apt-get install -y build-essential cmake default-jre-headless
+
+      - name: Install ANTLR 4.13.1 (jar + C++ runtime)
+        run: |
+          sudo curl -fsSL -o /usr/local/lib/antlr-4.13.1-complete.jar \
+            https://www.antlr.org/download/antlr-4.13.1-complete.jar
+          git clone --depth 1 --branch 4.13.1 https://github.com/antlr/antlr4.git /tmp/antlr4
+          cmake -S /tmp/antlr4/runtime/Cpp -B /tmp/antlr4-cpp \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DANTLR_BUILD_CPP_TESTS=OFF \
+            -DANTLR4_INSTALL=ON \
+            -DCMAKE_INSTALL_PREFIX="$HOME/antlr4-4.13.1"
+          cmake --build /tmp/antlr4-cpp -j"$(nproc)"
+          cmake --install /tmp/antlr4-cpp
 
       - name: Install Clang 22 for LLVM IR tests
         run: |
@@ -40,6 +53,11 @@ jobs:
         run: |
           rustup toolchain install 1.95.0 --profile minimal --target riscv32im-unknown-none-elf
           rustup default 1.95.0
+
+      - name: Build reference runtime library
+        run: |
+          cargo build --release --target riscv32im-unknown-none-elf \
+            --manifest-path crates/rx/Cargo.toml --target-dir target/reference
 
       - name: Run tests
         run: make test
