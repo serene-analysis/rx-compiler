@@ -9,7 +9,7 @@ using semType = semantic::Type;
 
 struct funcSignature {
     std::vector<semType*> params_;
-    semType* ret_ = nullptr;
+    semType* retType_ = nullptr;
     bool isMethod_ = false;
     bool selfRef_ = false;
     bool selfMut_ = false;
@@ -22,13 +22,18 @@ struct structSignature {
 
 struct ConstValue;
 
+struct Constant {
+    bool isBool_ = false;
+    long long value_ = 0;
+    Constant(bool isBool = false, long long value = 0) : isBool_(isBool), value_(value) {}
+};
+
 struct constSignature {
     semType* type_ = nullptr;
     ConstValue* value_ = nullptr;
     enum kState { UNTOUCHED, CALCULATING, DONE };
     kState state_ = UNTOUCHED;
-    long long ivalue_ = 0;
-    bool bvalue_ = false;
+    Constant real_;
 };
 
 struct globalTable {
@@ -42,14 +47,14 @@ struct globalTable {
 struct localShadowing {
     semType* type_;
     bool isMut_;
-    localShadowing(semType* type, bool isMut) : type_(type), isMut_(isMut) {}
+    localShadowing(semType* type = nullptr, bool isMut = false) : type_(type), isMut_(isMut) {}
 };
 
 struct stackShadowing {
     std::string name_;
     localShadowing shadow_;
     int depth_;
-    stackShadowing(std::string name, localShadowing shadow, int depth) : name_(name), shadow_(shadow), depth_(depth) {}
+    stackShadowing(std::string name, localShadowing shadow, int depth = 0) : name_(name), shadow_(shadow), depth_(depth) {}
 };
 
 struct scopeStack {
