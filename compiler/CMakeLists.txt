@@ -51,6 +51,10 @@ endif()
 
 file(GLOB_RECURSE MY_SRCS CONFIGURE_DEPENDS src/*.cpp)
 
+# 生成的 parser 源文件很大，Release 默认 -O3 在小内存机器上会 OOM；
+# 解析器对优化不敏感，固定用 -O0 编译，显著降低编译内存。
+set_source_files_properties(${GEN_SRCS} PROPERTIES COMPILE_OPTIONS "-O0")
+
 add_executable(rxcc ${MY_SRCS} ${GEN_SRCS})
 target_include_directories(rxcc PRIVATE ${GEN_DIR} ${ANTLR4_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(rxcc PRIVATE antlr4_static)

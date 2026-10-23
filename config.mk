@@ -5,7 +5,7 @@
 # Write shared runtime assembly there if your IR/CODEGEN output references it.
 BUILD = cmake -S compiler -B target/build -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_PREFIX_PATH=$(HOME)/antlr4-4.13.1 && \
-        cmake --build target/build -j && : > {runtime}
+        cmake --build target/build -j1 && : > {runtime}
 
 # Required for semantic tests: exit 0 to accept {source}, 1 to reject it.
 SEMANTIC = ./target/build/rxcc --stage semantic {source}
