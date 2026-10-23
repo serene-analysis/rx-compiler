@@ -66,6 +66,7 @@ std::any ASTVisitor::visitFunctionDefinition(RxParser::FunctionDefinitionContext
         now->retType_ = unit;
     }
     now->body_ = anyExpr(visit(ctx->blockExpression()));
+    now->hasGenericParams_ = (ctx->genericParams() != nullptr);
     return static_cast<Item*>(now);
 }
 /*
@@ -360,7 +361,7 @@ std::any ASTVisitor::visitTypePath(RxParser::TypePathContext *ctx) {
             }
         }
     }
-    return makeNamedType(name, types);
+    return makeNamedType(name, types, types.size() != 0);
 }
 /*
 typePath
@@ -491,7 +492,7 @@ std::any ASTVisitor::visitClosedCastType(RxParser::ClosedCastTypeContext *ctx) {
             }
         }
     }
-    return makeNamedType(name, types);
+    return makeNamedType(name, types, ctx->genericArgs() != nullptr);
 }
 /*
 closedCastType
@@ -618,6 +619,7 @@ std::any ASTVisitor::visitStatement(RxParser::StatementContext *ctx) {
     }
     if (ctx->expressionWithBlock()) {
         auto now = make<exprStmt>();
+        now->hasSemi_ = (ctx->SEMI() != nullptr);
         now->expr_ = anyExpr(visit(ctx->expressionWithBlock()));
         return static_cast<Stmt*>(now);
     }

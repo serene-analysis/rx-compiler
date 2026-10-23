@@ -1,6 +1,8 @@
 #include "checker.h"
 #include <iostream>
 #include <set>
+#include <functional>
+#include <algorithm>
 
 using kKind = Type::kTypeKind; // AST Type
 
@@ -27,6 +29,14 @@ static bool isSignedType(semType* t) {
 
 static bool isBoolType(semType* t) {
     return t != nullptr && t->kind_ == semantic::Type::kTypeKind::BUILTIN && t->name_ == "bool";
+}
+
+static bool isNever(semType* type){
+    return type != nullptr && type->kind_ == semType::kTypeKind::NEVER;
+}
+
+static bool matches(semType* type, semType* expected) {
+    return isNever(type) || semantic::typeEqual(type, expected);
 }
 
 static semType* digOneRef(semType* type) {
@@ -223,11 +233,70 @@ bool Checker::checkConstInit(const ConstValue* value, semType* expected, const s
     return true;
 }
 
+bool Checker::evalArrayLength(ConstValue* value, const std::string& owner, unsigned& length) {
+    if (value->kind_ == ConstValue::kConstKind::INT) {
+        std::string suffix = intSuffix(value->text_);
+        if (!suffix.empty() && suffix != "usize") {
+            error("attempted to explicitly use non-usize int literal as an array's length : " + value->text_);
+            return false;
+        }
+    }
+    else if (value->kind_ == ConstValue::kConstKind::PATH) {
+        auto path = value->text_;
+        auto fir = path.find("::");
+        std::string constOwner, name;
+        if (fir == std::string::npos) {
+            constOwner = "";
+            name = path;
+        }
+        else {
+            if (path.find("::", fir + 1) != std::string::npos) {
+                error("unsupported path in ConstValue");
+                return false;
+            }
+            constOwner = path.substr(0, fir);
+            name = path.substr(fir + 2);
+            if (constOwner == "Self") {
+                if (owner.empty()) {
+                    error("attempted to use \"Self\" in top-level scope");
+                    return false;
+                }
+                constOwner = owner;
+            }
+        }
+        constSignature* cs = findConst(constOwner, name);
+        if (cs == nullptr) {
+            error(constOwner.empty() ? "unresolved constant " + name
+                                     : "unresolved constant " + constOwner + "::" + name);
+            return false;
+        }
+        if (!typeEqual(cs->type_, semantic::makeBuiltin("usize"))) {
+            error("array length must be usize");
+            return false;
+        }
+    }
+    else {
+        error("array length must be usize");
+        return false;
+    }
+    Constant len = calculateConst(value, owner);
+    length = static_cast<unsigned>(len.value_);
+    return true;
+}
+
 semType* Checker::transformType(Type* type){
     if (type->kind_ == kKind::BUILTIN) {
+        if (type->hasGenerigArgs) {
+            error("builtin type has generic args");
+            return semantic::makeError();
+        }
         return semantic::makeBuiltin(type->name_);
     }
     if (type->kind_ == kKind::STRUCT) {
+        if (type->hasGenerigArgs) {
+            error("struct type has generic args");
+            return semantic::makeError();
+        }
         if (type->name_ == "Self") {
             if (currentStruct_ == "") {
                 error("attempted to use Self in top-level type");
@@ -251,54 +320,11 @@ semType* Checker::transformType(Type* type){
         return semantic::makeRef(transformType(type->elem_), type->isMut_);
     }
     if (type->kind_ == kKind::ARRAY) {
-        ConstValue* c = type->arrayLength_;
-        if (c->kind_ == ConstValue::kConstKind::INT) {
-            std::string suffix = intSuffix(c->text_);
-            if (!suffix.empty() && suffix != "usize") {
-                error("attempted to explicitly use non-usize int literal as an array's length : " + c->text_);
-                return semantic::makeError();
-            }
-        }
-        else if (c->kind_ == ConstValue::kConstKind::PATH) {
-            auto path = c->text_;
-            auto fir = path.find("::");
-            std::string owner, name;
-            if (fir == std::string::npos) {
-                owner = "";
-                name = path;
-            }
-            else {
-                if (path.find("::", fir + 1) != std::string::npos) {
-                    error("unsupported path in ConstValue");
-                    return semantic::makeError();
-                }
-                owner = path.substr(0, fir);
-                name = path.substr(fir + 2);
-                if (owner == "Self") {
-                    if (currentStruct_.empty()) {
-                        error("attempted to use \"Self\" in top-level scope");
-                        return semantic::makeError();
-                    }
-                    owner = currentStruct_;
-                }
-            }
-            constSignature* cs = findConst(owner, name);
-            if (cs == nullptr) {
-                error(owner.empty() ? "unresolved constant " + name
-                                    : "unresolved constant " + owner + "::" + name);
-                return semantic::makeError();
-            }
-            if (!typeEqual(cs->type_, semantic::makeBuiltin("usize"))) {
-                error("array length must be usize");
-                return semantic::makeError();
-            }
-        }
-        else {
-            error("array length must be usize");
+        unsigned length = 0;
+        if (!evalArrayLength(type->arrayLength_, currentStruct_, length)) {
             return semantic::makeError();
         }
-        Constant len = calculateConst(type->arrayLength_, currentStruct_);
-        return semantic::makeArray(transformType(type->elem_), len.value_);
+        return semantic::makeArray(transformType(type->elem_), length);
     }
     if (type->kind_ == kKind::UNIT) {
         return semantic::makeUnit();
@@ -325,6 +351,9 @@ void Checker::collect(Crate* crate) {
                                     std::map<std::string, constSignature> &constSig, bool insideImpl) {
         if (auto func = dynamic_cast<funcItem*>(item); func) {
             std::string funcName = func->name_;
+            if (!insideImpl && funcName == "main" && func->hasGenericParams_) {
+                error("main function should not have generic params");
+            }
             if (funcSig.count(funcName) || constSig.count(funcName)) {
                 error("duplicate function name (with function or constant) : " + funcName);
             }
@@ -514,6 +543,80 @@ void Checker::evaluateTypes(Crate* crate) {
     }
 }
 
+semType* Checker::lub(std::vector<semType*> types) {
+    std::vector<semType*> all;
+    semType* t = nullptr; // strange name in spec
+    for (auto u : types) {
+        if (isNever(u)) {
+            continue;
+        }
+        if (u->kind_ == semType::kTypeKind::ERROR) {
+            return u;
+        }
+        if (t == nullptr) {
+            t = u;
+            all.push_back(u);
+            continue;
+        }
+        if (canImplicitlyTurn(u, t)) {
+            all.push_back(u);
+        }
+        else if(canImplicitlyTurn(t, u)) {
+            bool can = true;
+            for (auto now : all) {
+                can &= canImplicitlyTurn(now, u);
+            }
+            if (can) {
+                t = u;
+                all.push_back(u);
+                continue;
+            }
+            else {
+                error("lub failed");
+                return semantic::makeError();
+            }
+        }
+        else {
+            error("lub failed");
+            return semantic::makeError();
+        }
+    }
+    return t == nullptr ? semantic::makeNever() : t;
+}
+
+bool Checker::canImplicitlyTurn(semType* from, semType* to) {
+    if (isNever(from)) {
+        return true;
+    }
+    if (semantic::typeEqual(from, to)) {
+        return true;
+    }
+    std::function<bool(semType*, semType*, bool)> canDerefToRef = [&](semType* lhs, semType* rhs, bool mustmut) {
+        if (semantic::typeEqual(lhs, rhs)) {
+            return true;
+        }
+        if (lhs->kind_ == semType::kTypeKind::REF && (!mustmut || lhs->isMut_) && canDerefToRef(lhs->elem_, rhs, mustmut)) {
+            return true;
+        }
+        if (lhs->kind_ == semType::kTypeKind::BOX && canDerefToRef(lhs->elem_, rhs, mustmut)) {
+            return true;
+        }
+        return false;
+    };
+    if (from->kind_ == semType::kTypeKind::REF && to->kind_ == semType::kTypeKind::REF){
+        if (from->isMut_ && semantic::typeEqual(from->elem_, to->elem_)) {
+            return true;
+        }
+        if (!from->isMut_ && to->isMut_) {
+            return false;
+        }
+        return canDerefToRef(from->elem_, to->elem_, from->isMut_ && to->isMut_);
+    }
+    else {
+        return false;
+    }
+}
+
 semType* Checker::lookupValue(std::string name) { // I think the spec said that using function as a value is an UB?
     if (scope_.find(name)) {
         return scope_.memory_[name].top().type_;
@@ -542,6 +645,7 @@ bool Checker::isPlaceable(Expr* expr) {
     return false;
 }
 
+
 bool Checker::isMutablePlaceable(Expr* expr) {
     if (auto path = dynamic_cast<pathExpr*>(expr); path != nullptr && path->path_.size() == 1){
         if (!scope_.find(path->path_[0].name_)) {
@@ -550,16 +654,142 @@ bool Checker::isMutablePlaceable(Expr* expr) {
         return scope_.memory_[path->path_[0].name_].top().isMut_;
     }
     if (auto field = dynamic_cast<fieldExpr*>(expr); field) {
-        return isMutablePlaceable(field->from_);
+        semType* ftype = infer(field->from_);
+        if (ftype->kind_ == semType::kTypeKind::REF) {
+            if (!ftype->isMut_) {
+                return false;
+            }
+            return isMutablyAccessible(field->from_);
+        }
+        if (ftype->kind_ == semType::kTypeKind::STRUCT) {
+            return receiverMutable(field->from_);
+        }
+        if (ftype->kind_ == semType::kTypeKind::BOX) {
+            return receiverMutable(field->from_);
+        }
+        return false;
     }
     if (auto index = dynamic_cast<indexExpr*>(expr); index) {
-        return isMutablePlaceable(index->from_);
+        semType* ftype = infer(index->from_);
+        if (ftype->kind_ == semType::kTypeKind::REF) {
+            if (!ftype->isMut_) {
+                return false;
+            }
+            return isMutablyAccessible(index->from_);
+        }
+        if (ftype->kind_ == semType::kTypeKind::VEC) {
+            if (!isPlaceable(index->from_)) {
+                return true;
+            }
+            return receiverMutable(index->from_);
+        }
+        if (ftype->kind_ == semType::kTypeKind::ARRAY || ftype->kind_ == semType::kTypeKind::BOX) {
+            return receiverMutable(index->from_);
+        }
+        return false;
     }
     if (auto deref = dynamic_cast<derefExpr*>(expr); deref) {
         semType* inner = infer(deref->operand_);
-        return inner->kind_ == semType::kTypeKind::REF && inner->isMut_;
+        if (inner->kind_ == semType::kTypeKind::BOX) {
+            return isMutablePlaceable(deref->operand_);
+        }
+        if (inner->kind_ == semType::kTypeKind::REF && inner->isMut_) {
+            return receiverMutable(deref->operand_);
+        }
+        return false;
     }
     return false;
+}
+
+bool Checker::isMutablyAccessible(Expr* expr) {
+    if (auto path = dynamic_cast<pathExpr*>(expr); path) {
+        if (path->path_.size() == 1) {
+            return scope_.find(path->path_[0].name_);
+        }
+        else {
+            return false;
+        }
+    }
+    if (auto der = dynamic_cast<derefExpr*>(expr); der) {
+        semType* inner = infer(der->operand_);
+        if (inner->kind_ == semType::kTypeKind::REF && inner->isMut_) {
+            if (!isPlaceable(der->operand_)) {
+                return true;
+            }
+            else {
+                return isMutablyAccessible(der->operand_);
+            }
+        }
+        else if (inner->kind_ == semType::kTypeKind::BOX) {
+            return isMutablyAccessible(der->operand_);
+        }
+        else {
+            return false;
+        }
+    }
+    if (auto fie = dynamic_cast<fieldExpr*>(expr); fie) {
+        return isMutablyAccessible(fie->from_);
+    }
+    if (auto ind = dynamic_cast<indexExpr*>(expr); ind) {
+        semType* ftype = infer(ind->from_);
+        if (ftype->kind_ == semType::kTypeKind::REF) {
+            if (!ftype->isMut_) {
+                return false;
+            }
+            return isMutablyAccessible(ind->from_);
+        }
+        if (ftype->kind_ == semType::kTypeKind::VEC) {
+            if (!isPlaceable(ind->from_)) {
+                return true;
+            }
+            return isMutablePlaceable(ind->from_);
+        }
+        if (ftype->kind_ == semType::kTypeKind::ARRAY) {
+            return isMutablyAccessible(ind->from_);
+        }
+        if (ftype->kind_ == semType::kTypeKind::BOX) {
+            if (ftype->elem_->kind_ == semType::kTypeKind::REF && ftype->elem_->isMut_) {
+                return isMutablyAccessible(ind->from_);
+            }
+            return isMutablePlaceable(ind->from_);
+        }
+        return false;
+    }
+    return false;
+}
+
+bool Checker::receiverMutable(Expr* expr) {
+    semType* type = infer(expr);
+    if (type->kind_ == semType::kTypeKind::ERROR) {
+        return false;
+    }
+    if (type->kind_ == semType::kTypeKind::REF) {
+        if (!type->isMut_) {
+            return false;
+        }
+        if (!isPlaceable(expr)) {
+            return true;
+        }
+        return isMutablyAccessible(expr);
+    }
+    if (!isPlaceable(expr)) {
+        return true;
+    }
+    return isMutablePlaceable(expr);
+}
+
+void Checker::eliminateOneShared(semType*& type, bool& valid) {
+    if (type->kind_ == semType::kTypeKind::REF) {
+        if (type->isMut_) {
+            error("operand can't be a mutable reference");
+            valid = false;
+        }
+        type = type->elem_;
+    }
+    if (type->kind_ == semType::kTypeKind::REF) {
+        error("operand can't have multiple reference layers");
+        valid = false;
+    }
 }
 
 semType* Checker::infer(Expr* expr) {
@@ -615,35 +845,306 @@ semType* Checker::infer(Expr* expr) {
             error("callExpr callee is not a function");
             return semantic::makeError();
         }
+        auto checkParams = [&](std::string callee, std::string owner) {
+            if (owner != ""){
+                if (table_.methods[owner].find(callee) == table_.methods[owner].end()) {
+                    semType* ctype = semantic::makeStruct(owner);
+                    if (callee != "clone" || !canClone(ctype)) {
+                        error("can't resolve function name when calling a method of" + owner);
+                        return semantic::makeError();
+                    }
+                    if (call->args_.size() != 1) {
+                        error("callExpr callee implicitly clone args not exactly one");
+                        return semantic::makeError();
+                    }
+                    expect(call->args_[0], semantic::makeRef(ctype, false));
+                    return ctype;
+                }
+            }
+            else {
+                if (scope_.find(callee)) {
+                    error("called function name is shadowed by local variables");
+                    return semantic::makeError();
+                }
+                if (table_.funcSig.find(callee) == table_.funcSig.end()) {
+                    error("callExpr attempted to use an non-existing function");
+                    return semantic::makeError();
+                }
+            }
+            auto &sig = owner == "" ? table_.funcSig[callee] : table_.methods[owner][callee];
+            size_t offset = 0;
+            if (sig.isMethod_) {
+                if (owner.empty()) {
+                    error("a method with a receiver has no owner type");
+                    return semantic::makeError();
+                }
+                semType* rtype = semantic::makeStruct(owner);
+                if (sig.selfRef_) {
+                    rtype = semantic::makeRef(rtype, sig.selfMut_);
+                }
+                if (call->args_.size() != sig.params_.size() + 1) {
+                    error("explicit method call has a wrong number of arguments");
+                    return semantic::makeError();
+                }
+                expect(call->args_[0], rtype);
+                offset = 1;
+            }
+            else if (call->args_.size() != sig.params_.size()) {
+                error("callExpr parameters number mismatch");
+                return semantic::makeError();
+            }
+            for (size_t i = 0; i < sig.params_.size(); i++) {
+                expect(call->args_[offset + i], sig.params_[i]);
+            }
+            return sig.retType_;
+        };
         if (path->path_.size() > 1) {
-            // This won't be dealt until stage 5
-            return semantic::makeError();
+            if (path->path_.size() > 2) {
+                error("pathExpr with size longer than 2");
+                return semantic::makeError();
+            }
+            if (path->path_[1].types_.size() != 0) {
+                error("turbofish appeared after function name");
+                return semantic::makeError();
+            }
+            std::string owner = path->path_[0].name_, func = path->path_[1].name_;
+            if (owner == "Self") {
+                if (currentStruct_ == "") {
+                    error("attempted to call \"Self\" in top-level pathExpr");
+                    return semantic::makeError();
+                }
+                owner = currentStruct_;
+            }
+            if (owner == "Box" || owner == "Vec") {
+                if (path->path_[0].types_.size() != 1) {
+                    error(owner + " requires exactly one turbofish type argument");
+                    return semantic::makeError();
+                }
+                semType* type = transformType(path->path_[0].types_[0]);
+                if (owner == "Box") {
+                    if (func == "new") {
+                        if (call->args_.size() != 1) {
+                            error("Box::new requires exactly one value argument");
+                            return semantic::makeError();
+                        }
+                        expect(call->args_[0], type);
+                        return semantic::makeBox(type);
+                    }
+                    if (func == "clone") {
+                        if (call->args_.size() != 1) {
+                            error("Box::clone requires exactly one reference argument");
+                            return semantic::makeError();
+                        }
+                        if (!canClone(type)) {
+                            error("Box::<T>::clone called while T can not clone");
+                            return semantic::makeError();
+                        }
+                        expect(call->args_[0], semantic::makeRef(semantic::makeBox(type), false));
+                        return semantic::makeBox(type);
+                    }
+                    error("unsupported associated function : " + owner + "::" + func);
+                    return semantic::makeError();
+                }
+                // Vec
+                if (func == "new") {
+                    if (!call->args_.empty()) {
+                        error("Vec::new requires no value arguments");
+                        return semantic::makeError();
+                    }
+                    return semantic::makeVec(type);
+                }
+                if (func == "len" || func == "is_empty" || func == "clone") {
+                    if (call->args_.size() != 1) {
+                        error("Vec::" + func + " requires exactly one reference argument");
+                        return semantic::makeError();
+                    }
+                    expect(call->args_[0], semantic::makeRef(semantic::makeVec(type), false));
+                    if (func == "len") {
+                        return semantic::makeBuiltin("usize");
+                    }
+                    if (func == "is_empty") {
+                        return semantic::makeBuiltin("bool");
+                    }
+                    if (!canClone(type)) {
+                        error("Vec::<T>::clone called while T can not clone");
+                        return semantic::makeError();
+                    }
+                    return semantic::makeVec(type);
+                }
+                if (func == "push" || func == "remove") {
+                    if (call->args_.size() != 2) {
+                        error("Vec::" + func + " requires a mutable reference and one value argument");
+                        return semantic::makeError();
+                    }
+                    expect(call->args_[0], semantic::makeRef(semantic::makeVec(type), true));
+                    if (func == "push") {
+                        expect(call->args_[1], type);
+                        return semantic::makeUnit();
+                    }
+                    expect(call->args_[1], semantic::makeBuiltin("usize"));
+                    return type;
+                }
+                error("unsupported associated function : " + owner + "::" + func);
+                return semantic::makeError();
+            }
+            if (path->path_[0].types_.size() != 0) {
+                error("using turbofish in non-Box and non-Vec function calling");
+                return semantic::makeError();
+            }
+            return checkParams(func, owner);
         }
         if (!path->path_[0].types_.empty()) {
             error("callExpr single word path have types");
             return semantic::makeError();
         }
         std::string callee = path->path_[0].name_;
-        if (scope_.find(callee)) {
-            error("called function name is shadowed by local variables");
+        return checkParams(callee, "");
+    }
+    if (auto met = dynamic_cast<methodCallExpr*>(expr); met) {
+        if (met->hasGenericArgs_) {
+            error("methodCallExpr should not has generic args");
             return semantic::makeError();
         }
-        if (table_.funcSig.find(callee) == table_.funcSig.end()) {
-            error("callExpr attempted to use an non-existing function");
+        semType* lhs = infer(met->from_);
+        if (lhs->kind_ == semType::kTypeKind::ERROR) {
             return semantic::makeError();
         }
-        auto &sig = table_.funcSig[callee];
-        if (sig.params_.size() != call->args_.size()) {
-            error("callExpr parameters number mismatch");
+        semType* callee = lhs;
+        if (met->name_ == "clone") {
+            if (met->args_.size() != 0) {
+                error("methodCallExpr called clone with no args");
+                return semantic::makeError();
+            }
+            while (callee->kind_ == semType::kTypeKind::REF && !callee->isMut_) {
+                callee = callee->elem_;
+            }
+            bool explicitCloneable = (callee->kind_ == semType::kTypeKind::STRUCT && table_.methods[callee->name_].count("clone"));
+            if (!explicitCloneable) {
+                if (canClone(callee)) {
+                    return callee;
+                }
+                if (lhs->kind_ == semType::kTypeKind::REF && !lhs->isMut_) {
+                    return lhs;
+                }
+                error("methodCallExpr called clone implicitly but failed");
+                return semantic::makeError();
+            }
+        }
+        while (callee->kind_ == semType::kTypeKind::REF || callee->kind_ == semType::kTypeKind::BOX) {
+            callee = callee->elem_;
+        }
+        if (callee->kind_ == semType::kTypeKind::VEC || callee->kind_ == semType::kTypeKind::ARRAY) {
+            if (callee->kind_ == semType::kTypeKind::VEC) {
+                if (met->name_ == "len" || met->name_ == "is_empty" || met->name_ == "clone") {
+                    if (met->args_.size() != 0) {
+                        error("vec." + met->name_ + " called with non-empty args");
+                        return semantic::makeError();
+                    }
+                    if (met->name_ == "len") {
+                        return semantic::makeBuiltin("usize");
+                    }
+                    else if(met->name_ == "is_empty") {
+                        return semantic::makeBuiltin("bool");
+                    }
+                    else {
+                        if (!canClone(callee->elem_)) {
+                            error("Vec.clone called while the element type can not clone");
+                            return semantic::makeError();
+                        }
+                        return callee;
+                    }
+                }
+                else if (met->name_ == "push" || met->name_ == "remove") {
+                    if (met->args_.size() != 1) {
+                        error("vec." + met->name_ + " called with not exactly one arg");
+                        return semantic::makeError();
+                    }
+                    if (!receiverMutable(met->from_)) {
+                        error("vec." + met->name_ + " called by a non mutable expr");
+                        return semantic::makeError();
+                    }
+                    if (met->name_ == "push") {
+                        expect(met->args_[0], callee->elem_);
+                        return semantic::makeUnit();
+                    }
+                    expect(met->args_[0], semantic::makeBuiltin("usize"));
+                    return callee->elem_;
+                }
+                else {
+                    error("vec." + met->name_ + "is not supported");
+                    return semantic::makeError();
+                }
+            }
+            // array
+            if (met->name_ != "len" && met->name_ != "clone") {
+                error("array. called a non-len and non-clone method");
+                return semantic::makeError();
+            }
+            if (met->args_.size() != 0) {
+                error("array." + met->name_ + " called with non-empty args");
+                return semantic::makeError();
+            }
+            if (met->name_ == "clone") {
+                if (!canClone(callee->elem_)) {
+                    error("Array.clone called while the element type can not clone");
+                    return semantic::makeError();
+                }
+                return callee;
+            }
+            return semantic::makeBuiltin("usize");
+        }
+        callee = lhs;
+        while (callee->kind_ == semType::kTypeKind::REF || callee->kind_ == semType::kTypeKind::BOX) {
+            callee = callee->elem_;
+        }
+        if (callee->kind_ != semType::kTypeKind::STRUCT) {
+            error("methodCallExpr can't find appropriate receiver");
             return semantic::makeError();
         }
-        for (int i = 0; i < sig.params_.size(); i++) {
-            expect(call->args_[i], sig.params_[i]);
+        std::string owner = callee->name_;
+        auto dt = table_.methods.find(owner);
+        if (dt == table_.methods.end() ||
+            dt->second.find(met->name_) == dt->second.end()) {
+            error("can't resolve function name when calling a method of " + owner);
+            return semantic::makeError();
+        }
+        auto &sig = dt->second[met->name_];
+        bool can = false;
+        if (!sig.isMethod_) {
+            can = false;
+        }
+        else if (!sig.selfRef_) {
+            can = (lhs->kind_ != semType::kTypeKind::REF);
+        }
+        else if (!sig.selfMut_) {
+            can = true;
+        }
+        else {
+            can = receiverMutable(met->from_);
+        }
+        if (!can) {
+            error("methodCallExpr receiver does not match the method");
+            return semantic::makeError();
+        }
+        if (met->args_.size() != sig.params_.size()) {
+            error("methodCallExpr arguments number mismatch");
+            return semantic::makeError();
+        }
+        for (size_t i = 0; i < sig.params_.size(); i++) {
+            expect(met->args_[i], sig.params_[i]);
         }
         return sig.retType_;
     }
     if (auto una = dynamic_cast<unaryExpr*>(expr); una) {
         semType* type = infer(una->operand_);
+        if (type->kind_ == semType::kTypeKind::ERROR) {
+            return semantic::makeError();
+        }
+        bool valid = true;
+        eliminateOneShared(type, valid);
+        if (!valid) {
+            return semantic::makeError();
+        }
         if (una->op_ == "-") { // I remember unaryExpr only have -x and !x?
             if (!isSignedType(type)) {
                 error("unary minus attempted to negate an unsigned value");
@@ -664,15 +1165,10 @@ semType* Checker::infer(Expr* expr) {
     if (auto fi = dynamic_cast<ifExpr*>(expr); fi) {
         expect(fi->cond_, semantic::makeBuiltin("bool"));
         if (fi->else_ != nullptr) {
-            semType* rhs = infer(fi->else_);
-            if (!semantic::typeEqual(infer(fi->then_), rhs)) {
-                error("ifExpr then and else have different type");
-                return semantic::makeError();
-            }
-            return rhs;
+            return lub({infer(fi->then_), infer(fi->else_)});
         }
         else {
-            if (!semantic::typeEqual(infer(fi->then_), semantic::makeUnit())) {
+            if (!matches(infer(fi->then_), semantic::makeUnit())) {
                 error("ifExpr then is not unit");
                 return semantic::makeError();
             }
@@ -680,34 +1176,50 @@ semType* Checker::infer(Expr* expr) {
         }
     }
     if (auto whi = dynamic_cast<whileExpr*>(expr); whi) {
+        loops_.push_back(loopInfo{nullptr, {}, true});
         expect(whi->cond_, semantic::makeBuiltin("bool"));
-        if (!semantic::typeEqual(infer(whi->block_), semantic::makeUnit())) {
-            error("whileExpr block is not unit");
-            return semantic::makeError();
-        }
+        loops_.pop_back();
+        loops_.push_back(loopInfo{semantic::makeUnit(), {}});
+        checkBlock(whi->block_, semantic::makeUnit());
+        loops_.pop_back();
         return semantic::makeUnit();
     }
     if (auto loop = dynamic_cast<loopExpr*>(expr); loop) {
-        if (!semantic::typeEqual(infer(loop->block_), semantic::makeUnit())) {
-            error("loopExpr block is not unit");
-            return semantic::makeError();
-        }
-        return semantic::makeUnit();
+        return checkLoop(loop, nullptr);
     }
     if (auto bre = dynamic_cast<breakExpr*>(expr); bre) {
-        if (bre->tail_) {
-            infer(bre->tail_);
+        if (loops_.empty()) {
+            error("break outside loop");
+            return semantic::makeError();
         }
+        if (loops_.back().barrier_) {
+            error("attempted to break an outer loop in a while's condition");
+            return semantic::makeError();
+        }
+        loopInfo &top = loops_.back();
+        if (!bre->tail_ && top.expected_ && !matches(semantic::makeUnit(), top.expected_)) {
+            error("break without a value in a loop which expects one");
+        }
+        semType* type = (bre->tail_ ? (top.expected_ != nullptr ? expect(bre->tail_, top.expected_) : infer(bre->tail_)) : semantic::makeUnit());
+        top.breaks_.push_back(type);
         return semantic::makeNever();
     }
     if (auto con = dynamic_cast<continueExpr*>(expr); con) {
+        if (loops_.empty()) {
+            error("continue outside a loop");
+            return semantic::makeError();
+        }
+        if (loops_.back().barrier_) {
+            error("attempted to continue an outer loop in a while's condition");
+            return semantic::makeError();
+        }
         return semantic::makeNever();
     }
     if (auto ret = dynamic_cast<returnExpr*>(expr); ret) {
         if (ret->tail_) {
             expect(ret->tail_, currentRet_);
         }
-        else if (currentRet_ != nullptr && !semantic::typeEqual(currentRet_, semantic::makeUnit())) {
+        else if (currentRet_ != nullptr && !matches(currentRet_, semantic::makeUnit())) {
             error("returned an unit in a function with a return type");
         }
         return semantic::makeNever();
@@ -715,6 +1227,9 @@ semType* Checker::infer(Expr* expr) {
     if (auto cast = dynamic_cast<castExpr*>(expr); cast) {
         semType* ltype = infer(cast->from_);
         semType* rtype = transformType(cast->to_);
+        if (ltype->kind_ == semType::kTypeKind::ERROR) {
+            return rtype;
+        }
         if ((!isIntegerType(ltype) && !isBoolType(ltype)) || 
              !isIntegerType(rtype)){
             error("castExpr lhs is neither int nor bool");
@@ -724,6 +1239,12 @@ semType* Checker::infer(Expr* expr) {
     }
     if (auto der = dynamic_cast<derefExpr*>(expr); der) {
         semType* t = infer(der->operand_);
+        if (t->kind_ == semType::kTypeKind::ERROR) {
+            return semantic::makeError();
+        }
+        if (t->kind_ == semType::kTypeKind::BOX) {
+            return t->elem_;
+        }
         if (t->kind_ == semType::kTypeKind::REF) {
             return t->elem_;
         }
@@ -733,6 +1254,9 @@ semType* Checker::infer(Expr* expr) {
         }
     }
     if (auto ref = dynamic_cast<refExpr*>(expr); ref) {
+        if (ref->isMut_ && isPlaceable(ref->operand_) && !isMutablePlaceable(ref->operand_)) {
+            error("attempted to mutably borrow an immutable place");
+        }
         return semantic::makeRef(infer(ref->operand_), ref->isMut_);
     }
     if (auto bin = dynamic_cast<binaryExpr*>(expr); bin) {
@@ -756,53 +1280,93 @@ semType* Checker::infer(Expr* expr) {
         };
         if (inside(op, {"+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", "<", "<=", ">", ">=", "==", "!=", "&&", "||"})) {
             semType* ltype = infer(lhs);
+            if (ltype->kind_ == semType::kTypeKind::ERROR) {
+                return semantic::makeError();
+            }
             if (inside(op, {"+", "-", "*", "/", "%"})) {
+                bool valid = true;
+                eliminateOneShared(ltype, valid);
+                semType* rtype = infer(rhs);
+                eliminateOneShared(rtype, valid);
                 if (!isIntegerType(ltype)) {
-                    error("arith lhs is not an integer type");
-                    return semantic::makeError();
+                    error("arith ltype is not an integer type");
+                    valid = false;
                 }
-                if (!semantic::typeEqual(ltype, digOneRef(infer(rhs)))) {
+                if (!semantic::typeEqual(ltype, rtype)) {
                     error("arith lhs and rhs have different types");
                     return semantic::makeError();
                 }
-                return ltype;
+                return valid ? ltype : semantic::makeError();
             }
             if (inside(op, {"&", "|", "^"})) {
+                bool valid = true;
+                semType* rtype = infer(rhs);
+                eliminateOneShared(ltype, valid);
+                eliminateOneShared(rtype, valid);
                 if (!isIntegerType(ltype) && !isBoolType(ltype)) {
-                    error("bitwise lhs is neither an integer nor a boolean type");
+                    error("bitwise lhs is neither an integer type nor a boolean type");
                     return semantic::makeError();
                 }
-                if (!semantic::typeEqual(ltype, digOneRef(infer(rhs)))) {
-                    error("bitwise lhs and rhs have different types");
+                if (!semantic::typeEqual(ltype, rtype)) {
+                    error("bitwise two sides have different types");
                     return semantic::makeError();
                 }
                 return ltype;
             }
             if (inside(op, {"<<", ">>"})) {
+                bool valid = true;
+                semType* rtype = infer(rhs);
+                eliminateOneShared(ltype, valid);
+                eliminateOneShared(rtype, valid);
                 if (!isIntegerType(ltype)) {
-                    error("shift lhs is neither an integer nor a boolean type");
+                    error("shift lhs is not an integer type");
                     return semantic::makeError();
                 }
-                if (!isIntegerType(digOneRef(infer(rhs)))) {
-                    error("shift lhs and rhs have different types");
+                if (!isIntegerType(rtype)) {
+                    error("shift rhs is not an integer type");
                     return semantic::makeError();
                 }
                 return ltype;
             }
             if (inside(op, {"<", "<=", ">", ">="})) {
-                if (!semantic::typeEqual(ltype, digOneRef(infer(rhs)))) {
-                    error("comparison lhs and rhs have different types");
+                semType* rtype = infer(rhs);
+                if (ltype->kind_ == semType::kTypeKind::ERROR || rtype->kind_ == semType::kTypeKind::ERROR) {
                     return semantic::makeError();
                 }
+                if (canImplicitlyTurn(rtype, ltype)) {
+                    rtype = ltype;
+                }
+                else {
+                    error("comparison rhs can't turn to lhs");
+                    return semantic::makeError();
+                }
+                std::function<semType*(semType*)> eliminateAllRef = [&](semType* type) {
+                    if (type->kind_ == semType::kTypeKind::REF) {
+                        return eliminateAllRef(type->elem_);
+                    }
+                    else {
+                        return type;
+                    }
+                };
+                ltype = eliminateAllRef(ltype);
+                rtype = eliminateAllRef(rtype);
                 if (!isIntegerType(ltype) && !isBoolType(ltype)) {
                     error("arithequal lhs is neither an integer nor a boolean type");
+                    return semantic::makeError();
+                }
+                if (!isIntegerType(rtype) && !isBoolType(rtype)) {
+                    error("arithequal rhs is neither an integer nor a boolean type");
                     return semantic::makeError();
                 }
                 return semantic::makeBuiltin("bool");
             }
             if (inside(op, {"==", "!="})) {
                 if (!semantic::typeEqual(ltype, infer(rhs))) {
-                    error("(not)equal lhs and rhs have different types");
+                    error("(not)equal binaryExpr lhs and rhs have different types");
+                    return semantic::makeError();
+                }
+                if (!canPartialEq(ltype)) {
+                    error("(not)equal binaryExpr type can't partialEq");
                     return semantic::makeError();
                 }
                 return semantic::makeBuiltin("bool");
@@ -860,6 +1424,118 @@ semType* Checker::infer(Expr* expr) {
             }
         }
     }
+    if (auto fie = dynamic_cast<fieldExpr*>(expr); fie) {
+        semType* ftype = infer(fie->from_);
+        while (ftype->kind_ == semType::kTypeKind::REF || ftype->kind_ == semType::kTypeKind::BOX) {
+            ftype = ftype->elem_;
+        }
+        if (ftype->kind_ == semType::kTypeKind::ERROR) {
+            return semantic::makeError();
+        }
+        if (ftype->kind_ != semType::kTypeKind::STRUCT) {
+            error("attempted to use non-struct as a field");
+            return semantic::makeError();
+        }
+        if (table_.structSig.find(ftype->name_) == table_.structSig.end()) {
+            error("fieldExpr base name does not name a struct");
+            return semantic::makeError();
+        }
+        auto fields = table_.structSig[ftype->name_];
+        for (auto sig : fields.fields_) {
+            if (sig.first == fie->name_) {
+                return sig.second;
+            }
+        }
+        error("target field does not have correspond variable name");
+        return semantic::makeError();
+    }
+    if (auto init = dynamic_cast<structInitExpr*>(expr); init) {
+        if (auto path = dynamic_cast<pathExpr*>(init->path_); path) {
+            if (path->path_.size() != 1) {
+                error("structInitExpr path is not a type name");
+                return semantic::makeError();
+            }
+            std::string name = path->path_[0].name_;
+            if (name == "Self") {
+                if (currentStruct_.empty()) {
+                    error("attempted to use \"Self\" in top-level structInitExpr");
+                    return semantic::makeError();
+                }
+                name = currentStruct_;
+            }
+            if (table_.structSig.find(name) == table_.structSig.end()) {
+                error("structInitExpr base name does not name a struct");
+                return semantic::makeError();
+            }
+            auto sig = table_.structSig[name].fields_;
+            auto isig = init->fields_; // AST, not allowed to reference it
+            if (sig.size() != isig.size()) {
+                error("structInitExpr structSig and structField have different size");
+                return semantic::makeError();
+            }
+            std::sort(sig.begin(), sig.end(), [&](std::pair<std::string, semType*> now, std::pair<std::string, semType*> oth) {
+                return now.first < oth.first;
+            });
+            std::sort(isig.begin(), isig.end(), [&](fieldInit now, fieldInit oth) {
+                return now.name_ < oth.name_;
+            });
+            int size = sig.size();
+            for (int i = 0; i < size; i++) {
+                if(sig[i].first != isig[i].name_) {
+                    error("structInitExpr structSig and structField name mismatch");
+                    return semantic::makeError();
+                }
+                expect(isig[i].value_, sig[i].second);
+            }
+            return semantic::makeStruct(name);
+        }
+        else {
+            error("structInitExpr path is not pathExpr");
+            return semantic::makeError();
+        }
+    }
+    if (auto arr = dynamic_cast<arrayExpr*>(expr); arr) {
+        std::vector<semType*> types;
+        if (arr->args_.size() == 0){
+            error("arrayExpr args.size() = 0");
+            return semantic::makeError();
+        }
+        for (auto now : arr->args_) {
+            types.push_back(infer(now));
+        }
+        semType* ret = lub(types);
+        if (ret->kind_ == semType::kTypeKind::ERROR) {
+            return ret;
+        }
+        return semantic::makeArray(ret, arr->args_.size());
+    }
+    if (auto rarr = dynamic_cast<repeatedArrayExpr*>(expr); rarr) {
+        semType* type = infer(rarr->value_);
+        unsigned length = 0;
+        if (!evalArrayLength(rarr->num_, currentStruct_, length)) {
+            return semantic::makeError();
+        }
+        if (length > 1 && !canCopy(type)) {
+            error("constructing a repeatedArray with length greater than one and a non-copyable element");
+            return semantic::makeError();
+        }
+        return semantic::makeArray(type, length);
+    }
+    if (auto index = dynamic_cast<indexExpr*>(expr); index) {
+        semType* type = infer(index->from_);
+        while (type->kind_ == semType::kTypeKind::REF || type->kind_ == semType::kTypeKind::BOX) {
+            type = type->elem_;
+        }
+        if (type->kind_ == semType::kTypeKind::ERROR) {
+            return semantic::makeError();
+        }
+        if (type->kind_ != semType::kTypeKind::ARRAY && type->kind_ != semType::kTypeKind::VEC) {
+            error("attempted to index a non-array type");
+            return semantic::makeError();
+        }
+        expect(index->index_, semantic::makeBuiltin("usize"));
+        return type->elem_;
+    }
     return semantic::makeError();
 }
 
@@ -890,8 +1566,66 @@ semType* Checker::expect(Expr* expr, semType* wish) {
     if (auto block = dynamic_cast<blockExpr*>(expr); block) {
         return checkBlock(block, wish);
     }
+    if (auto loop = dynamic_cast<loopExpr*>(expr); loop) {
+        return checkLoop(loop, wish);
+    }
+    if (auto fi = dynamic_cast<ifExpr*>(expr); fi) {
+        expect(fi->cond_, semantic::makeBuiltin("bool"));
+        if (fi->else_ != nullptr){
+            expect(fi->then_, wish);
+            expect(fi->else_, wish);
+            return wish;
+        }
+        else {
+            expect(fi->then_, semantic::makeUnit());
+            if(!matches(wish, semantic::makeUnit())) {
+                error("if without else has a non-unit type");
+                return semantic::makeError();
+            }
+            return semantic::makeUnit();
+        }
+    }
+    if (auto arr = dynamic_cast<arrayExpr*>(expr); arr) {
+        if (wish->kind_ == semType::kTypeKind::ARRAY) {
+            if (arr->args_.size() != wish->arrayLength_) {
+                error("array literal length mismatch");
+                return semantic::makeError();
+            }
+            for (auto arg : arr->args_) {
+                expect(arg, wish->elem_);
+            }
+            return wish;
+        }
+    }
+    if (auto rarr = dynamic_cast<repeatedArrayExpr*>(expr); rarr) {
+        if (wish->kind_ == semType::kTypeKind::ARRAY) {
+            unsigned length = 0;
+            if (!evalArrayLength(rarr->num_, currentStruct_, length)) {
+                return semantic::makeError();
+            }
+            if (length != wish->arrayLength_) {
+                error("array constexpr length mismatch");
+                return semantic::makeError();
+            }
+            expect(rarr->value_, wish->elem_);
+            if (length > 1 && !canCopy(wish->elem_)) { // Shall I do this ?
+                error("constructing a repeatedArray with length greater than one and a non-copyable element");
+                return semantic::makeError();
+            }
+            return wish;
+        }
+    }
+    if (auto ind = dynamic_cast<indexExpr*>(expr); ind) {
+        semType* btype = infer(ind->from_);
+        if (btype->kind_ == semType::kTypeKind::VEC && !canCopy(btype->elem_) &&
+            semantic::typeEqual(btype->elem_, wish) && !isMutablePlaceable(ind)) {
+                error("attempted to move a non-copy value out of an immutable vector index");
+                return semantic::makeError();
+        }
+        // Note that we do not solve this case, it goes to infer();
+    }
     semType* type = infer(expr);
-    if (!semantic::typeEqual(type, wish)) {
+    if (!matches(type, wish) && !canImplicitlyTurn(type, wish)) {
         error("expect type mismatch");
         return semantic::makeError();
     }
@@ -931,11 +1665,17 @@ void Checker::checkFunction(funcItem* func, const std::string& owner) {
 
 semType* Checker::checkBlock(blockExpr* block, semType* wish) {
     scope_.levelUp();
+    bool reachable = true;
+    semType* last = nullptr;
     for (auto stmt : block->stmts_) {
-        checkStatement(stmt);
+        last = checkStatement(stmt);
+        if (isNever(last)) {
+            reachable = false;
+        }
     }
-    semType* ret = (block->tail_ ? expect(block->tail_, wish) : semantic::makeUnit()); // as mentioned in spec, our wish can inflitrate into block's tail
-    if (wish != nullptr && !semantic::typeEqual(ret, wish)) {
+    semType* ret = (block->tail_ ? expect(block->tail_, wish) : 
+                   (reachable ? semantic::makeUnit() : semantic::makeNever())); // as mentioned in spec, our wish can inflitrate into block's tail
+    if (wish != nullptr && !matches(ret, wish)) {
         error("blockExpr's tail_ has a different semType with our wish");
         scope_.levelDown();
         return semantic::makeError();
@@ -944,16 +1684,350 @@ semType* Checker::checkBlock(blockExpr* block, semType* wish) {
     return ret;
 }
 
-void Checker::checkStatement(Stmt* stmt) {
+semType* Checker::checkLoop(loopExpr* loop, semType* wish) {
+    loops_.push_back(loopInfo{wish, {}});
+    checkBlock(loop->block_, semantic::makeUnit());
+    loopInfo info = loops_.back();
+    loops_.pop_back();
+    if (info.breaks_.empty()) {
+        return semantic::makeNever();
+    }
+    if (wish != nullptr) {
+        return wish;
+    }
+    return lub(info.breaks_);
+}
+
+semType* Checker::checkStatement(Stmt* stmt) {
     if (auto let = dynamic_cast<letStmt*>(stmt); let) {
         semType* curType = let->type_ ? transformType(let->type_) : nullptr;
         semType* init = expect(let->init_, curType);
         scope_.push(let->name_, localShadowing(init, let->isMut_));
+        return isNever(init) ? init : semantic::makeUnit();
     }
     if (auto expr = dynamic_cast<exprStmt*>(stmt); expr) {
-        infer(expr->expr_);
+        semType* type = infer(expr->expr_);
+        if (!expr->hasSemi_ && !matches(type, semantic::makeUnit())) {
+            error("non-tail block statement without semicolon attempted to be non-unit");
+            return semantic::makeError();
+        }
+        return type;
+    }
+    return semantic::makeUnit();
+}
+
+bool Checker::canCopy(semType* type) {
+    if (type->kind_ == semType::kTypeKind::BUILTIN || type->kind_ == semType::kTypeKind::UNIT) {
+        return true;
+    }
+    if (type->kind_ == semType::kTypeKind::REF) {
+        return !type->isMut_;
+    }
+    if (type->kind_ == semType::kTypeKind::ARRAY) {
+        return canCopy(type->elem_);
+    }
+    if (type->kind_ == semType::kTypeKind::BOX) {
+        return false;
+    }
+    if (type->kind_ == semType::kTypeKind::VEC) {
+        return false;
+    }
+    if (type->kind_ == semType::kTypeKind::STRUCT) {
+        std::string name = type->name_ + "Copy";
+        if (state[name] == kLayoutAndDeriveState::UNTOUCHED) {
+            state[name] = kLayoutAndDeriveState::CALCULATING;
+        }
+        else if (state[name] == kLayoutAndDeriveState::CALCULATING) {
+            return false; // Only copy return false here
+        }
+        else if (state[name] == kLayoutAndDeriveState::YES || state[name] == kLayoutAndDeriveState::NO) {
+            return state[name] == kLayoutAndDeriveState::YES;
+        }
+        else { // Won't happen in my imagination
+            error("some strange things happened in derive traits checking");
+            return false;
+        }
+        auto &sig = table_.structSig[type->name_];
+        auto derives = sig.derives_;
+        bool copyable = false, cloneable = false;
+        for (std::string derive : derives) {
+            if (derive == "Copy") {
+                copyable = true;
+            }
+            if (derive == "Clone") {
+                cloneable = true;
+            }
+        }
+        if (!copyable || !cloneable) {
+            state[name] = kLayoutAndDeriveState::NO;
+            return false;
+        }
+        for (auto inner : sig.fields_) {
+            if (!canCopy(inner.second)) {
+                state[name] = kLayoutAndDeriveState::NO;
+                return false;
+            }
+        }
+        state[name] = kLayoutAndDeriveState::YES;
+        return true;
+    }
+    return false;
+}
+bool Checker::canClone(semType* type) {
+    if (type->kind_ == semType::kTypeKind::BUILTIN || type->kind_ == semType::kTypeKind::UNIT) {
+        return true;
+    }
+    if (type->kind_ == semType::kTypeKind::REF) {
+        return !type->isMut_;
+    }
+    if (type->kind_ == semType::kTypeKind::ARRAY) {
+        return canClone(type->elem_);
+    }
+    if (type->kind_ == semType::kTypeKind::BOX) {
+        return canClone(type->elem_);
+    }
+    if (type->kind_ == semType::kTypeKind::VEC) {
+        return canClone(type->elem_);
+    }
+    if (type->kind_ == semType::kTypeKind::STRUCT) {
+        std::string name = type->name_ + "Clone";
+        if (state[name] == kLayoutAndDeriveState::UNTOUCHED) {
+            state[name] = kLayoutAndDeriveState::CALCULATING;
+        }
+        else if (state[name] == kLayoutAndDeriveState::CALCULATING) {
+            return true;
+        }
+        else if (state[name] == kLayoutAndDeriveState::YES || state[name] == kLayoutAndDeriveState::NO) {
+            return state[name] == kLayoutAndDeriveState::YES;
+        }
+        else { // Won't happen in my imagination
+            error("some strange things happened in derive traits checking");
+            return false;
+        }
+        auto &sig = table_.structSig[type->name_];
+        auto derives = sig.derives_;
+        bool cloneable = false;
+        for (std::string derive : derives) {
+            if (derive == "Clone") {
+                cloneable = true;
+            }
+        }
+        if (!cloneable) {
+            state[name] = kLayoutAndDeriveState::NO;
+            return false;
+        }
+        for (auto inner : sig.fields_) {
+            if (!canClone(inner.second)) {
+                state[name] = kLayoutAndDeriveState::NO;
+                return false;
+            }
+        }
+        state[name] = kLayoutAndDeriveState::YES;
+        return true;
+    }
+    return false;
+}
+bool Checker::canPartialEq(semType* type) {
+    if (type->kind_ == semType::kTypeKind::BUILTIN || type->kind_ == semType::kTypeKind::UNIT) {
+        return true;
+    }
+    if (type->kind_ == semType::kTypeKind::REF) {
+        return canPartialEq(type->elem_);
+    }
+    if (type->kind_ == semType::kTypeKind::ARRAY) {
+        return canPartialEq(type->elem_);
+    }
+    if (type->kind_ == semType::kTypeKind::BOX) {
+        return canPartialEq(type->elem_);
+    }
+    if (type->kind_ == semType::kTypeKind::VEC) {
+        return canPartialEq(type->elem_);
+    }
+    if (type->kind_ == semType::kTypeKind::STRUCT) {
+        std::string name = type->name_ + "PartialEq";
+        if (state[name] == kLayoutAndDeriveState::UNTOUCHED) {
+            state[name] = kLayoutAndDeriveState::CALCULATING;
+        }
+        else if (state[name] == kLayoutAndDeriveState::CALCULATING) {
+            return true;
+        }
+        else if (state[name] == kLayoutAndDeriveState::YES || state[name] == kLayoutAndDeriveState::NO) {
+            return state[name] == kLayoutAndDeriveState::YES;
+        }
+        else { // Won't happen in my imagination
+            error("some strange things happened in derive traits checking");
+            return false;
+        }
+        auto &sig = table_.structSig[type->name_];
+        auto derives = sig.derives_;
+        bool partialeqable = false;
+        for (std::string derive : derives) {
+            if (derive == "PartialEq") {
+                partialeqable = true;
+            }
+        }
+        if (!partialeqable) {
+            state[name] = kLayoutAndDeriveState::NO;
+            return false;
+        }
+        for (auto inner : sig.fields_) {
+            if (!canPartialEq(inner.second)) {
+                state[name] = kLayoutAndDeriveState::NO;
+                return false;
+            }
+        }
+        state[name] = kLayoutAndDeriveState::YES;
+        return true;
+    }
+    return false;
+}
+bool Checker::canEq(semType* type) {
+    if (type->kind_ == semType::kTypeKind::BUILTIN || type->kind_ == semType::kTypeKind::UNIT) {
+        return true;
+    }
+    if (type->kind_ == semType::kTypeKind::REF) {
+        return canEq(type->elem_);
+    }
+    if (type->kind_ == semType::kTypeKind::ARRAY) {
+        return canEq(type->elem_);
+    }
+    if (type->kind_ == semType::kTypeKind::BOX) {
+        return canEq(type->elem_);
+    }
+    if (type->kind_ == semType::kTypeKind::VEC) {
+        return canEq(type->elem_);
+    }
+    if (type->kind_ == semType::kTypeKind::STRUCT) {
+        std::string name = type->name_ + "Eq";
+        if (state[name] == kLayoutAndDeriveState::UNTOUCHED) {
+            state[name] = kLayoutAndDeriveState::CALCULATING;
+        }
+        else if (state[name] == kLayoutAndDeriveState::CALCULATING) {
+            return true;
+        }
+        else if (state[name] == kLayoutAndDeriveState::YES || state[name] == kLayoutAndDeriveState::NO) {
+            return state[name] == kLayoutAndDeriveState::YES;
+        }
+        else { // Won't happen in my imagination
+            error("some strange things happened in derive traits checking");
+            return false;
+        }
+        auto &sig = table_.structSig[type->name_];
+        auto derives = sig.derives_;
+        bool eqable = false, partialeqable = false;
+        for (std::string derive : derives) {
+            if (derive == "Eq") {
+                eqable = true;
+            }
+            if (derive == "PartialEq") {
+                partialeqable = true;
+            }
+        }
+        if (!eqable || !partialeqable) {
+            state[name] = kLayoutAndDeriveState::NO;
+            return false;
+        }
+        for (auto inner : sig.fields_) {
+            if (!canEq(inner.second)) {
+                state[name] = kLayoutAndDeriveState::NO;
+                return false;
+            }
+        }
+        state[name] = kLayoutAndDeriveState::YES;
+        return true;
+    }
+    return false;
+}
+
+void Checker::checkLayoutLoop(std::string typeName) {
+    if (reject_) {
+        return;
+    }
+    if (table_.structSig.find(typeName) == table_.structSig.end()) {
+        return;
+    }
+    auto &sig = table_.structSig[typeName];
+    std::string name = typeName + "Layout"; // note that adding any suffix here is acceptable
+        // as long as we use five different suffices for layout, copy, clone, partialeq and eq
+    if (state[name] == kLayoutAndDeriveState::UNTOUCHED) {
+        state[name] = kLayoutAndDeriveState::CALCULATING;
+    }
+    else if (state[name] == kLayoutAndDeriveState::CALCULATING) {
+        error("layout forms a loop");
+        return;
+    }
+    else if (state[name] == kLayoutAndDeriveState::LAYOUTDONE) {
+        return;
+    }
+    for (auto down : sig.fields_) {
+        while (down.second->kind_ == semType::kTypeKind::ARRAY) {
+            down.second = down.second->elem_;
+        }
+        if (down.second->kind_ == semType::kTypeKind::STRUCT) {
+            checkLayoutLoop(down.second->name_);
+        }
+    }
+    state[name] = kLayoutAndDeriveState::LAYOUTDONE;
+    return;
+}
+
+void Checker::checkLayout(Crate* crate) {
+    for (Item* item : crate->items_) {
+        if (auto stru = dynamic_cast<structItem*>(item); stru) {
+            checkLayoutLoop(stru->name_);
+        }
     }
     return;
+}
+
+void Checker::checkDerives(Crate* crate) {
+    for (Item* item : crate->items_) {
+        if (auto stru = dynamic_cast<structItem*>(item); stru) {
+            std::set<std::string> apr;
+            for (auto der : stru->derives_) {
+                if (apr.find(der) != apr.end()) {
+                    error("duplicate derive name : " + der);
+                    return;
+                }
+                apr.insert(der);
+            }
+            bool hasCopy = apr.count("Copy"), hasClone = apr.count("Clone"), 
+                 hasEq = apr.count("Eq"), hasPartialEq = apr.count("PartialEq");
+            // we'll check copy without clone and eq without partialeq above
+            semType* type = semantic::makeStruct(stru->name_);
+            if (hasCopy && !canCopy(type)) {
+                error("struct " + stru->name_ + " does not support Copy");
+                return;
+            }
+            if (hasClone && !canClone(type)) {
+                error("struct " + stru->name_ + " does not support Clone");
+                return;
+            }
+            if (hasEq && !canEq(type)) {
+                error("struct " + stru->name_ + " does not support Eq");
+                return;
+            }
+            if (hasPartialEq && !canPartialEq(type)) {
+                error("struct " + stru->name_ + " does not support PartialEq");
+                return;
+            }
+        }
+    }
+}
+
+void Checker::checkEntry() {
+    auto dt = table_.funcSig.find("main");
+    if (dt == table_.funcSig.end()) {
+        error("main not found");
+        return;
+    }
+    if (!dt->second.params_.empty()) {
+        error("main should not have value parameters");
+    }
+    if (dt->second.retType_ == nullptr ||
+        dt->second.retType_->kind_ != semType::kTypeKind::UNIT) {
+        error("main should return unit");
+    }
 }
 
 void Checker::error(std::string message) {
@@ -975,6 +2049,19 @@ void Checker::checkCrate(Crate* crate) {
     if (reject_) {
         return;
     } // stage 0 ended: register all functions, structs, constvalues, implements ; evaluated constvalues ; evaluated all types mentioned in former items
+
+    checkEntry();
+    if (reject_) {
+        return;
+    }
+    checkLayout(crate); // This is stage final. Time really flies.
+    if (reject_) {
+        return;
+    }
+    checkDerives(crate);
+    if (reject_) {
+        return;
+    }
 
     for (Item* item : crate->items_) {
         checkItem(item);

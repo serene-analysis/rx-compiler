@@ -2,2430 +2,362 @@
 
 **Session ID:** ses_ed768f957ffe6fu05usjda7Bum
 **Created:** 10/11/2026, 9:32:28 AM
-**Updated:** 10/11/2026, 4:43:01 PM
+**Updated:** 10/18/2026, 3:03:50 PM
 
 ---
 
-## Assistant (Build · DeepSeek V4.1 Flash · 20.6s)
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 18.7s)
 
 _Thinking:_
 
-The user asks:
-1. Can structs contain constants directly, or must constants be defined in the corresponding impl? This relates to const evaluation.
-2. What can structs and impls contain respectively in Rx?
-3. What paths are allowed for ConstValue's PATH kind? E.g., can it go into a struct to find another ConstValue? Can it go into Vec<i32> to find something?
+The user asks: "你是说这一步只需要写出 lookupValue 就好了是吗？那 infer 是干什么的呢？" — They're confused about the division between step 1 (lookupValue / name resolution) and infer.
 
-Let me answer based on the spec and AST/grammar:
+I need to clarify: lookupValue is a helper used BY infer; step 1 isn't "only lookupValue" — you also need the minimal `infer` for path expressions (and the skeleton that calls it), otherwise nothing uses lookupValue. Specifically:
 
-**Struct contents**: only fields (and derive attributes), lifetime params, where clauses. No constants, no functions. From the spec structs page: "A struct declaration defines a name, optional lifetime parameters and where-clause bounds, and a brace-delimited list of named fields. The field list may include an optional trailing comma after the final field. A struct may have derive attributes." So struct body = only named fields + derives.
+- `lookupValue` (or `lookupLocal`/`lookupConst`) is just the table lookup; it answers "this name refers to what type".
+- `infer(Expr*)` is the recursive type calculator for every expression node: it dispatches on Expr kind; for `pathExpr` it calls lookupValue; for literals it returns types; for binary it infers children and applies operator rules; for calls it resolves sig; etc.
+- Step 1's goal: name resolution + minimal `infer` covering literals, path, unit, and enough of block/stmt to run let statements. So "step 1" = lookupValue + infer's first few branches + checkBlock/checkStatement definitions (because link error).
+- `expect(Expr*, expected)` is infer with an expected type (for literals etc.), which comes more in step 2.
 
-**Impl contents**: associated items = constants + functions (methods/associated functions), plus lifetime params/where clause. From items/associated-items.html: "An inherent impl block may contain associated constants, associated functions, and methods." Only constant items and function definitions. No fields, no struct definitions, no nested impls.
+Give a clear mental model:
+- lookupValue: leaf lookup (name → symbol/type).
+- infer: bottom-up type computation for the whole expression tree, using lookupValue for names and recursively calling itself.
+- expect/check: top-down with expected type, used at specific sites.
 
-**ConstValue PATH allowed paths**:
-From const_eval.html: `ConstantPath → PathInExpression`, and "ConstantPath must resolve to a constant item, either directly or through an associated-constant path such as `LIMIT`, `Config::LIMIT`, or `Self::LIMIT`. A path to a local, function, or other value is a static form error."
+Also give concrete skeleton of infer's switch and say which branches step 1 should have: intLit/boolLit/unit/path, maybe call; the rest can return makeError placeholders so it compiles and doesn't crash. And checkBlock/checkStatement to drive let + exprStmt.
 
-So allowed:
-- Unqualified top-level constant: `LIMIT`, `N`.
-- Associated constant via type name: `Config::LIMIT`, `Point::ZERO`.
-- `Self::LIMIT` inside impl.
-- What about multi-segment paths? `PathInExpression` grammar allows multiple segments: `pathExprSegment (:: pathExprSegment)*` where pathExprSegment can have generic args (`::<T>`). The spec says "either directly or through an associated-constant path such as LIMIT, Config::LIMIT, or Self::LIMIT". So the forms are: one segment (top-level const), or two segments (Type::NAME or Self::NAME). Can it be more? E.g., `A::B::C`? In Rx there are no modules/namespaces, only structs with assoc items. A path `A::B::C` would mean... the prefix `A::B` is a type? That's not resolvable: `A::B` isn't a type unless there are nested types (no user modules, no assoc types in Rx). So effectively `A::B::C` cannot resolve to a constant item. The spec examples show at most 2 segments. The AST stores path as a string `text_` for PATH ConstValue. The plan in now_todolist_3 says: 常量名解析：非限定 `N`、`Type::NAME`、`Self::NAME`；指向局部/函数 → 编译错误.
+Also explain the call chain: checkFunction → checkBlock → checkStatement (let → expect/infer(init)) → infer(path) → lookupValue. So writing only lookupValue does nothing; infer must call it.
 
-- Can it go into a struct and find a const? `Type::NAME` where Type is a struct → yes, associated consts only exist in impl (struct can't define them). But the path syntax is the same: `Point::LIMIT` looks in "methods/assoc consts table" for Point. That's the only "into struct" route. Note: assoc consts are stored in GlobalTable::associatedConsts keyed by struct name.
-- Can it go into `Vec<i32>` to find something? No — `Vec` is a protected builtin type, cannot have impls ("Because inherent implementations can only be declared for user-defined structs, inherent methods cannot be added to protected builtin types"). So `Vec::<i32>::LIMIT` or `Vec::new` as a constant path → no associated constants exist for Vec → static form error (not a constant item). Also in constant context, referencing `Vec::new` would be a path to a function → compile error.
-- What about `Box::<T>::new` in ConstValue? No — functions aren't constants.
-- Generic args in const path segments: `Config::<i32>::LIMIT`? Rx has no generics (only lifetime params); type args are only for Box/Vec containers. A user struct can't take type params. So generic args in a const path would only make sense for Box/Vec, which have no associated constants. Tests won't have this (probably invalid/UB). We can handle simply: split by "::", if 1 segment → top-level const; if 2 segments → owner::name; otherwise error.
+Let me answer concisely with a code sketch of the dispatch and the minimal set for step 1. Also mention `expect` relationship. No tools needed.
 
-Also need to be careful with `Self::NAME`: while evaluating an assoc const, `Self` = current struct (the owner). While evaluating a top-level const, `Self` shouldn't appear (can't use Self outside impl).
+不是，`lookupValue` 只是 `infer` 的一个**零件**。依赖关系是：
 
-Another subtlety: the AST ConstValue PATH's `text_` is `ctx->pathInExpression()->getText()`. What does `getText()` return for `Self::LIMIT`? Concatenation of all tokens without spaces: "Self::LIMIT". For generic args `Cfg::<i32>::LIMIT` → "Cfg::<i32>::LIMIT". Splitting by "::" would produce "Cfg", "<i32>", "LIMIT" — 3 segments. But this shouldn't appear in valid tests.
-
-Also constant-name collision guarantee: local bindings colliding with visible unqualified constants is UB; assoc consts reachable only as `Type::NAME` do not collide with locals. So in the evaluator, only unqualified `N` looks at global consts, not assoc consts. Good.
-
-Also, can a const initializer reference an assoc const of a *different* struct? Yes: `const X: usize = Point::LIMIT;` if Point::LIMIT is a const. The spec says "either directly or through an associated-constant path such as LIMIT, Config::LIMIT, or Self::LIMIT".
-
-What about referencing an assoc const from within the same impl without qualification, e.g.:
-```rust
-impl S {
-    const A: usize = 1;
-    const B: usize = A;  // ← is A visible unqualified here?
-}
-```
-Hmm. In Rust, associated constants are not in scope unqualified inside an impl — you need `Self::A`. What does Rx spec say? const_eval: "ConstantPath must resolve to a constant item, either directly or through an associated-constant path such as LIMIT, Config::LIMIT, or Self::LIMIT." "directly" = top-level constant. So inside impl, unqualified `A` would NOT refer to the sibling assoc const; it would have to be `Self::A`. Is that a compile error if `A` is not a top-level const? Yes: path to a local/function/other → static form error; and unresolved name → compile error. I should check names.html scope rules: "Top-level and associated-item lookup is independent of declaration order." How are associated items looked up? Only via paths `Type::member`. Associated items aren't introduced into any unqualified scope. I believe unqualified `A` inside impl doesn't resolve to the assoc const. Let me verify with tests maybe. Search the test suite for assoc const references.
-
-Let me grep the semantic tests for `const` and `::` in const values to see patterns. This is a good idea to ground the answer. Let me look at constants-and-paths and constant-errors suites.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "ls /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/constants-and-paths/ /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/constant-errors/"
-}
+```text
+checkFunction → checkBlock → checkStatement(let/exprStmt)
+                               └→ infer(init) ── pathExpr ──→ lookupValue
 ```
 
-**Output:**
-```
-/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/constant-errors/:
-acc-forward-constant-reference-and-negation.rx
-manifest.json
-rej-a-constant-path-must-resolve-to-a-constant.rx
-rej-an-i32-constant-cannot-be-a-usize-repeat-count.rx
-rej-array-length-must-be-usize.rx
-rej-associated-constant-cycle.rx
-rej-constant-initializer-must-match-declared-type.rx
-rej-direct-constant-dependency-cycle.rx
-rej-indirect-constant-cycle.rx
-rej-repeat-length-cannot-name-a-local.rx
-rej-unsigned-constant-negation-is-invalid.rx
+`lookupValue` 只回答"这个**名字**是什么类型"；`infer` 是"**递归地算出任意表达式的类型**"。单独写 `lookupValue` 没有任何地方会调用它。
 
-/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/constants-and-paths/:
-acc-array-lengths-compare-by-value-associated-constants-do-not-reserve-unqualified-locals.rx
-manifest.json
-rej-array-length-must-have-usize-type.rx
-rej-constant-dependency-cycle.rx
+分工：
 
-```
+| 函数 | 职责 | 输入 |
+|---|---|---|
+| `lookupValue(name)` | 查一个裸名字（局部 → 常量） | 名字 |
+| `infer(expr)` | 按节点 kind 递归算类型：字面量直接给；`pathExpr` 调 `lookupValue`；`binaryExpr` 先 `infer(lhs)`、`infer(rhs)` 再套运算符规则；`callExpr` 查签名；`block` 调 `checkBlock`…… | 表达式树 |
+| `expect(expr, wish)` | `infer` 的"带期望类型"版本：字面量按 wish 定型、块尾把 wish 传下去，其余退回 `infer` + `typeEqual` | 表达式 + 期望类型 |
 
-**Tool: bash**
+所以**第 1 步实际要写的是**：`lookupValue` + `infer` 的前几个分支 + `checkBlock`/`checkStatement`（不然链接不过），让 `let` 语句能跑起来：
 
-**Input:**
-```json
-{
-  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic\"; grep -rn \"const \" constants-and-paths/ constant-errors/ | head -60"
+```cpp
+semType* Checker::infer(Expr* e) {
+    if (auto* x = dynamic_cast<intLitExpr*>(e)) {
+        std::string suf = intSuffix(x->value_);
+        return suf.empty() ? makeBuiltin("i32") : makeBuiltin(suf);
+    }
+    if (dynamic_cast<boolLitExpr*>(e)) return makeBuiltin("bool");
+    if (dynamic_cast<unitExpr*>(e))    return makeUnit();
+    if (auto* x = dynamic_cast<pathExpr*>(e)) {
+        if (x->path_.size() == 1) {
+            if (auto* l = scope_.find(x->path_[0].name_)) return l->type_;
+            auto it = table_.constSig.find(x->path_[0].name_);
+            if (it != table_.constSig.end()) return it->second.type_;
+            error("unresolved value name : " + x->path_[0].name_);
+            return makeError();
+        }
+        // 2 段：Self::N / Config::N，Phase 2 可以先 makeError 占位
+    }
+    if (auto* x = dynamic_cast<blockExpr*>(e)) return checkBlock(x, nullptr);
+    // 其他节点这一步先 return makeError(); 别 throw，Phase 2/3/4/5 再逐个填
+    return makeError();
 }
 ```
 
-**Output:**
-```
-constants-and-paths/acc-array-lengths-compare-by-value-associated-constants-do-not-reserve-unqualified-locals.rx:3:const COUNT: usize = Config::N;
-constants-and-paths/acc-array-lengths-compare-by-value-associated-constants-do-not-reserve-unqualified-locals.rx:4:const VALUE: i32 = LATER;
-constants-and-paths/acc-array-lengths-compare-by-value-associated-constants-do-not-reserve-unqualified-locals.rx:9:    const N: usize = (3);
-constants-and-paths/acc-array-lengths-compare-by-value-associated-constants-do-not-reserve-unqualified-locals.rx:10:    const NEG: i32 = -VALUE;
-constants-and-paths/acc-array-lengths-compare-by-value-associated-constants-do-not-reserve-unqualified-locals.rx:12:const LATER: i32 = 7;
-constants-and-paths/rej-array-length-must-have-usize-type.rx:3:const N: i32 = 3;
-constants-and-paths/rej-constant-dependency-cycle.rx:3:const A: i32 = B;
-constants-and-paths/rej-constant-dependency-cycle.rx:4:const B: i32 = A;
-constant-errors/acc-forward-constant-reference-and-negation.rx:3:const B: i32 = -A;
-constant-errors/acc-forward-constant-reference-and-negation.rx:4:const A: i32 = 3;
-constant-errors/rej-a-constant-path-must-resolve-to-a-constant.rx:6:const N: i32 = value;
-constant-errors/rej-an-i32-constant-cannot-be-a-usize-repeat-count.rx:3:const N: i32 = 2;
-constant-errors/rej-array-length-must-be-usize.rx:3:const N: bool = true;
-constant-errors/rej-associated-constant-cycle.rx:7:    const A: i32 = Self::B;
-constant-errors/rej-associated-constant-cycle.rx:8:    const B: i32 = Self::A;
-constant-errors/rej-constant-initializer-must-match-declared-type.rx:3:const N: i32 = true;
-constant-errors/rej-direct-constant-dependency-cycle.rx:3:const A: i32 = A;
-constant-errors/rej-indirect-constant-cycle.rx:3:const A: i32 = B;
-constant-errors/rej-indirect-constant-cycle.rx:4:const B: i32 = A;
-constant-errors/rej-unsigned-constant-negation-is-invalid.rx:3:const N: u32 = -1u32;
+`checkStatement` 里 `let` 就是"先 `infer(init_)`、再 `scope_.push(name, {type, isMut})`"——这样 `let x = x;` 才会在 init 里查不到 x（因为还没 push）。
 
-```
+`expect` 可以现在只写个最小版（`intLit` 按 wish、`block` 穿透 wish、其余 `infer` + `typeEqual`），也可以等第 2 步。第 1 步结束时能过的用例大概是 `rej-unresolved-value-name`、`rej-a-binding-is-invisible-in-its-own-initializer`、`rej-a-block-local-name-cannot-escape`，以及所有"能正常调用 println_i32"的正例不再报错。
 
 ---
 
-## Assistant (Build · DeepSeek V4.1 Flash · 13.3s)
+## User
 
-_Thinking:_
-
-Let me read all those test files fully as they directly inform the constant evaluation semantics.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic\"; for f in constants-and-paths/acc-array-lengths-compare-by-value-associated-constants-do-not-reserve-unqualified-locals.rx constants-and-paths/rej-array-length-must-have-usize-type.rx constant-errors/acc-forward-constant-reference-and-negation.rx constant-errors/rej-a-constant-path-must-resolve-to-a-constant.rx constant-errors/rej-an-i32-constant-cannot-be-a-usize-repeat-count.rx constant-errors/rej-array-length-must-be-usize.rx constant-errors/rej-associated-constant-cycle.rx constant-errors/rej-constant-initializer-must-match-declared-type.rx constant-errors/rej-unsigned-constant-negation-is-invalid.rx; do echo \"=== $f\"; cat \"$f\"; done"
-}
-```
-
-**Output:**
-```
-=== constants-and-paths/acc-array-lengths-compare-by-value-associated-constants-do-not-reserve-unqualified-locals.rx
-use rx::core::*;
-
-const COUNT: usize = Config::N;
-const VALUE: i32 = LATER;
-struct Config {
-    x: i32,
-}
-impl Config {
-    const N: usize = (3);
-    const NEG: i32 = -VALUE;
-}
-const LATER: i32 = 7;
-fn main() {
-    let mut a: [i32; COUNT] = [VALUE; Config::N];
-    a[1] = Config::NEG;
-    println_i32(a[0]);
-    println_i32(a[1]);
-    println_i32(a.len() as i32);
-    let N = 9;
-    println_i32(N);
-}
-=== constants-and-paths/rej-array-length-must-have-usize-type.rx
-use rx::core::*;
-
-const N: i32 = 3;
-fn main() {
-    let a = [1; N];
-}
-=== constant-errors/acc-forward-constant-reference-and-negation.rx
-use rx::core::*;
-
-const B: i32 = -A;
-const A: i32 = 3;
-fn main() {
-    println_i32(B);
-}
-=== constant-errors/rej-a-constant-path-must-resolve-to-a-constant.rx
-use rx::core::*;
-
-fn value() -> i32 {
-    1
-}
-const N: i32 = value;
-fn main() {}
-=== constant-errors/rej-an-i32-constant-cannot-be-a-usize-repeat-count.rx
-use rx::core::*;
-
-const N: i32 = 2;
-fn main() {
-    let a = [1; N];
-}
-=== constant-errors/rej-array-length-must-be-usize.rx
-use rx::core::*;
-
-const N: bool = true;
-fn main() {
-    let a: [i32; N] = [1; 1];
-}
-=== constant-errors/rej-associated-constant-cycle.rx
-use rx::core::*;
-
-struct S {
-    x: i32,
-}
-impl S {
-    const A: i32 = Self::B;
-    const B: i32 = Self::A;
-}
-fn main() {}
-=== constant-errors/rej-constant-initializer-must-match-declared-type.rx
-use rx::core::*;
-
-const N: i32 = true;
-fn main() {}
-=== constant-errors/rej-unsigned-constant-negation-is-invalid.rx
-use rx::core::*;
-
-const N: u32 = -1u32;
-fn main() {}
-
-```
+我看你 infer(pathExpr) 和我写的 lookupValue 不是一样的吗？我理解错了？以及，pathseg 为什么还装了个 vector<Type*> 啊？我看 parser 写的不是 usePathSegment
+    : identifier | SELF_VALUE | SUPER | CRATE
+    ;  吗？难道 AST 压缩了什么东西？
 
 ---
 
-## Assistant (Build · DeepSeek V4.1 Flash · 30.6s)
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 18.5s)
 
 _Thinking:_
 
-These tests confirm the semantics:
+The user asks two things:
 
-1. `constants-and-paths/acc-...`: 
-   - `const COUNT: usize = Config::N;` — assoc const via type name, forward reference across items.
-   - `const VALUE: i32 = LATER;` — forward reference to a later top-level const.
-   - Impl has `const N: usize = (3);` and `const NEG: i32 = -VALUE;` — assoc const initializer uses `VALUE` unqualified (top-level const), and `Config::N` used elsewhere. Note inside impl, `const NEG: i32 = -VALUE;` references top-level VALUE, not assoc.
-   - `let N = 9;` — local named N doesn't conflict with assoc const `Config::N` (assoc const reachable only as Type::NAME doesn't reserve unqualified local names) — this is the test's point. Note: if there were a *top-level* const N, then local N would be UB (excluded from tests). Here assoc only, so `let N` is valid.
-   - `[VALUE; Config::N]` — repeat count is assoc const; `[i32; COUNT]` array type length is a const path.
+1. "我看你 infer(pathExpr) 和我写的 lookupValue 不是一样的吗？我理解错了？" — They think my infer(pathExpr) code is the same as their lookupValue. I need to see their current lookupValue implementation to compare. Let me read the current checker.cpp for lookupValue. Maybe they wrote a `lookupValue` that returns semType* and handles the same branches. My point: infer(pathExpr) is one call site of lookupValue; if their lookupValue returns a symbol (with type and mutability) or does the lookup, infer should delegate. If theirs returns semType*, then yes, the code is effectively the same — the difference is structural: `infer` must call `lookupValue` rather than duplicating. If they literally wrote `lookupValue(name)` doing local→const and returning type, then infer(path) just returns lookupValue(name) and errors on null. That's fine. Let me read the file to see what they wrote.
 
-2. Type checks on const:
-   - `const N: i32 = 3; let a = [1; N];` → rejected: repeat count must be usize typed (even though value 3 is fine).
-   - `const N: bool = true; let a: [i32; N]` → rejected: array length must be usize.
-   - `const N: i32 = true;` → rejected: init must match declared type.
-   - `const N: u32 = -1u32;` → rejected: unsigned negation invalid. Interesting: the suffix `u32` fixes the literal type, so negating u32 is invalid. So the const evaluator must check the declared type for NEG: if the target type is unsigned → error. Also `-VALUE` where VALUE: i32 fine.
-   - `const N: i32 = value;` (fn value) → rejected: path must resolve to a constant.
-   - `rej-array-length-must-have-usize-type.rx` vs `rej-an-i32-constant-cannot-be-a-usize-repeat-count.rx` — both type-checks: array length and repeat count require *declared type* usize. So for array lengths, not only must we get a numeric value, we must check the const's declared type is usize. Note the type check requires the const's declared type to be resolved first (pass 3 territory). Hmm — but our planned order is: register names → evaluate all constants → resolve types. The type check "array length must be usize" requires the const's declared type, which is resolved in pass 3. But `transformType` (pass 3) itself handles ARRAY length, so at that point the const's declared type may be resolved... order within pass 3 matters: if the ARRAY type syntax is in a fn signature and the const's declared type hasn't been resolved yet (const declared later), then transformType on ARRAY would evaluate the length but the type check needs the const's `type_`. Options: resolve const declared types first in pass 1.5/2.5, or evaluate + check types lazily in the evaluator by resolving the const's declared type on demand. Let me think.
+2. "pathseg 为什么还装了个 vector<Type*> 啊？我看 parser 写的不是 usePathSegment : identifier | SELF_VALUE | SUPER | CRATE 吗？难道 AST 压缩了什么东西？"
 
-The three-step plan:
-1. register names + syntax pointers
-2. evaluate all constants (fill ivalue_/bvalue_)
-3. resolve types (fields/signatures/const declared types; ARRAY lengths)
+They're confusing `usePathSegment` (in the *use declaration* grammar) with `pathExprSegment` in the expression grammar. AST `pathSeg` holds `name_` and `types_` (generic args) because expression paths support turbofish: `Box::<i32>::new` — the segment carries generic type args. The grammar `pathExprSegment : pathIdentSegment (PATHSEP? genericArgs)?`. So `Vec::<i32>::new` → segments: {name="Vec", types_=[i32]}, {name="new"}. That's why `vector<Type*>`.
 
-For step 2, evaluation of a const's value is fine without types (Rx const syntax has no arithmetic, so literal/path/neg only; result's numeric value is computable). But the *legality* checks need types:
-- `-1u32` / `-VALUE` where VALUE: u32 → error (unsigned negation).
-- `const N: i32 = true` → error (init vs declared type).
-- array length const must be usize → error.
-- `[i32; N]` where N: bool → error (length must be usize, not just "numeric").
+`usePathSegment` is only for `use` declarations (discarded), and `SUPER/CRATE` are only valid there (use paths); Rx tests never rely on them. Expression paths use `pathIdentSegment : identifier | SELF_VALUE | SELF_TYPE`, so `self` and `Self` can be path segments; `super`/`crate` cannot appear in expressions.
 
-So evaluation must know the type of each const. That suggests transformType (or at least const declared types) must be resolved before/along with evaluation, or evaluation is split: numeric value computed in step 2 but checks after type resolution in step 3.
+Let me verify the exact grammar in Parser.g4:
+- `usePathSegment : identifier | SELF_VALUE | SUPER | CRATE ;` (use only)
+- `pathExprSegment : pathIdentSegment (PATHSEP? genericArgs)? ;`
+- `pathIdentSegment : identifier | SELF_VALUE | SELF_TYPE ;`
+- `pathInExpression : pathExprSegment (PATHSEP pathExprSegment)* ;`
 
-Wait, the todo doc says the doc was updated to: step 2 求值全部常量 fills ivalue_/bvalue_; step 3 解析类型. And `transformType` ARRAY branch calls evalConstInt to get the number, "此时常量都已是 DONE". But the *usize type check* for array length must happen somewhere. If the const's declared type resolution happens in pass 3, and array lengths are also resolved in pass 3, there's an ordering issue only if the array type appears before the const's declared type is resolved (which is likely: signatures before consts). But since transformType calls evalConstInt lazily, it can also ensure the referenced const's declared type is resolved on demand (recursive resolution). Or we can reorder pass 3 to resolve all const *declared types* first, then struct fields/signatures. Hmm.
+Yes. The AST builder's `visitPathInExpression` collects each segment's generic args (`s.types_`). So `types_` holds turbofish type arguments. For normal `a::b`, empty.
 
-Actually, better: in step 2 (evaluate), for each const we can:
-- resolve its declared type on demand (call transformType on the const's type syntax) to check initializer type vs declared; but this is circular with transformType for ARRAY types in const's declared type... e.g., `const A: [i32; N] = ...` isn't valid anyway (const values only literals/bools, can't initialize an array). But the *declared type* of a const could syntactically be `[i32; N]`; the value can't be an array, so it's an error anyway. Tests probably don't include such.
+Also note: `pathSeg.types_` vector<Type*> where Type is AST Type. The AST builder pushes types from `genericArg` (only typeRef ones; lifetimes ignored). So `Vec::<i32>::new` stores i32 in the "Vec" segment.
 
-Actually simpler: do type checks of constants in a later step (after pass 3 resolves declared types), and only compute values in step 2. But then `-1u32` check needs declared type. We could store "isNegative" flag and defer the check. Or in step 2, when evaluating, call a helper `constDeclType(name)` that lazily resolves the declared type. Since declared types are mostly builtins (i32/usize/bool), lazy resolution is easy.
-
-Hmm, but the user's question is narrower. Let me not over-design; answer the question and point out this ordering subtlety.
-
-Actually wait — re-read the test `rej-an-i32-constant-cannot-be-a-usize-repeat-count.rx`: `const N: i32 = 2; let a = [1; N];` → rejected. The repeated-array length `N` is a ConstValue path; its const has declared type i32, not usize. So when evaluating the repeat length, we must check the referenced const's type is usize. This applies to both array type lengths and repeat lengths. So the evaluator needs types.
-
-Also note: `[1; N]` where N is a **local** name (not const) is `rej-repeat-length-cannot-name-a-local.rx` presumably → error. Let me check that too. And `rej-a-binding-is-invisible-in-its-own-initializer` etc. But the user's questions:
-
-1. Can struct contain constants? No — only fields + derives. Constants must be in impl (associated constants) or top level.
-2. What can struct and impl contain respectively? Struct: named fields only (+ derives, lifetime generics/where). Impl: associated constants and functions only (methods & assoc fns). No fields, no nested structs/impls. Also invalid impls: target must be user struct.
-3. ConstValue PATH allowed paths:
-   - unqualified constant item: `N`
-   - associated const via type: `Config::N`
-   - `Self::N` inside impl
-   - Path must resolve to a constant item; local/function/other value → compile error (static form error).
-   - `Vec<i32>` / `Vec::new` etc.: no associated constants on builtins; `Vec::<T>::...` would not resolve to a constant → compile error. `Box`/`Vec` have no consts. Also generic args in paths — Box::<i32>::new for constructors in expressions, but in const context a function path is invalid anyway.
-   - Can it "enter a struct to find another ConstValue"? Only via `Struct::NAME` associated const (defined in an impl of that struct). There are no nested constants inside struct bodies. Dotted path deeper than 2 segments has nothing to resolve to (no modules/nested types), so error.
-   - Type-cast/let in const value? No.
-   
-Also important: evaluation type checks. Let me also read rej-repeat-length-cannot-name-a-local.rx and maybe the manifest descriptions of the other constant tests for full coverage.
-
-Let me also check how `PathInExpression` handles `Self::N`: text is "Self::N". And `Config::N`: text "Config::N".
-
-Also the question of whether `[i32; N]` in a const's declared type etc. Not needed.
-
-Another point: associated const referencing sibling unqualified: `impl Config { const NEG: i32 = -VALUE; }` uses top-level VALUE. Is `const NEG2: i32 = N;` inside same impl valid referring to assoc N? Based on spec, ConstantPath resolves "directly (top-level const) or through associated-constant path (Config::LIMIT / Self::LIMIT)". So unqualified `N` inside impl would mean a top-level const `N`, not the sibling assoc const. If no top-level N exists → compile error. I should tell the user this.
-
-Let me verify with a custom test? Can't compile rxcc semantic (not implemented). Could check Rust semantics, but spec is authoritative here. The test `acc-array-lengths-...` has `impl Config { const N: usize = (3); const NEG: i32 = -VALUE; }` — NEG doesn't reference N unqualified (it references top-level VALUE), which supports the reading that unqualified names inside impl refer only to top-level consts. There's no test with `const B = A` inside the same impl referring to assoc A. Given spec wording, treat unqualified as top-level only.
-
-Now, what about const path inside *top-level* const referencing `Self::`? Self outside impl is invalid. And `Config::N` from top-level const works (test COUNT). Good.
-
-What about array length referencing assoc const? Yes: `[VALUE; Config::N]` and `a[1] = Config::NEG;`—also `let mut a: [i32; COUNT]` where COUNT is top-level. So both forms work in all three const contexts.
-
-Type rules for const contexts:
-- const initializer: must match declared type. Typing: literal suffix or declared expected type; e.g., `const N: i32 = true` → error. `const N: u32 = -1u32` → error (unsigned negation). `const NEG: i32 = -VALUE` → VALUE: i32, negation of signed → ok. What about `-1` with declared i32: allowed by default i32 (spec: `const N: i32 = -1;` valid). `-1isize` valid; `const N: isize = -1;` UB (propagation exclusion) so not in tests. So NEG node: value = magnitude; type must be signed (i32/isize) if it ends up negative; the declared type must be matched.
-- array type length & repeat length: the constant must have declared type usize, and (maybe) value fits. `const N: bool = true; [i32; N]` → error. Also `const N: i32 = 3; [i32; N]` → error.
-- Note: `[i32; 4]` literal directly with suffix? `4` expected usize → usize. Handled by evalConstInt directly on ConstValue INT without suffix? For array length, the expected type is usize; so literal `4` is usize. Fine — but if literal has a suffix `4i32`, is that an error? Probably yes (array length must be usize; `[i32; 4i32]` would be a type error). Tests might not include. We can handle: when evaluating array length from an INT literal, its type is usize; a suffix other than usize → error.
-- Negative array length: `[i32; -1]`? Negative forms require signed type; usize is unsigned → error. Probably a test somewhere? Not in the list I saw. rej-unsigned-constant-negation is about `const N: u32 = -1u32`. For array lengths, `-1` with expected usize would be invalid. Handle by checking sign/type.
-
-So the evaluator needs to track value *and* type for each const. The current constSignature has `type_` (declared type), `ivalue_`, `bvalue_`. For evaluation of a const, we can check declared type against value form. For array lengths, check `refConst.type_ == usize` (after resolving it). The ordering issue: `transformType` runs in pass 3; when evaluating array length it may reference a const whose `type_` isn't resolved yet (because const declaration appears later in the file and pass 3 iterates items in order). Two clean options:
-- In pass 3, resolve all const declared types *before* resolving other types (a sub-loop). Since declared types can be simple (i32/usize/bool/... possibly arrays? `const A: [i32; N]` — allowed syntax? ConstantItem type can be any Type. Initializer must be a ConstValue; can't initialize arrays, so invalid anyway; but the declared type could still be resolved).
-- Or in `evalConstInt`/`evalConst` when encountering a path, lazily resolve the target const's declared type on demand, and guard with its own state.
-
-Since collect has exactly 3 steps per plan, we can add a "resolve const declared types" as a sub-step of pass 3 (do consts first, then structs/signatures), OR do it lazily in the evaluator. Simplest robust approach: in pass 3, first loop over all consts/assoc consts and resolve their declared types; then arrays lengths encountered in signatures can safely check `type_`. But if arrays appear in a const's own declared type referencing an unresolved const type... rare/invalid; lazy recursion with a separate state avoids it.
-
-I'll mention this ordering issue briefly as a design note, since the user said "这关系到常量求值".
-
-Now, is there an issue with evaluating values in step 2 before types in step 3? For `-1u32` check, we could record `negative=true` and verify after type resolution. Alternatively evaluate in step 2 only values, then in step 3 do type checks. The user asked specifically about structure contents and paths, so let me answer those precisely and flag the type-check ordering.
-
-Let me also read `rej-repeat-length-cannot-name-a-local.rx` to confirm local issue.
+Let me read their lookupValue to answer #1 precisely.
 
 **Tool: bash**
 
 **Input:**
 ```json
 {
-  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/constant-errors\"; cat rej-repeat-length-cannot-name-a-local.rx; echo ===; cat manifest.json"
+  "command": "grep -n \"lookupValue\\|lookupLocal\\|lookupConst\" \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp\" \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.h\"; echo ===; sed -n '/lookupValue/,/^}/p' \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp\" | head -40; echo ===; grep -n \"usePathSegment\\|pathExprSegment\\|pathIdentSegment\\|SUPER\\|CRATE\" \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/grammar/Parser.g4\" | head"
 }
 ```
 
 **Output:**
 ```
-use rx::core::*;
-
-fn main() {
-    let n = 2usize;
-    let a = [1; n];
+/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp:510:semType* Checker::lookupValue(std::string name) { // I think the spec said that using function as a value is an UB?
+/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp:516:        error("can't resolve name in lookupValue : " + name);
+/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.h:25:    semType* lookupValue(std::string name);
+===
+semType* Checker::lookupValue(std::string name) { // I think the spec said that using function as a value is an UB?
+    if (scope_.memory_.find(name) != scope_.memory_.end()) {
+        return scope_.memory_[name].top().type_;
+    }
+    auto sig = findConst(currentStruct_, name);
+    if (sig == nullptr) {
+        error("can't resolve name in lookupValue : " + name);
+        return semantic::makeError();
+    }
+    return sig->type_;
 }
 ===
-[
-  {
-    "source": "acc-forward-constant-reference-and-negation.rx",
-    "stage": "semantic",
-    "compilation_success": true,
-    "description": "Forward constant reference and negation."
-  },
-  {
-    "source": "rej-direct-constant-dependency-cycle.rx",
-    "stage": "semantic",
-    "compilation_success": false,
-    "description": "Direct constant dependency cycle."
-  },
-  {
-    "source": "rej-indirect-constant-cycle.rx",
-    "stage": "semantic",
-    "compilation_success": false,
-    "description": "Indirect constant cycle."
-  },
-  {
-    "source": "rej-associated-constant-cycle.rx",
-    "stage": "semantic",
-    "compilation_success": false,
-    "description": "Associated constant cycle."
-  },
-  {
-    "source": "rej-a-constant-path-must-resolve-to-a-constant.rx",
-    "stage": "semantic",
-    "compilation_success": false,
-    "description": "A constant path must resolve to a constant."
-  },
-  {
-    "source": "rej-repeat-length-cannot-name-a-local.rx",
-    "stage": "semantic",
-    "compilation_success": false,
-    "description": "Repeat length cannot name a local."
-  },
-  {
-    "source": "rej-an-i32-constant-cannot-be-a-usize-repeat-count.rx",
-    "stage": "semantic",
-    "compilation_success": false,
-    "description": "An i32 constant cannot be a usize repeat count."
-  },
-  {
-    "source": "rej-array-length-must-be-usize.rx",
-    "stage": "semantic",
-    "compilation_success": false,
-    "description": "Array length must be usize."
-  },
-  {
-    "source": "rej-unsigned-constant-negation-is-invalid.rx",
-    "stage": "semantic",
-    "compilation_success": false,
-    "description": "Unsigned constant negation is invalid."
-  },
-  {
-    "source": "rej-constant-initializer-must-match-declared-type.rx",
-    "stage": "semantic",
-    "compilation_success": false,
-    "description": "Constant initializer must match declared type."
-  }
-]
+29:    : PATHSEP? usePathSegment (PATHSEP usePathSegment)*
+32:usePathSegment
+33:    : identifier | SELF_VALUE | SUPER | CRATE
+135:    : pathIdentSegment (PATHSEP? genericArgs)?
+139:    : pathExprSegment (PATHSEP pathExprSegment)*
+142:pathExprSegment
+143:    : pathIdentSegment (PATHSEP genericArgs)?
+146:pathIdentSegment
+168:    | (typePathSegment PATHSEP)* pathIdentSegment PATHSEP? genericArgs
+654:    : DOT pathExprSegment callArguments
 
 ```
 
 ---
 
-## Assistant (Build · DeepSeek V4.1 Flash · 25.5s)
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 21.2s)
 
 _Thinking:_
 
-Now I have everything I need to answer. Let me formulate:
+Now I can answer.
 
-**1. struct 里能不能放 const？**
-不能。struct body 只有字段（+ derive 属性、lifetime 泛型/where）。常量只能在顶层或 impl 里（assoc const）。所以 `Config::N` 里的 N 一定来自 `impl Config { const N ... }`，不是 struct 体。
-
-**2. struct / impl 各能放什么**（Rx）：
-- struct：`#[derive(...)]` + 命名命段列表（唯一内容）；lifetime 参数/where 可写但被忽略。没有方法、没有关联常量、没有嵌套项。
-- impl：只有关联项 = 常量项 + 函数（方法/关联函数）；可以多个 impl 共享一张关联项命名空间；目标必须是用户 struct；lifetime/where 可写但忽略。
-- 顶层：fn / struct / const / impl / use（丢弃）。
-
-**3. ConstValue 的 PATH 允许哪些**：
-- 形式：`N`（1 段，指向顶层常量）、`Type::NAME`（2 段；Type 必须是结构体名，NAME 是它的关联常量）、`Self::NAME`（在 impl 里，指当前结构体的关联常量）。
-- "进入 struct 找别的 ConstValue"：只能这样 `Struct::NAME`，因为 struct 里没有常量；关联常量在 impl 里定义、但路径写法是 `Struct::NAME`。
-- `Vec<i32>` 里面找：不行。Vec/Box 是保护的内建类型，不允许 impl（不能给它们加关联项），所以 `Vec::<i32>::NAME` 不可能解析到常量；而且常量 PATH 指向的必须是一个常量项，指向函数（如 `Vec::<i32>::new`）或局部都是编译错误。注：常量路径语法上也能带泛型实参，但唯一能用泛型实参的类型是 Box/Vec，而它们没有关联常量，所以实际合法只有 1 段或 2 段。
-- 多段（`A::B::C`）：Rx 没有模块/嵌套类型，不可能解析到常量 → 编译错误。
-- 非限定 `N` 只查顶层常量；impl 里不写 `Self::` 的同级关联常量不算可见（spec 只列 `LIMIT`/`Config::LIMIT`/`Self::LIMIT`；且 "associated constant reachable only as Type::NAME does not exclude a local NAME"）。
-
-Wait — I must double check: is it definitely true that inside `impl Config { const B = N; }` unqualified `N` does not resolve to sibling assoc const? The spec const_eval says "ConstantPath must resolve to a constant item, either directly or through an associated-constant path such as LIMIT, Config::LIMIT, or Self::LIMIT." — "directly" is a top-level const. Associated constants are "reachable only as Type::NAME" per the collision guarantee. So yes: unqualified inside impl = top-level only. If tests have a counterexample (sibling unqualified), we'd see; not in these suites. I'm fairly confident.
-
-Also note the collision guarantee: local let/param colliding with a visible unqualified (top-level) constant is UB. So we never need to handle it. The `let N = 9;` in the acc test works because Config::N is assoc only.
-
-**Constant evaluation type checks (关系到求值)**:
-- const 初始化式必须匹配声明类型（`const N: i32 = true` 错；`-1u32` 错——无符号不能取负）。
-- 数组长度/repeat 长度的常量必须有 declared type usize（`const N: i32 = 3; [1; N]` 错；`const N: bool; [i32; N]` 错）。
-- 因此求值不仅要算值，还要对声明类型做检查；`transformType` 的 ARRAY 分支调用求值器时，需要那个常量的 `type_` 已解析。有个顺序小坑：pass 3 如果按 items 顺序解析，signature 里的 `[i32; N]` 可能在 `const N` 的声明类型解析之前就要求检查 N 的 type。解决：pass 3 先解析全部常量的声明类型，再解析字段/签名；或在求值器里按需递归解析（用另一个 state）。
-
-Actually wait, does the array length check need to check `N`'s declared type, or the *value's* type? For `const N: i32 = 3; let a = [1; N];` the error is because N's declared type is i32, not usize. So yes: check `constSignature.type_ == usize`. That requires resolution order.
-
-Simplest to suggest: in pass 3, do const declared types first (they're usually simple builtin types), then everything else. Or resolve on demand.
-
-Also: `const N: u32 = -1u32;` — NEG evaluation: the magnitude `1u32` has suffix → u32; negating unsigned → error. So the evaluator or a later type-check pass must look at the literal suffix. If we evaluate NEG purely numerically in pass 2 (value=-1) without type, we'd store -1 and later compare declared u32 vs actual... the later check could catch: `const N: u32 = -1u32` — declared type u32; the initializer is a negative int; type of `-1u32` is invalid. We need to detect this. Options: check in evaluation using declared type (resolved on demand), or defer negative-form checks to a post-type pass. Keeping it simple: in step 2 evaluate values; in step 3 after types resolved, do a validation pass over all const initializers checking declared type vs form (bool/int/neg sign). But then cycle detection still happens in step 2. This split is reasonable: value computation (step 2) + type validation (part of step 3). Mention briefly.
-
-Hmm, but does the todo doc say step 2 fills ivalue_/bvalue_; then transformType ARRAY reads DONE. The type validation can be in step 3 when resolving each const's declared type (validate its initializer form against declared type there). But note `rej-an-i32-constant-cannot-be-a-usize-repeat-count` needs N.type_ resolved before/at use; same lazy/order solution.
-
-Let me answer concisely with a small table. Also answer the semantic/type rules for PATH value (int vs bool) maybe not necessary.
-
-One more path case: `Self::NAME` inside a *top-level const* — invalid (Self only in impl/struct declaration context). And in const initializers of a top-level const, a path `Self::` shouldn't appear in tests. Error if so.
-
-What about forward reference to assoc const of a struct declared later? `const C: usize = Config::N;` before struct Config — test has exactly that: COUNT before struct Config. So eval must resolve `Config::N` via `associatedConsts["Config"]["N"]` registered in pass 1 regardless of order. Good.
-
-Also `const NEG: i32 = -VALUE;` inside impl references top-level VALUE declared *later* (line 12 vs line 10). Good.
-
-Now formulate the answer in Chinese, compact. Use a small table for struct vs impl contents and const path rules. Mention the type-check ordering pitfall. Keep code out or minimal.
-
-**1. struct 里不能定义常量。** Rx 的 struct 体只有两样东西：`#[derive(...)]` 和命名字段列表（lifetime 参数/where 可写但丢弃）。常量要么在顶层，要么在 impl 里当关联常量。
-
-| 位置 | 允许的内容 |
-|---|---|
-| 顶层 | `fn`、`struct`、`const`、`impl`、`use`（丢弃） |
-| struct 体 | 只有命名字段（+ derive 属性）；无方法、无常量、无嵌套项 |
-| impl 体 | 只有关联项 = `const` + `fn`；多个 impl 共享同一张关联项表；目标必须是用户 struct |
-
-所以 `Config::N` 里的 `N` **一定**来自 `impl Config { const N: ... }`，struct 体里从来不存在它。
-
-**2. ConstValue 的 PATH 允许哪些**（spec：`ConstantPath must resolve to a constant item`）：
-
-| 写法 | 含义 |
-|---|---|
-| `N` | 顶层常量（1 段，只查顶层 `constSig`） |
-| `Config::N` | Config 这个 struct 的关联常量（2 段，查 `associatedConsts["Config"]`） |
-| `Self::N` | 当前 impl 目标 struct 的关联常量（仅 impl 内） |
-
-- "进入某个 struct 找别的 ConstValue"：只有 `Struct::NAME` 这一种，且找的是**关联常量**；struct 体里本来就没有常量可找。
-- 进入 `Vec<i32>` 找：**不行**。`Vec`/`Box` 是保护内建类型，规范禁止给它们写 impl（"inherent methods cannot be added to protected builtin types"），所以不存在 `Vec::<i32>::XXX` 这种常量；同理 `Vec::<i32>::new` 是函数，常量 PATH 指向函数 → 编译错误（有负例 `rej-a-constant-path-must-resolve-to-a-constant.rx`，那是顶层函数的版本）。
-- 多段如 `A::B::C`：Rx 没有模块/嵌套类型，不可能解析到常量 → 编译错误。实际合法路径只有 1 段或 2 段。
-- 指向局部/参数 → 编译错误（`rej-repeat-length-cannot-name-a-local.rx`），**不是** UB。
-- impl 里不带 `Self::` 的裸名 `N` 只指顶层常量，不会指同级关联常量（规范只说关联常量可达路径是 `Type::NAME`/`Self::NAME`；`acc-...associated-constants-do-not-reserve-unqualified-locals` 里 `let N = 9` 和 `Config::N` 并存就是证据）。
-
-**3. 对常量求值的影响（重要）**
-
-求值不只是算数，还要做**声明类型检查**，这些负例都要求它：
-- `const N: i32 = true;`（初始化式不匹配声明类型）
-- `const N: u32 = -1u32;`（无符号取负无效；负号要求有符号）
-- `const N: i32 = 3; let a = [1; N];`（repeat/array 长度必须**声明类型是 usize**，值对也不行）
-- `const N: bool = true; let a: [i32; N] = ...;`（长度必须 usize）
-
-所以 ivalue_ 算出来还不够：`transformType` 在 ARRAY 分支求长度时，要能拿到那个常量的 `type_` 并确认是 `usize`。这里有个 pass 3 内部的小顺序坑：signature 里的 `[i32; N]` 可能先于 `const N` 的声明类型被解析。两种解法：
-
-- pass 3 里**先解析所有 const/关联常量的声明类型**（它们基本是 `i32/usize/bool` 这种），再解析 struct 字段和函数签名；
-- 或者让求值器按需递归解析目标常量的类型（再加一个 state）。
-
-建议第一种，简单且顺序确定。求值本身（值 + 环检测）仍可以按你的三步在第 2 步全量做完；负号/类型匹配这类检查放在第 3 步解析声明类型时逐个补做即可。
-
----
-
-## User
-
-我总结一下你对我的问题的回答，你的意思是，struct 里面只有 derive 和变量定义，impl 里面可能有 const，path 只有三种可能情况，总的来说比较简单？然后，我需要对 arrayLength_ 做类型检查（type = usize），为此你建议我在 命名、常量求值 这两遍之后的第三遍 类型推导 时再做类型检查？
-另外我问一下你能不能识别空格，如果不能的话我就用别的分隔符跟你对话了。
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 22.8s)
-
-_Thinking:_
-
-The user is summarizing:
-1. struct only has derive and field definitions; impl can have const; path only three cases; overall simple?
-2. They need to type check arrayLength_ (type = usize); I suggest doing the type check in pass 3 (type resolution) after name registration and const eval?
-3. They ask if I can recognize spaces (spaces in Chinese text? Perhaps they're worried about tokenization—maybe they use a special input method that inserts spaces). They say "如果你不能识别空格，我就用别的分隔符" — "if you can't recognize spaces, I'll use other separators to converse with you."
-
-I should answer:
-1. Confirm summary, with small corrections: struct only has derives + named fields. impl only has const + fn. Paths: 3 forms (N, Type::N, Self::N) and must resolve to a constant item; 1-2 segments. It's simple but remember: impl target must be user struct; but in const evaluation context, the complexity is the type checks and cycle detection.
-2. Careful nuance: the type check for array length needs the const's declared type. Two sub-cases:
-   - For a literal directly in the array type like `[i32; 4]` — 4's expected type is usize; no const involved.
-   - For a const path, check the const's `type_ == usize`.
-   They ask "为此你建议我在...第三遍类型推导时再做类型检查？" — My previous suggestion: pass 3 first resolve const declared types, then fields/signatures; when ARRAY branch reads const, check its `type_` is usize. Alternatively do value computation in pass 2 and type checks in pass 3. Confirm yes, type checks belong in pass 3 (or a sub-step at its beginning). Note that evaluation of values in pass 2 should focus on value + cycle detection; checks requiring declared types can be deferred.
-
-But wait: there's a subtle point about `-1u32` — the negation legality check. Does that need to happen in pass 2 or pass 3? It needs declared type: `const N: u32 = -1u32;` — the declared type is u32. But actually the error can be detected purely from the suffix of the literal: `1u32` is unsigned, so `-1u32` invalid regardless of declared type. But `-VALUE` where VALUE: u32 and declared type i32? Hmm: `const M: i32 = -VALUE;` with `VALUE: u32` — the value is u32 typed, negating unsigned → invalid, even though declared is i32? Probably invalid, yes: negation requires signed operand type. So it needs VALUE's declared type → pass 3. Actually could also be detected if we track the type of the ConstValue node. Simplest: in pass 3 when resolving declared types, validate the initializer form against declared type and against referenced const types. So yes, pass 3.
-
-But careful: pass 2 computes values; is it still correct for `-VALUE` where VALUE is u32? Value = -3 maybe stored; but reject already flagged in pass 3. Since reject_ is global, final exit code is 1 anyway. Values don't matter after error. Fine.
-
-3. Spaces: Yes, I can recognize spaces perfectly. Chinese text with spaces or without both fine. The user might be testing because their previous session had trouble? I can read spaces. Reassure briefly.
-
-Also the user said "另外我问一下你能不能识别空格" — perhaps their keyboard/input adds spaces between Chinese characters (like some IME in "space mode"). I can read it; no need for other delimiters.
-
-Keep answer concise. Structure:
-1. 总结基本对，补正两点: (a) impl 里只有 const 和 fn; assoc const 的路径算 Type::NAME; (b) 常量求值的麻烦不在 path，在类型检查（usize / 负号 / bool vs int）。
-2. 是的：值+环检测在第 2 步；依赖声明类型的检查放第 3 步（建议开头先解析所有 const 的声明类型，之后 ARRAY 分支查 type_ == usize）。注意 literal 直接长度（`[i32; 4]`）没有 const，期望类型就是 usize，直接接受无后缀字面量；有别的后缀该报错。
-3. 空格完全没问题，中英文、带空格不带空格都行，不用换分隔符。
-
-Let me be careful about one thing: the array length check — for `[i32; N]`, after getting N's value, check N is usize type. But what about N being an assoc const `Config::N`? Its `type_` in `associatedConsts`. Same check.
-
-Another nuance: `[1; N]` where N is a local — "repeat length cannot name a local" is an error; local resolution happens in check phase (pass 4), not collect. So in collect's pass 3, when evaluating the repeat's ConstValue PATH, we look only in const tables; if not found, is it error at collect time or check time? The test `rej-repeat-length-cannot-name-a-local` with `let n = 2usize; let a = [1; n];` — the path `n` is not a const. At collect (pass 3) we can't know if `n` is a local (locals only exist in check phase). Hmm! Important subtlety: array type lengths appear in signatures/types (collect), but `[v; N]` repeat length is an *expression* (`repeatedArrayExpr.num_`), evaluated during check phase. And `[1; n]` with local n: during check phase, we evaluate the repeat length — lookup const first? If not found, it might be a local → error. Since a local can never be a const path (locals aren't constants), it's an error regardless. So the repeat-length evaluation happens in check phase (phase 2+), where we can look up: if the path names a const → ok (type must be usize); if it names a local/function → error.
-
-For array *type* lengths `[i32; N]` (in type syntax), the path must be a const; if it names something else (or nothing) → error at collect pass 3.
-
-So the type checks for repeat length and array type length both end up needing const declared types; both are doable once pass 3 resolved const types. But repeat lengths are processed in check phase (later), so no ordering issue there. Only `[i32; N]` in type syntax during collect pass 3 has the ordering issue. Good, my advice holds: at beginning of pass 3, resolve all const declared types; then ARRAY branch can check.
-
-One more subtlety: array type length via literal `[i32; 4]`: no const type check, but the literal's type is usize (expected). If suffix `4i32` → error? Spec: array lengths are constant values with expected type usize. Integer literal suffix fixes type; `4i32` has type i32, not usize → compile error presumably. Tests may have rej-array-length... not seen. Handle: when evaluating literal for a length, accept only unsuffixed (defaults usize) or usize-suffixed; else error.
-
-Also for const value type check `const N: usize = 4;` fine. `const N: i32 = 3; [i32; N]` → error even though value 3.
-
-OK. Also answer "总的来说比较简单？" — yes relatively, the hard part later is check phase; const eval is small due to restricted syntax.
-
-Formatting: concise, maybe 10-15 lines. No tools needed. Space question: answer directly.
-
-总结基本对，补两点修正：
-
-1. **struct 体**只有 derive + 命名字段；**impl 体**只有 `const` + `fn`（方法/关联函数）。常量在 struct 体里不存在，路径 `Config::N` 找的是约定俗成挂在 `impl Config` 下的关联常量。
-2. **常量求值本身简单，麻烦在类型检查**，不在路径：路径确实只有 `N` / `Type::N` / `Self::N`（1~2 段，必须落在常量项上，指局部/函数是编译错误）；但求值要同时满足——初始化式匹配声明类型、负号只能作用在有符号类型、**长度必须是 usize 类型**（值对也不行）。
-
-类型检查放第三遍，对。但要注意"第三遍内部的小顺序"：
-
-- 第三遍开头**先把所有 const/关联常量的声明类型解析完**（`transformType(constItem.type_)`）。
-- 之后任何 ARRAY 分支要长度时，才能安全地查那个常量的 `type_ == usize`，否则 `const N` 声明在函数后面时你还没解析到它的类型。
-- `[i32; 4]` 这种直接字面量没有常量参与：期望类型就是 usize，无后缀字面量直接收；带别的后缀（如 `4i32`）报错。
-- 例外：`[v; N]` 的 repeat 长度是**表达式**，发生在后面的 check 阶段，不在 collect；它的"不能指局部"检查天然在那里做，没有顺序问题。
-
-所以分工：第二遍只做**值计算 + `state_` 环检测**；凡是要看声明类型的检查（usize、负号、bool/int 匹配）都推迟到第三遍。这样第二遍不依赖任何类型，三步的顺序就不会打架。
-
-**空格完全没问题**，中英文、带不带空格我都能正常读，不需要换分隔符。
-
----
-
-## User
-
-inherentImpl
-    : IMPL genericParams? typeRef whereClause? LBRACE associatedItem* RBRACE
-    ; 这个是 parser.g4 对 impl 的定义，哪个是名字（比如 Config）啊？
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 15.9s)
-
-_Thinking:_
-
-The user asks about the grammar rule for inherentImpl:
-```
-inherentImpl
-    : IMPL genericParams? typeRef whereClause? LBRACE associatedItem* RBRACE
-    ;
-```
-Which part is the name (e.g., Config)?
-
-Answer: `typeRef` — the `Config` is inside typeRef, specifically typeRef → typePath → typePathSegment → pathIdentSegment → identifier. For `impl Config`, typeRef is a typePath with one segment "Config". For `impl Box<i32>`, it'd be typePath "Box" with generic args — which is invalid as an impl target semantically.
-
-In the AST builder, visitInherentImpl does `now->type_ = anyType(visit(ctx->typeRef()));` and `visitTypePath` calls `makeNamedType(name, types)` where name is the last segment's pathIdentSegment text. So for `impl Config`, `ImplItem::type_` is a `Type` with kind STRUCT, name_ "Config". For `impl i32`, kind BUILTIN name "i32". For `impl Box<i32>`, kind BOX. For `impl (S)`, the parenthesized typeRef unwraps to the same type.
-
-So in registerNames, to get the target name: check `im->type_->kind_ == Type::STRUCT` and use `name_`; anything else (BUILTIN/BOX/VEC/REF/ARRAY/UNIT) is an error ("impl target must be a user struct"). Note `Self` name would be STRUCT "Self" if someone writes `impl Self` — should be error (Self isn't a user struct in that position? Actually inside another impl maybe... no nested impls; `impl Self` at top level invalid). Also note the type could have a qualified path like `a::B`? `typePath` allows multiple segments; makeNamedType takes only the last segment's name = "B"; Rx has no modules; use paths are discarded, so `foo::Config` where foo is a module isn't valid in Rx anyway. Tests likely don't include. Actually wait, `visitTypePath` loops over segments and takes `name = ident->getText()` for each; the last one wins. And generic args accumulate across segments. So `impl Config` gives name "Config".
-
-Also important: an impl target `Config` could be a struct declared later; validation after registration pass.
-
-Also: `impl (S)` — visitTypeRef's LPAREN branch returns inner type, so parentheses transparent. Good.
-
-Answer concisely: it's `typeRef`; in your AST it's `ImplItem::type_`; the name is `im->type_->name_` when kind_ == STRUCT. Show the chain: typeRef → typePath → typePathSegment → pathIdentSegment → IDENTIFIER. And in collect, use dynamic check; non-STRUCT targets → error. Also mention genericParams/whereClause ignored, associatedItem* are the consts/fns.
-
-名字在 `typeRef` 里。对 `impl Config`，展开链是：
-
-```
-typeRef → typePath → typePathSegment → pathIdentSegment → IDENTIFIER("Config")
-```
-
-你的 AST builder 里 `visitInherentImpl` 做的就是 `now->type_ = anyType(visit(ctx->typeRef()))`，`visitTypePath` 取**最后一段**的 `pathIdentSegment` 文本调 `makeNamedType`。所以：
-
-- `impl Config` → `ImplItem::type_` 是 `Type{kind_=STRUCT, name_="Config"}`
-- `impl i32` → `Type{kind_=BUILTIN, name_="i32"}`
-- `impl Box<i32>` → `Type{kind_=BOX, elem_=i32}`
-- `impl (S)` → 括号在 `visitTypeRef` 里直接透传，`type_` 还是 `STRUCT("S")`
-
-所以在登记那遍取目标名就是：
+1. Their `lookupValue(name)` is essentially what I put in infer(pathExpr), yes. So the relationship: infer(pathExpr) should just call `lookupValue(name)` and return the result. They're not "the same thing" in role — lookupValue is the helper, infer dispatches the AST node. If their lookupValue already does local→const, then infer's path branch is simply:
 
 ```cpp
-if (im->type_->kind_ != Type::kTypeKind::STRUCT) {
-    // BUILTIN/BOX/VEC/REF/ARRAY/UNIT 都不是用户 struct → impl 目标非法，报错
-} else {
-    std::string tname = im->type_->name_;   // "Config"
-    // methods[tname][...] / associatedConsts[tname][...]
+if (auto* x = dynamic_cast<pathExpr*>(e)) {
+    if (x->path_.size() != 1) { ... }   // 2-segment handling
+    return lookupValue(x->path_[0].name_);
 }
 ```
 
-两个注意点：
+So yes, they understood right: my snippet was effectively inlining lookupValue. Since they wrote it as a helper, infer(path) delegates. Good.
 
-- 非法目标（`i32`/`Box`/`Vec`…）的报错**不能**在第 1 小遍当场判——因为 `struct Config` 可能写在 impl 后面，登记时你只知道 `type_->name_`，还不知道它是不是合法 struct；等第 1 小遍跑完（所有 struct 名都入表）再校验 `structSig.count(tname)`，或者放第 3 小遍一起做。
-- `genericParams?` 和 `whereClause?` 都是 lifetime 相关，AST 已丢弃；`associatedItem*` 就是 `im->items_` 里的 const/fn。
+But note bugs/considerations in their lookupValue:
+- It uses `scope_.memory_[name]` — `memory_` is public? scopeStack is a struct, all public, so compiles; but using `operator[]` on the map creates an empty stack if missing... they first check `find != end()`, so no insertion... wait: `if (scope_.memory_.find(name) != scope_.memory_.end()) return scope_.memory_[name].top().type_;` — find checks existence; then operator[] finds existing (no creation). BUT an empty stack could exist? scopeStack::levelDown pops entries and does `memory_[name].pop()` leaving an empty stack in the map. Then `find(name) != end()` is TRUE but `top()` on empty stack → UB/crash! This is a real bug. Their `scope_.find(name)` already handles the empty case (`dt->second.empty()` → nullptr). So lookupValue should use `scope_.find(name)` instead of `memory_` directly. Good catch.
+  - Concrete scenario: `{ let x = 1; } x` → after levelDown, memory_["x"] is an empty stack (because levelDown pops but doesn't erase). Then looking up `x` → find != end → top() on empty → crash. This is exactly `rej-a-block-local-name-cannot-escape`! So using memory_ directly would crash instead of erroring. Must use `scope_.find`.
+- Const lookup: `findConst(currentStruct_, name)` — this searches associatedConsts[currentStruct_][name] when currentStruct_ non-empty, and top-level constSig when empty. But a bare name in an expression should resolve to **top-level consts**, not assoc consts of the current impl! E.g., `impl S { const A: usize = 1; fn f() { let x = A; } }` — is `A` visible unqualified? Per spec, associated constants are reachable only as `Type::NAME`; unqualified `A` refers to a top-level const (if any). So lookupValue should call `findConst("", name)` (top-level), not `findConst(currentStruct_, name)`. Wait, careful: is that right? Let's verify with the spec: "A constant path has the declared type and value of its target item." ConstantPath examples: `LIMIT`, `Config::LIMIT`, `Self::LIMIT`. Unqualified means top-level constant. And constant-name collision guarantee: local binds colliding with "visible unqualified constant" is UB; assoc consts "reachable only as Type::NAME" don't exclude locals. So yes, unqualified = top-level only. Inside an impl method body, writing `START` should NOT resolve to `Self::START`; you must write `Self::START`. So `findConst(currentStruct_, name)` is wrong for unqualified names. Use `findConst("", name)`.
+  - Hmm, but wait: what about `self`? That's a local in scope, handled by scope lookup. Fine.
+- Function-as-value: they note UB; their code errors if not const; fine.
+- Also `name` param by value — minor.
 
----
+So answer #1: Yes, you understood correctly; they are the same logic — `infer(pathExpr)` calls `lookupValue`. But fix two things: use `scope_.find` (empty-stack crash) and top-level const lookup only (`findConst("", name)`), because unqualified assoc consts aren't visible.
+- Also 2-segment path isn't handled by lookupValue; infer must branch on path size: 2 segments → Self::/Type:: const (associatedConsts), not lookupValue.
 
-## User
+2. Explain pathSeg.types_: `pathSeg` corresponds to `pathExprSegment`, NOT `usePathSegment`. The expression grammar's `pathExprSegment : pathIdentSegment (PATHSEP? genericArgs)?` — genericArgs are turbofish type args (`Vec::<i32>::new`), stored in `types_`. `usePathSegment` is only for use declarations (identifier/SELF/SUPER/CRATE), which are discarded entirely by the AST builder. `pathIdentSegment : identifier | SELF_VALUE | SELF_TYPE` so expression segments can be `self`/`Self`; super/crate are use-only and never in expressions. Example: `Box::<i32>::new` → path segments: {"Box", types_=[i32]}, {"new", []}. `Self::START` → {"Self"}, {"START"}. So the vector<Type*> is the turbofish args.
 
-那我第一遍的时候也要把 impl 里面的 const 和 func 也挂上名字对吧？
+Also clarify AST builder visitPathInExpression collects `s.types_` from genericArgs (only typeRef; lifetimes dropped).
 
----
+Let me also check if their lookupValue is called anywhere yet (grep showed only declaration/definition; infer not written). They're asking conceptually.
 
-## Assistant (Build · DeepSeek V4.1 Flash · 22.9s)
-
-_Thinking:_
-
-The user asks: in pass 1 (register names), do I also need to register the consts and funcs inside impl?
-
-Yes. Register:
-- methods: `table_.methods[tname][fname]` placeholder, duplicate check (across all impls of same struct → same inner map).
-- associatedConsts: `table_.associatedConsts[tname][cname]` placeholder, duplicate check; also store the `value_` pointer for const eval (like top-level consts).
-- Assoc constant evaluation pass 2 needs syntax pointer and owner.
-- Also method signature vs assoc const name: do methods and assoc consts share a namespace? Spec: "All inherent implementations of a struct share a single associated-value namespace; defining duplicate methods, associated functions, or associated constants is a compile-time error". So methods and associated constants share ONE namespace: a method and an assoc const with the same name collide! The current globalTable has two separate maps: `methods` and `associatedConsts`. So cross-map duplicate check needed, similar to functions/consts at top level.
-
-Wait, let me re-read names.html: "Top-level names must be unique within their namespace. Fields within a struct and parameters within a function must also be unique. All inherent implementations of a struct share a single associated-value namespace; defining duplicate methods, associated functions, or associated constants is a compile-time error, regardless of their signatures or whether they are declared across different impl blocks."
-
-So associated items (methods + assoc consts) share a single value namespace. Since funcSignature is in `methods` map and constSignature is in `associatedConsts` map, a `const X` + `fn X` in impls of the same struct must be flagged. The user needs cross-check.
-
-Also, do assoc items conflict with top-level names? No — different scopes (associated namespace per struct). E.g., top-level `fn f` and `impl S { fn f }` are fine.
-
-Also, should I mention that for assoc consts we store `value_` in pass 1 (needed for pass 2 eval) — yes, same as top-level.
-
-Also, storing AST pointer for methods? Not needed; pass 3 re-walks impl items to fill signatures. But hmm — pass 3 will need to re-walk all items anyway (fields/signatures). Since the table is keyed by name and the AST nodes are reachable via crate->items_, re-walking is fine. But assoc const `value_` must be stored in pass 1 because pass 2 (eval) happens before pass 3 (which would otherwise fill it) — and pass 2 only has the table. Right.
-
-Also, duplicate param names within a function: fields within struct: those can be checked pass 1 (function params) or pass 3. Params don't need types to check dup names; can do in pass 1 when registering? The funcItem gives param_ list including self. Note self is a param named "self" — duplicate `self`+`self` impossible by grammar (selfParam only first). Ordinary param named "self"? IDENTIFIER can't be `self` keyword. Duplicate ordinary params → compile error. Can be checked in pass 1 or 3. Also "top-level function cannot have a receiver" check can be pass 1 (isSelf_ flag). The user asked only about impl contents.
-
-Also note: registering methods for an impl whose target is invalid (e.g., `impl i32`) — still register under "i32" (or under whatever name); error reported later. Or skip? If target isn't STRUCT, could still register under the name to avoid missing duplicate checks; but tests for invalid impl probably only check exit 1, which will happen anyway. Simplest: register anyway keyed by `im->type_->name_` (even for Box etc., name_ may be empty for BOX/VEC since makeBox doesn't set name_; for BOX name_ default is "AAAunnamedType" from Type's default! Hmm, `make<Type>()` in ast has `name_ = "AAAunnamedType"` default. For `impl Box<i32>`, name_ stays default. Keying by that is harmless but weird. Better to only register if STRUCT; if not, report error and skip registration. But pass 3 re-walk would then try fill under key; guard by same condition. Either way. I'd say: register only when STRUCT; otherwise record the error (deferred until after pass 1 so that names declared later are known... but kind_ != STRUCT is already definitive regardless of declarations! `impl i32` is STRUCT? No: `i32` is BUILTIN per makeNamedType. `impl Box<i32>` is BOX. `impl [i32;2]` ARRAY. Those are definitely invalid regardless of order. The only "order-dependent" invalid case is `impl UnknownName` — kind_ is STRUCT but name not in structSig → report after pass 1. So:
-  - kind_ != STRUCT → can error immediately in pass 1 (definitely not a user struct).
-  - kind_ == STRUCT but name not in structSig after pass 1 → error.
-  - name == "Self" → not valid at top level.
-  
-That's a clean rule. But wait: `impl UnknownName` where UnknownName is actually a builtin protected name? makeNamedType maps i32/u32/isize/usize/bool and Box/Vec specially; any other identifier becomes STRUCT. So an unknown name is STRUCT; after pass 1 check table membership.
-
-Nice.
-
-Also, one more: assoc const `Self::` resolution during pass 2 evaluation requires knowing the owner struct — when recursively evaluating an assoc const, set currentStruct_ = tname for its initializer, so `Self::B` works. Mention briefly.
-
-Let me answer concisely: yes; register both; same pattern; cross-namespace collision between method and assoc const of same struct must be checked (they share one associated-value namespace); store assoc const value_ pointer; currentStruct_ during eval.
-
-Show small code sketch perhaps. Keep short.
-
-对，impl 里的 const 和 fn 都要在第 1 小遍挂名，用同一套占位写法：
-
-```cpp
-} else if (auto* im = dynamic_cast<ImplItem*>(item)) {
-    std::string tn = im->type_->name_;        // STRUCT 目标名
-    for (Item* sub : im->items_) {
-        if (auto* m = dynamic_cast<funcItem*>(sub)) {
-            // 和 methods[tn] 以及 associatedConsts[tn] 都查重！
-            if (table_.methods[tn].count(m->name_) ||
-                table_.associatedConsts[tn].count(m->name_))
-                error("duplicate associated item " + m->name_);
-            else
-                table_.methods[tn][m->name_];                  // 占位
-        } else if (auto* c = dynamic_cast<constItem*>(sub)) {
-            if (table_.associatedConsts[tn].count(c->name_) ||
-                table_.methods[tn].count(c->name_))
-                error("duplicate associated item " + c->name_);
-            else {
-                table_.associatedConsts[tn][c->name_];         // 占位
-                table_.associatedConsts[tn][c->name_].value_ = c->value_;  // 存语法指针
-            }
-        }
-    }
-}
-```
-
-三个要点：
-
-1. **方法和关联常量共享一个命名空间**（spec：all inherent impls share a single associated-value namespace，重复方法/关联函数/关联常量跨 impl 也算错）。你的 `methods` 和 `associatedConsts` 是两张 map，所以**必须交叉查重**；重复只在同一 struct 内部算，"跨 impl 共享"靠内层 map 天然实现。
-2. **关联常量也要在第 1 小遍存 `value_`**，和顶层常量一样——第二遍求值时只能靠表，不能等第三遍。求值一个关联常量的初始化式时，记得把 `currentStruct_` 设成它所属的 struct，`Self::B` 才能解析。
-3. **impl 目标校验分两种**：`kind_ != STRUCT`（`impl i32`/`impl Box<i32>`/`impl (i32)`…）第 1 小遍就能报，和声明顺序无关；`kind_ == STRUCT` 但名字不在 `structSig` 里（可能是声明在后面的 struct，也可能是根本不存在的名字），要等第 1 小遍跑完再报。
-
----
-
-## User
-
-你这个第三点说的也就是，我跑完第一遍要扫一遍 methods 和 associatedConsts，检查一下 .first 是否在 structSig 中存在？
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 16.5s)
-
-_Thinking:_
-
-The user asks: after pass 1 (register names), do I scan methods and associatedConsts, checking that `.first` (the outer map key, struct name) exists in structSig?
-
-Yes, that's right — for impl targets that have kind_ == STRUCT, after all structs are registered, iterate `table_.methods` (and `table_.associatedConsts`, since an impl with only consts won't appear in methods) and check `structSig.count(tname)`.
-
-Important details:
-- For targets with kind_ != STRUCT you can report immediately in pass 1 and then you might not have registered them at all (or you skipped). But the user asked about the scan. Either way, the "unknown struct name" check requires iterating both maps after pass 1. Actually if you only register items when kind_==STRUCT, then both maps' keys are STRUCT names; scanning either map (better: the union/iteration of both) catches unknown names.
-- But there's a subtlety: if `impl NonExistent` is registered in methods only if it has methods. If it has only assoc consts, only in associatedConsts. So scan both maps. Or maintain a separate set/list of impl target names seen. Simpler: iterate both maps.
-- Wait, also: if kind_ == STRUCT and name not in structSig → error. But what about `impl Self`? name_ == "Self" which won't be in structSig → error naturally. Good.
-- Another subtlety: if impl target is a struct, `structSig.count` check works. But also: `impl u32` is kind_ == BUILTIN? makeNamedType maps u32 → BUILTIN. Yes. And `struct u32` can't exist (protected), so fine.
-- Also note: for the immediate kind_ != STRUCT error, you can report in pass 1, but if you want to still register under some key it doesn't matter. Since it errors, reject_ is set anyway.
-
-Also, there's a second thing: duplicate top-level struct/function/const vs protected names etc. But the question is narrow; answer yes, with the note to scan both maps (or keep a list of targets) since an impl might contain only one kind.
-
-Also mention: this scan is cheap and catches `impl Missing { ... }`.
+Answer structure:
+1. "对，你理解对了" — lookupValue is the helper; infer(path) = lookupValue single-segment + branch for 2-segment.
+2. Two bugs in lookupValue: memory_ empty-stack; findConst(currentStruct_) should be "" for unqualified.
+3. pathSeg.types_ explanation with grammar distinction.
 
 Keep concise.
 
-对，但有两个细节：
-
-1. **两张 map 都要扫**——impl 里可能只有方法（只进 `methods`），也可能只有关联常量（只进 `associatedConsts`），只看一张会漏。
-2. 在第 1 小遍里，`kind_ != STRUCT` 的目标（`impl i32`/`impl Box<i32>`）你已经当场报错了，**可以顺便不登记**；这样扫 map 时剩下的 key 全是 STRUCT 名字，只需查 `structSig.count(tname)`，报 "impl target is not a user struct / unknown type"。
+**1. 你没理解错**——是同一个逻辑。`lookupValue` 是我那段 `infer(pathExpr)` 代码抽出来的 helper；`infer` 里 path 分支只要：
 
 ```cpp
-// 第 1 小遍末尾
-for (auto& [tn, _] : table_.methods)
-    if (!table_.structSig.count(tn)) error("impl target is not a user struct: " + tn);
-for (auto& [tn, _] : table_.associatedConsts)
-    if (!table_.structSig.count(tn)) error(...);
+if (auto* x = dynamic_cast<pathExpr*>(e)) {
+    if (x->path_.size() == 1) return lookupValue(x->path_[0].name_);
+    // 2 段：Self::N / Config::N，查 associatedConsts
+}
 ```
 
-一个小提醒：如果 impl 只有关联常量、且目标名字不存在，那它只出现在 `associatedConsts` 里——所以"两边都扫"不是为了查重（查重在登记时已交叉做过），纯粹是为了保证这种 impl 也会被校验到。也可以在登记时另外维护一个 `std::set<std::string> implTargets_`，扫一个集合就够；两种都行。
+不过你这个 `lookupValue` 有两个 bug：
+
+- **`scope_.memory_.find(name) != end()` 之后直接 `.top()` 会崩**：`levelDown` 只 `pop` 不清 map，所以出块后 `memory_["x"]` 是**空栈**，`find` 仍返回存在，`top()` 就是空栈 UB。这正是 `rej-a-block-local-name-cannot-escape` 的场景。用你 `scopeStack::find`（它判了 `empty()`）：
+  ```cpp
+  if (auto* local = scope_.find(name)) return local->type_;
+  ```
+- **`findConst(currentStruct_, name)` 查错空间**：裸名字 `N` 在表达式里只指**顶层常量**，不是当前 impl 的关联常量（关联常量只能 `Self::N`/`Type::N` 可达）。应该 `findConst("", name)`。否则 `impl S { const A = 1; fn f() { let x = A; } }` 这种会错误地解析到 `S::A`。
+
+**2. `pathSeg::types_` 和 `usePathSegment` 不是同一条规则**：
+
+- `usePathSegment : identifier | SELF_VALUE | SUPER | CRATE` —— 只用于 `use` 声明，AST builder 整个丢弃，跟你现在处理的无关；
+- 表达式用的是 `pathExprSegment : pathIdentSegment (PATHSEP? genericArgs)?`，其中 `pathIdentSegment : identifier | SELF_VALUE | SELF_TYPE`（所以表达式里可以有 `self`/`Self`，但没有 `super`/`crate`）；
+- `genericArgs` 就是 **turbofish 类型实参**，所以 `pathSeg::types_` 装的是它们：
+
+```text
+Box::<i32>::new   →  seg1 { name="Box", types_=[i32] }
+                     seg2 { name="new", types_=[] }
+Self::START       →  seg1 { name="Self" }, seg2 { name="START" }
+```
+
+`visitPathInExpression` 里 `s.types_.push_back(...)` 就是在收 `genericArgs`（lifetime 实参被跳过）。所以 `types_` 只在 `Box`/`Vec` 这类 turbofish 上有内容，普通 `a::b` 都是空 vector。
 
 ---
 
 ## User
 
-我把 collect 写完了，用了一点小巧思，你看看有没有啥问题。
+那 Box::<i32>::new 属于什么 expr？换句话说，我需要在 infer 的哪个地方处理？
 
 ---
 
-## Assistant (Build · DeepSeek V4.1 Flash · 13.5s)
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 21.6s)
 
 _Thinking:_
 
-The user says they've finished writing collect (in their own conversation with me, presumably they wrote checker.cpp). I need to read the current checker.cpp and checker.h to review. There were no file changes shown yet in this turn, so let me read the files now. The user's instruction earlier was "这个会话中，不进行任何修改，只进行理解" but that referred to the first turn. Now they explicitly ask me to review their collect code ("你看看有没有啥问题") — that's a review request, not necessarily modification. I should read and review, pointing out issues. I should not edit unless asked.
+The user asks: `Box::<i32>::new` — what kind of Expr is it? Where in `infer` should it be handled?
 
-Let me read the current files.
+Let me think about how the AST builder parses `Box::<i32>::new(1)`.
 
-**Tool: read**
+Grammar:
+- `postfixSuffix : callArguments | dotSuffix | ...`? Let me recall: postfixExpression : primaryExpression postfixSuffix*; primaryExpression → nonBlockPrimary; nonBlockPrimary : literalExpression | pathInExpression (LBRACE structExprFields? RBRACE)? | ...; pathInExpression : pathExprSegment (PATHSEP pathExprSegment)*.
+- So `Box::<i32>::new(1)`: primary is `pathInExpression` = segments [Box (types=[i32]), new], then postfixSuffix = callArguments → builder's appendSuffix creates `callExpr` with `callee_` = pathExpr, args=[1].
 
-**Input:**
-```json
-{
-  "filePath": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp"
-}
+So the whole expression is a **callExpr** whose callee is a **pathExpr** with 2 segments; segment 0 is "Box" with types_=[i32], segment 1 is "new".
+
+Similarly `Vec::<i32>::new()` → callExpr with 2-segment path callee.
+
+`Box::<i32>::clone(&x)` → callExpr with 2-segment path (Box + clone), args=[refExpr]; not methodCall, because it's `Box::<i32>::clone(...)` (associated function form) — path call.
+
+`S::new()` → callExpr with 2-segment path [S, new].
+
+And `x.f()` → methodCallExpr (dot syntax).
+
+So in `infer`, the place to handle it: the `callExpr` branch. Inside call handling, resolve the callee:
+- If callee is pathExpr with 1 segment → free function (locals shadow check, funcSig lookup).
+- If 2 segments → associated function/method:
+  - prefix "Box"/"Vec" with `types_` = turbofish (builtin constructors `Box::<T>::new`, `Vec::<T>::new`, and maybe `Box::<T>::clone` where T): handle as builtins (Phase 5). Note: the type args live in `path_[0].types_`; validate count/size.
+  - prefix is user struct → `table_.methods[Struct][name]`, check params/ret; also `Self::...` in impl bodies → currentStruct_ as prefix. Need to check isMethod_: `S::get()` calling a method with receiver as associated function is an error (Rust: can't call method without receiver). For Phase 2, tests (casts, shifts, etc.) don't use these; but simple.
+  - `Self::NAME` used as a *value* (not call) is handled in `infer(pathExpr)`, not call.
+- If callee is not a path (e.g., `f()()`), function values are UB → error.
+
+Also note: `Box::<i32>::new` as a **value** (without call) would be a function value → UB, not tested. So only handle in call.
+
+Where exactly in infer: the `callExpr` branch. The `pathExpr` branch handles 1-segment values/2-segment associated consts (not functions). Do NOT try to handle `Box::<i32>::new` in `infer(pathExpr)` as a value.
+
+Also, the AST builder: does it treat `Box::<i32>::new(1)` callee as pathExpr with both segments? Yes: visitPathInExpression builds all segments; appendSuffix wraps call. Confirm with dump from earlier: in 10_paths.ast:
+```
+Let d
+  Call
+    Path Box<i32>::new
+    IntLit 1
+```
+Yes: Call → Path (with generic printed as Box<i32>::new). So callExpr with path callee.
+
+So answer:
+- It's a `callExpr`; callee is `pathExpr` with 2 segments; types_ on segment 0.
+- Handle in `infer`'s callExpr branch (or a helper `checkCall`).
+- Structure of resolution:
+  ```cpp
+  auto* p = dynamic_cast<pathExpr*>(call->callee_);
+  if (!p) { error("callee must be a function path"); ... }
+  if (p->path_.size() == 1) { ... funcSig ... }
+  else if (p->path_.size() == 2) {
+      std::string head = p->path_[0].name_;
+      std::string member = p->path_[1].name_;
+      if (head == "Box" || head == "Vec") { /* builtin Phase 5 */ }
+      else if (head == "Self") { head = currentStruct_; }  // then methods table
+      // methods[head][member], but ensure it has a receiver? for S::new assoc fn, no self; for method, calling S::get() without receiver is error
+  }
+  ```
+- Mention that `x.f()` (method call) is a different AST node (`methodCallExpr`), NOT callExpr; handle in Phase 5.
+- For Phase 2, you can leave 2-segment/builtin branch returning makeError or implement `S::assoc()` if easy; tests in Phase 2 mostly use 1-segment free functions + println_i32.
+
+Also note the generic args validation: `Box::<i32>::new` path_[0].types_ has exactly 1 type; if empty (Box::new) is UB, not tested; if >1 error. The type arg is an AST Type → transformType (needs currentStruct_).
+
+Maybe mention `Box::<i32>::clone` in official tests: `let b = Box::<i32>::clone(&a);`? Earlier grep showed `Box::<i32>::clone` count 2. Let me check the test to know the shape: probably `Box::<i32>::clone(&b)`. So builtin associated function clone. Phase 5.
+
+Keep the answer short and concrete.
+
+`Box::<i32>::new(1)` 是 **`callExpr`**，callee 是一个 **2 段 `pathExpr`**：
+
+```text
+Call
+  Path Box<i32>::new          ← path_[0]={Box, types_=[i32]}, path_[1]={new}
+  IntLit 1
 ```
 
-**Output:**
-```
-<path>/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp</path>
-<type>file</type>
-<content>
-1: #include "checker.h"
-2: 
-3: using kKind = Type::kTypeKind; // AST Type
-4: 
-5: long long Checker::manifestConstInt(ConstValue* value, bool& reject) {
-6: 
-7: }
-8: 
-9: semType* Checker::transformType(Type* type){
-10:     if (type->kind_ == kKind::BUILTIN) {
-11:         return semantic::makeBuiltin(type->name_);
-12:     }
-13:     if (type->kind_ == kKind::STRUCT) {
-14:         return semantic::makeStruct(type->name_);
-15:     }
-16:     if (type->kind_ == kKind::BOX) {
-17:         return semantic::makeBox(transformType(type->elem_));
-18:     }
-19:     if (type->kind_ == kKind::VEC) {
-20:         return semantic::makeVec(transformType(type->elem_));
-21:     }
-22:     if (type->kind_ == kKind::REF) {
-23:         return semantic::makeRef(transformType(type->elem_), type->isMut_);
-24:     }
-25:     if (type->kind_ == kKind::ARRAY) {
-26:         return semantic::makeArray(transformType(type->elem_), manifestConstInt(type->arrayLength_, reject_));
-27:     }
-28:     if (type->kind_ == kKind::UNIT) {
-29:         return semantic::makeUnit();
-30:     }
-31:     throw "transformType";
-32:     return nullptr;
-33: }
-34: 
-35: void Checker::collect(Crate* crate) {
-36:     // 1st time: register
-37:     auto all = crate->items_;
-38:     for (Item* item : all) {
-39:         auto registerFuncAndConst = [&](Item* item, std::map<std::string, funcSignature> &funcSig,
-40:                                         std::map<std::string, constSignature> &constSig) {
-41:             if (auto func = dynamic_cast<funcItem*>(item); func) {
-42:                 std::string funcName = func->name_;
-43:                 if (funcSig.count(funcName) || constSig.count(funcName)) {
-44:                     error("duplicate function name (with function or constant) : " + funcName);
-45:                 }
-46:                 else {
-47:                     funcSig[funcName];
-48:                 }
-49:             }
-50:             if (auto value = dynamic_cast<constItem*>(item); value) {
-51:                 std::string constName = value->name_;
-52:                 if (funcSig.count(constName) || constSig.count(constName)) {
-53:                     error("duplicate constant name (with function or constant) : " + constName);
-54:                 }
-55:                 else {
-56:                     constSig[constName];
-57:                     constSig[constName].value_ = value->value_;
-58:                 }
-59:             }
-60:         };
-61:         registerFuncAndConst(item, table_.funcSig, table_.constSig);
-62:         if (auto stru = dynamic_cast<structItem*>(item); stru) {
-63:             std::string struName = stru->name_;
-64:             if (table_.structSig.count(struName)) {
-65:                 error("duplicate struct name : " + struName);
-66:             }
-67:             else {
-68:                 table_.structSig[struName];
-69:             }
-70:         }
-71:         if (auto impl = dynamic_cast<ImplItem*>(item); impl) {
-72:             std::string implName = impl->type_->name_;
-73:             if (impl->type_->kind_ != kKind::STRUCT) {
-74:                 error("attempted to implement a non-struct type, name = " + implName);
-75:             }
-76:             else {
-77:                 for (Item* inner : impl->items_) {
-78:                     registerFuncAndConst(inner, table_.methods[implName], table_.associatedConsts[implName]);
-79:                 }
-80:             }
-81:         }
-82:     }
-83:     for (auto [name, anything] : table_.methods) {
-84:         if (table_.structSig.count(name) == 0) {
-85:             error("non-existing struct " + name + " have methods");
-86:         }
-87:     }
-88:     for (auto [name, anything] : table_.associatedConsts) {
-89:         if (table_.structSig.count(name) == 0) {
-90:             error("non-existing struct " + name + " have constants");
-91:         }
-92:     }
-93:     return;
-94: }
+（你之前的 AST dump 里就是这个形状。）`x.f()` 才是 `methodCallExpr`，`Box::<i32>::clone(&x)`/`S::new()` 都属于 **callExpr + 2 段 path**，因为语法上是 `path (args)`，不是 `.` 调用。
 
-(End of file - total 94 lines)
-</content>
-```
-
-**Tool: read**
-
-**Input:**
-```json
-{
-  "filePath": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.h"
-}
-```
-
-**Output:**
-```
-<path>/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.h</path>
-<type>file</type>
-<content>
-1: #pragma once
-2: #include "symbol.h"
-3: #include "type.h"
-4: #include "../ast/ast.h"
-5: 
-6: struct Checker {
-7:     bool checkCrate(Crate* rt);
-8: 
-9:     long long manifestConstInt(ConstValue* value, bool& reject);
-10:     void collect(Crate* crate);
-11:     semType* transformType(Type* t);
-12: 
-13:     void checkItem(Item* item);
-14:     semType* infer(Expr* expr);
-15:     semType* expect(Expr* expr, semType* wish);
-16: 
-17:     void error(std::string message);
-18: 
-19:     globalTable table_;
-20:     scopeStack scope_;
-21:     semType* currentRet_ = nullptr;
-22:     std::string currentStruct_;
-23:     bool reject_ = false;
-24: };
-
-(End of file - total 24 lines)
-</content>
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 32.2s)
-
-_Thinking:_
-
-Now let me carefully review the collect implementation. Let me analyze against the plan and spec.
-
-The code:
+所以在 **`infer` 的 `callExpr` 分支**里处理。建议把它拆成一个 `checkCall(callExpr*)`，分支按 callee path 的段数：
 
 ```cpp
-void Checker::collect(Crate* crate) {
-    // 1st time: register
-    auto all = crate->items_;
-    for (Item* item : all) {
-        auto registerFuncAndConst = [&](Item* item, std::map<std::string, funcSignature> &funcSig,
-                                        std::map<std::string, constSignature> &constSig) {
-            if (auto func = dynamic_cast<funcItem*>(item); func) {
-                std::string funcName = func->name_;
-                if (funcSig.count(funcName) || constSig.count(funcName)) {
-                    error("duplicate function name (with function or constant) : " + funcName);
-                }
-                else {
-                    funcSig[funcName];
-                }
-            }
-            if (auto value = dynamic_cast<constItem*>(item); value) {
-                std::string constName = value->name_;
-                if (funcSig.count(constName) || constSig.count(constName)) {
-                    error("duplicate constant name (with function or constant) : " + constName);
-                }
-                else {
-                    constSig[constName];
-                    constSig[constName].value_ = value->value_;
-                }
-            }
-        };
-        registerFuncAndConst(item, table_.funcSig, table_.constSig);
-        if (auto stru = dynamic_cast<structItem*>(item); stru) { ... }
-        if (auto impl = dynamic_cast<ImplItem*>(item); impl) {
-            std::string implName = impl->type_->name_;
-            if (impl->type_->kind_ != kKind::STRUCT) {
-                error("attempted to implement a non-struct type, name = " + implName);
-            }
-            else {
-                for (Item* inner : impl->items_) {
-                    registerFuncAndConst(inner, table_.methods[implName], table_.associatedConsts[implName]);
-                }
-            }
-        }
+auto* p = dynamic_cast<pathExpr*>(call->callee_);
+if (p == nullptr) { error("callee is not a function"); return makeError(); }
+
+if (p->path_.size() == 1) {
+    // 自由函数：局部遮蔽检查 → funcSig
+}
+else if (p->path_.size() == 2) {
+    std::string head  = p->path_[0].name_;
+    std::string member = p->path_[1].name_;
+    if (head == "Box" || head == "Vec") {
+        // 内置关联函数（Phase 5）：校验 p->path_[0].types_ 恰好 1 个类型实参，
+        // transformType(types_[0])，按 new/clone 的签名查参数、给返回类型
     }
-    for (auto [name, anything] : table_.methods) { ... }
-    for (auto [name, anything] : table_.associatedConsts) { ... }
+    else {
+        if (head == "Self") head = currentStruct_;      // impl 体内 Self::emit()
+        // 用户 struct 的关联函数：methods[head][member]
+        // 若 isMethod_ == true（有 receiver），S::method() 这种无接收者调用要报错
+    }
 }
+else { error("unsupported path"); return makeError(); }
 ```
 
-Issues I can spot:
-
-**1. The lambda accesses `this` implicitly (capture `[&]`) and calls `error(...)` — fine. But passing `registerFuncAndConst(inner, table_.methods[implName], ...)`: `table_.methods[implName]` default-constructs the inner map before the lambda runs. That's fine.
-
-**2. Crucial bug: `error()` sets `reject_`; but `transformType` throws for unexpected kinds — not relevant.**
-
-**3. `manifestConstInt` has no return statement** — warning and UB if called. Still stub; presumably they'll write it. But transformType currently calls it, so any array type in tests triggers UB → crash. It's a stub, so mention.
-
-**4. `transformType(Type* type)` — parameter named `type`, shadows nothing; `kKind` = AST Type kind. Fine. But `transformType` doesn't handle `STRUCT` name verification / `Self`. Minor.
-
-**5. Bigger issue: duplicates cause the first registration to be kept, and duplicate gets error. That's fine. But note: if `funcSig.count || constSig.count`, they error. But if a duplicate function has same name, the FIRST function entry stays as placeholder. Pass 3 will fill the first. Since reject_ is set, program exits 1 anyway. OK.
-
-**6. Lambda's cross-check for methods: `registerFuncAndConst` checks `funcSig.count(funcName) || constSig.count(funcName)` where the passed maps are `methods[implName]` and `associatedConsts[implName]` — correct cross-check. Good.
-
-**7. The struct registration happens AFTER `registerFuncAndConst(item, ...)`; for an item that is a struct, the lambda does nothing. Fine. But wait: order of registration: `registerFuncAndConst` before struct/impl checks; for `impl` items it does nothing. Fine.
-
-**8. Bug: When `impl->type_->kind_ != STRUCT`, they error and skip registering inner items. Then the post-loop scan doesn't include it (not registered), fine. But what about `impl U32`? kind BUILTIN → error. good.
-
-**9. Bug (semantic): `impl->type_->kind_ == STRUCT` but name unknown → post-loop scan checks methods/associatedConsts keyed by name. Good. But `impl Empty {}` (struct target valid but no items) — no registration occurs; no scan issue. Fine.
-
-**10. Potential subtle bug: the post-loop scan uses structured bindings `auto [name, anything]` — copies maps' pairs (fine).
-
-**11. Bigger issue: protected names.** Not implemented: `struct i32` → error (test rej-protected-type-name-i32). Wait — `struct i32` AST: makeNamedType only applied to types, not struct names. structItem name_ = "i32" (identifier). So table_.structSig["i32"] registers fine, no error. The protected-name check isn't in collect yet. The user said they finished collect; protect-name checks are part of Phase 1 per todo. Missing: top-level fn/const named get_i32/print_i32/println_i32 → error; struct named i32 → error. Should flag as missing. (UB cases: struct u32 etc. — skip.)
-
-Actually wait: what does `rej-protected-type-name-i32.rx` expect? struct named i32 → compile error. Their collect would accept it silently. That's a missing check.
-
-**12. Missing: duplicate parameter names** — `fn f(x: i32, x: i32)` should error. Their collect doesn't check. Could be pass 1 (params available) or pass 3. Not done.
-
-**13. Missing: struct field duplicate names** — `rej-duplicate-field` — not checked. Could be pass 1 or 3 (fields). Not done.
-
-**14. Missing: top-level function with receiver check (`fn f(self)`)** — not checked. `funcItem::parameter_` contains Param with isSelf_=true. Should error at top level. Not done (in collect; could be checkItem later, but it's a signature-level error; todo says Phase 1). The test `rej-a-top-level-function-cannot-have-a-receiver.rx` requires it.
-
-**15. Missing: protected value names check for top-level fn/const. Also local protected (UB, skip).
-
-**16. Missing: const declared types / function signatures resolution — that's pass 3, not done yet. The user says "我把 collect 写完了" — maybe they mean only pass 1 (registration)? They said earlier "collect 跑第一遍" and now "把 collect 写完了". The code only contains step 1 registration. Steps 2 and 3 are not there. So "collect 写完了" might mean the whole collect but only step 1 implemented? Actually the code doesn't show steps 2 & 3. They asked "用了一点小巧思" — the lambda is the "小巧思". I should review what's there and note that steps 2/3 (constant eval, type resolution) are still missing (maybe they know; but "写完了" suggests they think it's done). Let me point out clearly.
-
-**17. The lambda captures by reference and calls error; fine. But `registerFuncAndConst` uses `dynamic_cast<funcItem*>(item)` with `if (auto func = ...; func)` — C++17 init-statement, fine.
-
-**18. `for (auto [name, anything] : table_.methods)` — copies; fine.
-
-**19. Potential bug in the scan: `impl->type_->kind_ != STRUCT` gets an immediate error; but if kind is BOX/VEC, `implName` is "AAAunnamedType" (default name_ from ast.h Type default). The error message will print garbage name; cosmetic. For REF, name_ = default too. Not a functional issue.
-
-**20. More important: `impl Config` where Config is a valid struct declared later: registration goes into `methods["Config"]`/`associatedConsts["Config"]`; scan finds structSig has it. Good.
-
-**21. What about method/assoc const names colliding with each other via the lambda? The lambda checks the two maps passed. Good.
-
-**22. What about top-level `fn` and `const` inside impl? No interaction. Good.
-
-**23. Duplicate struct vs function: separate namespaces; no check between them. Good (acc test expects allowed).
-
-**24. Missing: `struct same name as protected? handled above.
-
-**25. What about duplicate struct name and impl target? separate. fine.
-
-**26. The order: `registerFuncAndConst(item, table_.funcSig, table_.constSig)` is called for every item including struct/impl. Fine.
-
-**27. One real bug: if an `impl` target has kind_ != STRUCT, they don't register items; but the post-loop scans methods/associatedConsts for unknown structs only. Since nothing registered for invalid target, no duplicate-check for its inner items. Fine given error already.
-
-**28. Another real bug: the "non-existing struct have methods" scan: if `impl Unknown` has items, registered under "Unknown"; scan errors. Good. But error message repeats for both methods and assoc consts? Only one of them has entries. Fine.
-
-**29. What about `impl Self`? kind STRUCT name "Self" → registered; scan finds no structSig["Self"] → error. OK.
-
-**30. `error()` not defined yet (declared in header). Since collect calls it, checker.cpp won't link until error() is defined. It already was needed before. They must define it. Presumably will.
-
-**31. Missing `#include <map>`? symbol.h includes <map>. Fine.
-
-**32. `for (auto [name, anything] : table_.methods)` — "anything" unused; fine but maybe `[[maybe_unused]]` not needed.
-
-**33. C++17 structured bindings with map copies — fine.
-
-**34. Very important design issue: `manifestConstInt(ConstValue*, bool& reject)` is a member now (declared in checker.h line 9). It can now access table_ and currentStruct_, good — that resolves my earlier concern. But it has no return and no implementation.
-
-**35. transformType: STRUCT branch doesn't check table_.structSig and doesn't handle Self; ARRAY branch calls manifestConstInt which returns long long but makeArray takes unsigned int — implicit conversion fine.
-
-**36. Also, `transformType` for ARRAY needs length type check (usize) per our discussion — manifestConstInt presumably will do the type check, but it can't yet because const declared types aren't resolved (pass 3 order issue we discussed). They haven't done pass 3.
-
-So the review should:
-- Confirm the lambda approach is good and correct for registration + cross-namespace checks.
-- Point out what's missing (still expected): pass 2 (manifestConstInt implementation + eval-all-consts loop + cycle detection) and pass 3 (resolve types). If they mean "collect is done" including steps 2/3, clearly no — only step 1 exists.
-- Bugs/gaps in step 1:
-  a. Protected names not checked: `struct i32` CE, top-level fn/const with get_i32/print_i32/println_i32 CE.
-  b. Duplicate parameter names not checked (could do here since funcItem has params; or in check phase).
-  c. Top-level function with receiver (`fn f(self)`) not checked.
-  d. Duplicate struct fields not checked.
-  e. `manifestConstInt` empty body → UB if array type encountered; transformType calls it.
-- Also point out: error on non-STRUCT impl target skips registering associated items; for `impl i32 { fn f... }` that's fine, but there's a subtle issue: if two impls target the same invalid type, no matter. Fine.
-- Note: `implName` for BOX/VEC is default "AAAunnamedType"; error message ugly; minor.
-- Note pass 3 scan order issue we discussed (const declared types first) — not yet relevant.
-
-Wait, also check: duplicate method check uses `methods[tn]` and `associatedConsts[tn]` passed by reference; inside lambda, `funcSig.count(funcName) || constSig.count(constName)` — cross-check works.
-
-One more potential bug: `registerFuncAndConst` for a top-level item and for impl inner items — when called with `table_.methods[implName]`, the `operator[]` creates the entry even if the lambda finds nothing to do? No — `table_.methods[implName]` is evaluated as an argument BEFORE the call, so it always creates an empty inner map for every impl, even `impl Config {}` with no items. Then the post-loop scan iterates `table_.methods` and finds "Config" (exists in structSig, fine) — no error. But for `impl i32 {}`? kind != STRUCT → skip, no creation. For `impl Unknown {}` (empty, valid-kind) — `table_.methods["Unknown"]` gets created by the argument evaluation even with no items! Then the scan reports "non-existing struct Unknown have methods" — which is correct behavior anyway (unknown target is an error). But for `impl Config {}` where Config exists — fine. But hold on: what about an impl of an existing struct with only a const? `table_.methods[implName]` creates an empty inner map for it; scan sees name in structSig → fine. OK no false positive.
-
-But wait, there IS a subtle false-positive scenario: none. Fine.
-
-Another subtle issue: the post-loop scan reports "non-existing struct X have methods" for any impl target unknown. But if `impl Unknown` is empty (no methods/consts), the `methods[Unknown]` empty map still gets created due to C++ argument evaluation → scan catches. Actually good, catches it.
-
-Hmm, one more: `registerFuncAndConst` at top level also cross-checks top-level fn/const. Good.
-
-Another potential issue: when a duplicate top-level function is found, they don't insert; but the FIRST insertion remains a placeholder. Pass 3 would fill first signature. fine.
-
-What about duplicate constant: they don't overwrite value_; the first const's value_ remains. Pass 2 evaluates first; duplicate is error anyway.
-
-Now — "用了一点小巧思" refers to the lambda shared between top-level and impl-level registration. It's good; worth praising.
-
-Should I also mention that checking top-level fn/const protected names would ideally be in the lambda? Also params check.
-
-Also, one more potential issue: the lambda is defined inside the loop (recreated each iteration, capturing by reference). Minor overhead; could define outside; not a correctness issue. Could mention as style (optional).
-
-Also, `error()` signature takes `std::string` by value; fine.
-
-Also note: `throw "transformType";` — could theoretically be reached only if AST kind invalid; fine, but per log.md, prefer makeError. Mentioned before; skip or briefly.
-
-What about the missing `#include <string>` etc. — checker.h includes symbol.h/type.h/ast.h; string comes along. fine.
-
-Now, before writing the review, maybe I should verify whether `error()` is defined elsewhere (maybe they added it). Let me grep for `Checker::error` and `checkCrate` in the repo. Also check if main.cpp was wired up. Let me do that quickly.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "grep -rn \"Checker::error\\|checkCrate\\|error(\" /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/ | grep -v \"syntaxError\\|ErrorListener\" | head -20; echo ===; git -C \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" status --short | head -20"
-}
-```
-
-**Output:**
-```
-/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp:44:                    error("duplicate function name (with function or constant) : " + funcName);
-/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp:53:                    error("duplicate constant name (with function or constant) : " + constName);
-/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp:65:                error("duplicate struct name : " + struName);
-/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp:74:                error("attempted to implement a non-struct type, name = " + implName);
-/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp:85:            error("non-existing struct " + name + " have methods");
-/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp:90:            error("non-existing struct " + name + " have constants");
-/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.h:7:    bool checkCrate(Crate* rt);
-/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.h:17:    void error(std::string message);
-===
- M .vscode/c_cpp_properties.json
- M compiler/src/ast/ast.h
- M compiler/src/semantic/checker.cpp
- M compiler/src/semantic/checker.h
- M compiler/src/semantic/symbol.h
- M compiler/src/semantic/type.h
- M now_todolist_3.md
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 35.5s)
-
-_Thinking:_
-
-So `error()` and `checkCrate()` are declared but not defined yet. The build would fail at link if main.cpp calls checkCrate; currently main.cpp doesn't call it, but collect calls error() which is undefined → link error! Wait, checker.cpp is compiled; undefined `Checker::error` reference will cause a link error even if collect is never called, because checker.cpp is part of rxcc and references the symbol. Actually, unless the linker garbage-collects? No, by default the linker requires all referenced symbols to be defined. So `cmake --build` would fail with undefined reference to `Checker::error(std::string)`.
-
-Also `manifestConstInt` has no return → warning (not error unless -Werror). And `throw "transformType"`.
-
-Also .vscode/c_cpp_properties.json modified — irrelevant.
-
-The user says "我把 collect 写完了，用了一点小巧思，你看看有没有啥问题。" So review. I should read the current files (done). Note they may not have compiled yet. Let me think about what to say:
-
-**Praise the clever bit**: the shared `registerFuncAndConst` lambda handles both top-level (value namespace) and impl (associated namespace) with cross-map duplicate checks; passing `table_.methods[implName]` and `table_.associatedConsts[implName]` by reference makes cross-check work. Nice.
-
-**Problems to flag**:
-
-A. **Doesn't compile/link yet**: `Checker::error` and `Checker::checkCrate` declared but not defined; `manifestConstInt` missing return. If they haven't tried building, they'll hit undefined references. Also `main.cpp` doesn't call Checker yet.
-
-B. **Steps 2/3 missing**: collect currently is only step 1 (registration). Step 2 (eval all consts + cycle detection) and step 3 (transformType filling fields/signatures/const types) aren't in collect. Maybe they know; but "写完了" perhaps means pass 1 only. I should state clearly what's covered: 登记名字 only.  
-
-Wait, maybe they mean they wrote all of collect but only step 1 so far? The code shows transformType exists (partially) and manifestConstInt stub. No step 2/3 loops. I'll ask/point out.
-
-C. **Missing Phase-1 checks** (negative tests that will still pass incorrectly):
-   - `struct i32` protected name → CE; current code accepts.
-   - Top-level fn/const named get_i32/print_i32/println_i32 → CE; accepts.
-   - `<struct>` duplicate fields → CE; accepts.
-   - `<fn>` duplicate params → CE; accepts.
-   - Top-level `fn f(self)` → CE; accepts (isSelf_ in Param).
-   
-D. **Minor issues**:
-   - `implName` for non-STRUCT kinds prints default "AAAunnamedType" (BOX/VEC/REF/ARRAY have no name_); cosmetic.
-   - The lambda is re-created each loop iteration; move outside loop for clarity (optional).
-   - `for (auto [name, anything] : ...)` copies the pair; use `const auto&` (minor perf). Not important.
-   - `throw "transformType"` fallback: prefer `return makeError()` (log.md lesson). Also transformType STRUCT branch doesn't check existence/Self yet (step 3 TODO).
-   - `transformType` doesn't handle struct name resolution or Self yet — step 3.
-   - `manifestConstInt` free of type checks: the array length check (usize) will need const declared types resolved first (as discussed).
-   - The scan reports duplicates repeatedly? No.
-   - One subtle bug: the scan `table_.methods` includes **empty** inner maps created by `table_.methods[implName]` argument evaluation for every impl (even one with no items). That's fine functionally (an impl target unknown with no items would be caught; existing struct fine). But for an invalid target `impl i32 {}` they skip registration entirely so `methods["i32"]` isn't created → no scan error, but they already errored with "attempted to implement non-struct". Fine.
-
-E. Cross-check between method and assoc const works via the lambda. Good.
-
-F. Another subtle bug: **duplicate detection between top-level function and constant** — the lambda checks both maps. Good. But what if a function and a constant with the same name both appear: first one registers, second errors. Good.
-
-G. What about `impl Config` where `Config` is not (yet) declared but is actually a typo and some struct with the same name is declared later? The scan after loop checks structSig; correct.
-
-H. What about the same struct having multiple impls: `table_.methods[implName]` reuses the inner map; duplicate checks catch cross-impl. Good.
-
-I. Check ordering: `registerFuncAndConst(item, ...)` for top-level called before struct registration — irrelevant since namespaces separate.
-
-J. Protected value names: the top-level check `get_i32` etc. should be added in the lambda or after loop.
-
-K. One more: **`error()` should probably print to stderr; but more importantly, `error` should set `reject_`**. Not yet defined.
-
-L. Also `manifestConstInt` returns `long long` but `makeArray` expects `unsigned int` — implicit narrowing on use. Fine but the check "negative length / non-usize" belongs in manifestConstInt.
-
-M. Also potential issue in `transformType`: for BUILTIN, should validate name is one of the 5 (parser guarantees). Fine.
-
-N. `transformType` for STRUCT with name "Self" — must use currentStruct_; and unknown struct → error. TODO step 3.
-
-O. Since collect is called (presumably from checkCrate), `checkCrate` still missing.
-
-Let me also consider: is there any actual logic bug in what's implemented? Let me re-examine:
-- Lambda `if (funcSig.count(funcName) || constSig.count(funcName))` — for top-level, funcSig=table_.funcSig, constSig=table_.constSig. OK.
-- For impl: funcSig=methods[tn], constSig=associatedConsts[tn]. OK.
-- Duplicate struct check OK.
-- Impl target validation: kind_ != STRUCT error; skip registering items. Hmm — skipping means that for `impl i32 { fn f(self){} }` (also has receiver error) only one error reported; that's fine (multi-error not required).
-- Post-loop scans OK.
-
-One more potential issue: **the post-loop scan `for (auto [name, anything] : table_.methods)`** — copies inner map including all signatures (types are pointers); slight overhead, harmless.
-
-Another: `struct i32` — the structItem for name "i32" would be registered in structSig["i32"]. Then `impl i32` would have kind_? impl target `i32` parses via makeNamedType → BUILTIN i32 (because ast_builder maps "i32" to BUILTIN). So `impl i32` errors "non-struct type" even if a struct named i32 was declared (which is itself invalid). Fine.
-
-But also `struct Box {}` — name "Box" registers; but `impl Box` is BOX kind error. Fine.
-
-Potential issue with protected type check: `struct i32` should error. Not implemented → rej-protected-type-name-i32 will fail. Add check in struct registration: if name == "i32" → error. For the UB names (u32, etc.) no need. Actually per spec, only "i32" is a compile error among struct names in the protected type namespace; the others are UB. But wait, re-read: "Other redeclarations of protected builtins within their respective namespaces are compile-time errors, including defining a struct named i32". Hmm, so `struct u32` is listed under UB ("Declaring a struct named u32, isize, usize, bool, Box, Vec, Copy, Clone, PartialEq, or Eq"). So only `i32` needs rejection. Weird but ok. Actually hold on: why is `i32` different? Perhaps because `i32` is not usable as a struct name... Whatever, spec is spec. Since UB cases never appear in tests, rejecting them is harmless too, but might conflict? No positive test declares struct u32. So could reject all type protected names; but strictly only i32 is required. I'd implement: reject struct name i32 (required); optionally others (harmless). Fine.
-
-Also missing: `fn get_i32()`/`const print_i32` top-level → error. Implement in registration.
-
-Also: `fn f(self)` at top level → error. Check any param `isSelf_` in top-level funcItem.
-
-Also duplicate parameter names: `fn f(x: i32, x: i32)` → error. Implement when? Could do right in registration (we have funcItem). But careful: methods' params include self at index 0; self name "self" won't duplicate. Fine. But duplicate param check is more naturally in step 3 when filling signatures. Either.
-
-Also duplicate field names in struct: could check in registration loop too.
-
-Now, the "clever bit" is nice; to help, I could offer whether they want me to point out exact places; but no edits unless asked. The user asked "看看有没有啥问题" — review only, no edits.
-
-Should I run the build to see compile errors? The instruction from first turn "这个会话中，不进行任何修改" — running a build writes to target/build (modifies files outside source). Hmm, that's a build artifact; user asked to review. Building would be helpful to confirm undefined error. But it may take time and modify build outputs. The earlier instruction said no modifications; but that was that turn. Reviewing code doesn't require building. However, verifying compile/link issues would be useful. The project's build command: cmake --build target/build. It may already be configured. Let me consider: the user said "我把 collect 写完了...你看看有没有啥问题" — they probably want a code review, not a build. I can point out the undefined `error()` from static reading. But maybe they defined error() in another file? I grepped `Checker::error` — no definition found. So link error is certain once checker.cpp is compiled and references it... Actually static linking requires the symbol to be defined regardless of whether collect is called, unless the linker uses --gc-sections and collect is unreferenced? Undefined symbol errors happen at link time for any undefined referenced symbol in included object code. collect is a member function that's compiled into checker.o; it references Checker::error → undefined symbol → link error. So the project currently doesn't build. Let me verify by building? That would be useful and confirm. But building might be expensive (~ANTLR generated). The build dir exists; incremental build would compile checker.cpp only (it changed) and link. Let me check if target/build exists. Yes target/ exists. Let me try `cmake --build target/build -j` — this runs compile; it doesn't modify source. I think it's acceptable and helpful ("verify"). The user asked for review; verifying compilation is part of review. But the first-turn instruction "这个会话中，不进行任何修改" may still be in spirit? They later asked me to review collect, so reading + optionally compiling is fine. However, if main.cpp doesn't call checker, the object is still linked. Let's build to confirm. Actually, wait: `manifestConstInt` missing return triggers a warning, not error (unless -Werror; Release build no -Werror). Link error due to error() is certain. Let me run the build quickly to confirm and to see if it otherwise compiles.
-
-Timeout: cmake build -j; ANTLR generation already done, incremental. Let's run with 120s timeout. Note workdir is repo root; build command uses `target/build`. Let me run `cmake --build target/build -j` only (already configured).
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cmake --build target/build -j 2>&1 | tail -25",
-  "workdir": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler",
-  "timeout": 180000
-}
-```
-
-**Output:**
-```
--- GLOB mismatch!
--- Configuring done (0.7s)
--- Generating done (0.2s)
--- Build files have been written to: /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/target/build
-[  9%] Building CXX object CMakeFiles/rxcc.dir/src/frontend/ast_builder.cpp.o
-[ 18%] Building CXX object CMakeFiles/rxcc.dir/src/main.cpp.o
-[ 27%] Building CXX object CMakeFiles/rxcc.dir/src/semantic/checker.cpp.o
-/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp: In member function ‘long long int Checker::manifestConstInt(ConstValue*, bool&)’:
-/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp:7:1: warning: no return statement in function returning non-void [-Wreturn-type]
-    7 | }
-      | ^
-[ 36%] Linking CXX executable rxcc
-/usr/bin/ld: CMakeFiles/rxcc.dir/src/semantic/checker.cpp.o: in function `Checker::collect(Crate*)::{lambda(Item*, std::map<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, funcSignature, std::less<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::allocator<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, funcSignature> > >&, std::map<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, constSignature, std::less<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::allocator<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, constSignature> > >&)#1}::operator()(Item*, std::map<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, funcSignature, std::less<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::allocator<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, funcSignature> > >&, std::map<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, constSignature, std::less<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::allocator<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, constSignature> > >&) const':
-checker.cpp:(.text+0x153b): undefined reference to `Checker::error(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >)'
-/usr/bin/ld: checker.cpp:(.text+0x16ac): undefined reference to `Checker::error(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >)'
-/usr/bin/ld: CMakeFiles/rxcc.dir/src/semantic/checker.cpp.o: in function `Checker::collect(Crate*)':
-checker.cpp:(.text+0x2281): undefined reference to `Checker::error(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >)'
-/usr/bin/ld: checker.cpp:(.text+0x2405): undefined reference to `Checker::error(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >)'
-/usr/bin/ld: checker.cpp:(.text+0x2b66): undefined reference to `Checker::error(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >)'
-/usr/bin/ld: CMakeFiles/rxcc.dir/src/semantic/checker.cpp.o:checker.cpp:(.text+0x2cf4): more undefined references to `Checker::error(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >)' follow
-collect2: error: ld returned 1 exit status
-gmake[2]: *** [CMakeFiles/rxcc.dir/build.make:248: rxcc] Error 1
-gmake[1]: *** [CMakeFiles/Makefile2:83: CMakeFiles/rxcc.dir/all] Error 2
-gmake: *** [Makefile:91: all] Error 2
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 19.6s)
-
-_Thinking:_
-
-As predicted: link error because `Checker::error` is not defined, and warning for `manifestConstInt` no return.
-
-Now write the review. Structure:
-
-1. 好的地方：lambda 复用、交叉查重（值空间 fn/const；关联空间 method/assoc const）、跨 impl 共享内层 map、非 STRUCT 目标当场报、跑完全部后扫两张 map 校验未知 struct —— 都对。一个小的隐含保障：`table_.methods[implName]` 作为实参求值会为每个 impl 建空表，所以 `impl Unknown {}` 这种空 impl 也会被扫到（对现有扫描逻辑是件好事）。
-
-2. 编译/链接问题（我实际 build 过）：
-   - `Checker::error` 只声明没定义 → 链接错误（8 处 undefined reference）。
-   - `manifestConstInt` 没有 return → 警告，且一旦被调到就是 UB；目前 `transformType` 的 ARRAY 分支会调它，跑含数组的用例会崩。
-   - `checkCrate` 也没定义，main.cpp 还没接。
-
-3. collect 只完成了第 1 小遍：第 2 遍（全量求值 + 环检测）、第 3 遍（填字段/签名/常量声明类型 + ARRAY 长度）都还没有。如果"写完 collect"指的是三遍都写完了，那另外两遍还没出现在文件里。
-
-4. 第 1 小遍还缺的 Phase 1 负例检查（列出来，附测试名）：
-   - `struct i32` → CE（rej-protected-type-name-i32）。u32/isize/... 那些是 UB 不用管。
-   - 顶层 fn/const 叫 get_i32/print_i32/println_i32 → CE。局部是 UB 不用管。
-   - `fn f(self)` 顶层带接收者 → CE（rej-a-top-level-function-cannot-have-a-receiver）。可以在 lambda 里检查 funcItem 的 parameter_ 有没有 isSelf_。
-   - 函数参数重名 → CE（rej-duplicate-parameter）。
-   - 结构体字段重名 → CE（rej-duplicate-field）。
-
-5. 小问题/风格（可选）：
-   - `impl Box<i32>` 报错信息里的 `implName` 是 Type 默认的 "AAAunnamedType"（BOX/VEC/REF/ARRAY 的 name_ 没赋值），报错里别用 name_，直接用 kind 描述。
-   - lambda 可以移到循环外，避免每轮重建（无关正确性）。
-   - 扫描 `for (auto [name, anything] : ...)` 按值拷贝整个 map，用 `const auto&`。
-   - `throw "transformType"` 建议 `return makeError()`（log.md 教训 11）；不过现在也到不了。
-   - transformType STRUCT 分支还缺 `Self` 与存在性校验（第 3 遍的事）。
-
-Also note one subtle correctness point: the cross-check for impl associated items: methods & associatedConsts share namespace — done via lambda. Good.
-
-Another subtle point: for top-level duplicate names, they keep first. Fine.
-
-Another subtle point: the "小巧合" — passing `table_.methods[implName]` creates the entry even if impl has no items; this makes the unknown-struct scan catch empty impls too. Actually wait, do we want `impl Unknown {}` to be an error? Yes (unknown target). Good.
-
-But hmm, one more issue: `impl i32 { }` kind != STRUCT → error, skipped. Good. But what about `impl Unknown { fn f() {} }` — registered "Unknown", scan errors. Good.
-
-What about `impl (i32)`? visitTypeRef unwraps parens → BUILTIN → error. Good.
-
-Also: `struct i32` would be registered and only caught by adding check. Note also that `struct i32` then `impl i32`: impl target parse "i32" → BUILTIN → error too. Fine.
-
-Let me keep the review organized and concise-ish. The user asked "看看有没有啥问题" — a detailed review is expected. I can be a bit longer than 4 lines.
-
-Also mention that I ran the build (transparency). Good.
-
-Order: start with the good, then blocking issues, then missing checks, then minor.
-
-我实际重新 build 了一下。小巧思本身是对的，先说好话：用 `registerFuncAndConst` 同时服务顶层和 impl、把 `methods[tn]`/`associatedConsts[tn]` 传进去做**交叉查重**、跨 impl 共享内层 map、非 STRUCT 目标当场报、最后扫两张 map 查未知 struct——这些都正确。顺带一个隐藏好处：`table_.methods[implName]` 作为实参求值会给每个 impl 建出空表，所以 `impl Unknown {}` 这种空 impl 也会被尾部扫描抓到。
-
-**阻塞问题（现在链接不过）**
-
-1. `Checker::error` 只有声明没定义 → 8 处 `undefined reference`，rxcc 链接失败。
-2. `manifestConstInt` 没有 return（编译器警告），被调到就是 UB；`transformType` 的 ARRAY 分支正在调它，将来一跑含数组的用例就崩。
-3. `checkCrate` 也未定义、`main.cpp` 还没接（这个你知道）。
-
-**collect 还只有第 1 小遍**
-
-第 2 遍（全量常量求值 + `state_` 环检测）和第 3 遍（填字段/签名/常量声明类型 + ARRAY 长度）在文件里都还没有。如果"写完了"指三遍，那还差两遍。
-
-**第 1 小遍还缺的负例检查**（都有对应测试）
-
-| 检查 | 测试 |
-|---|---|
-| `struct i32` → CE（`u32/isize/...` 是 UB 可不管） | `rej-protected-type-name-i32` |
-| 顶层 fn/const 叫 `get_i32`/`print_i32`/`println_i32` → CE（局部的是 UB） | 保护名 suite |
-| 顶层 `fn f(self)` → CE（看 `funcItem.parameter_[0].isSelf_`） | `rej-a-top-level-function-cannot-have-a-receiver` |
-| 函数参数重名 | `rej-duplicate-parameter` |
-| 结构体字段重名 | `rej-duplicate-field` |
-
-**小问题（不阻塞）**
-
-- `impl Box<i32>` 的报错里 `implName` 是 Type 的默认名 `"AAAunnamedType"`（BOX/VEC/REF/ARRAY 没设 name_），这条报错别用 `name_`。
-- lambda 每轮循环重建，可挪到循环外；`for (auto [name, anything] : ...)` 按值拷贝了整个 map，用 `const auto&`。
-- `throw "transformType"` 建议换 `return makeError()`（log.md 教训 11），虽然现在到不了。
-- `transformType` 的 STRUCT 分支还缺 `Self` 解析和未知 struct 校验（第 3 遍再做），ARRAY 长度也还没做我们在讨论的 `usize` 声明类型检查。
-
-先补 `error()` 的定义 + `manifestConstInt` 的 return 占位，让它能编译链接，再继续第 2 遍。
+几个要点：
+
+- **turbofish 类型实参在 `path_[0].types_` 里**（`Box` 段的 `vector<Type*>`），不在第二段；`Box::<i32>::new` 的 `new` 段 types_ 是空的；
+- **别在 `infer(pathExpr)` 里处理它**：`infer(path)` 只处理"作为值"的路径——1 段（局部/常量）和 2 段的**关联常量**（`Self::N`/`Config::N`）。函数路径只出现在 callExpr 的 callee 位置，作为值本来就不用管（UB）；
+- `Box::<i32>::new` 省略 turbofish 是 UB，测试不会出现，`types_.size() != 1` 时报错就行；
+- Phase 2 跑 `casts/arithmetic/shifts` 用不到这两个分支，可以先 `return makeError()` 占位；但 `println_i32(...)` 是 1 段自由函数，必须在第 1 步就通。
 
 ---
 
 ## User
 
-implName 用的 Type 是 AST 的 Type，不是 semType（这个的默认值才是 "AAAunnamedType"），所以应该这个点没问题，否则的话 implName 错了会出大问题。现在 error() 改了，manifestConstInt return 也写了，你看看。
+我写了一下，你看看。
 
 ---
 
-## Assistant (Build · DeepSeek V4.1 Flash · 14.7s)
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 13.5s)
 
 _Thinking:_
 
-The user corrects me: `implName` uses AST's `Type`, not semType; the default "AAAunnamedType" is from... wait, let me check. In ast.h:
-
-```cpp
-struct Type : Node {
-    enum kTypeKind { BUILTIN, STRUCT, BOX, VEC, REF, ARRAY, UNIT } ;
-    kTypeKind kind_;
-    std::string name_;
-    Type* elem_ = nullptr;
-    bool isMut_ = false;
-    ConstValue* arrayLength_ = nullptr;
-};
-```
-
-Hmm, AST Type has `std::string name_;` with no default initializer. In semantic/type.h:
-
-```cpp
-struct Type{
-    enum kTypeKind { BUILTIN, STRUCT, BOX, VEC, REF, ARRAY, UNIT, NEVER, ERROR } ;
-    kTypeKind kind_ = kTypeKind::ERROR;
-    std::string name_ = "AAAunnamedType";
-    ...
-};
-```
-
-So the default "AAAunnamedType" is in **semType** (semantic::Type), not AST Type. Let me re-check ast.h from my earlier read:
-
-```cpp
-struct Type : Node {
-    enum kTypeKind { BUILTIN, STRUCT, BOX, VEC, REF, ARRAY, UNIT } ;
-    kTypeKind kind_;
-    std::string name_;
-    Type* elem_ = nullptr;
-    bool isMut_ = false;
-    ConstValue* arrayLength_ = nullptr;
-};
-```
-
-Yes! AST Type has `std::string name_;` default-initialized to empty string. So for `impl Box<i32>`, AST Type kind_=BOX, name_="" (empty). So my comment about "AAAunnamedType" was wrong — that's semType's default. The user is right. For AST Type, name_ is empty for BOX/VEC/REF/ARRAY. So error message will show empty name, not "AAAunnamedType". Minor cosmetic issue remains (empty name), but not the "default garbage" I claimed. I should acknowledge the correction. Actually `makeNamedType` for BOX/VEC doesn't set name_, so name_ is "" (default-constructed std::string). Fine.
-
-Wait, also referenceType/arrayType create Type with make<Type>() — name_ empty except arrayType sets name_="[k, N]". Reference type: name_ empty. closedCastType etc. Fine.
-
-Now the user says: error() is fixed, manifestConstInt has a return statement. Let me read the files again to review the current state.
-
-I should re-read checker.cpp and checker.h (and maybe main.cpp) and then run build to check. Let me read.
-
-**Tool: read**
-
-**Input:**
-```json
-{
-  "filePath": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp"
-}
-```
-
-**Output:**
-```
-<path>/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp</path>
-<type>file</type>
-<content>
-1: #include "checker.h"
-2: #include <iostream>
-3: 
-4: using kKind = Type::kTypeKind; // AST Type
-5: 
-6: long long Checker::manifestConstInt(ConstValue* value) {
-7:     return 0;
-8: }
-9: 
-10: semType* Checker::transformType(Type* type){
-11:     if (type->kind_ == kKind::BUILTIN) {
-12:         return semantic::makeBuiltin(type->name_);
-13:     }
-14:     if (type->kind_ == kKind::STRUCT) {
-15:         return semantic::makeStruct(type->name_);
-16:     }
-17:     if (type->kind_ == kKind::BOX) {
-18:         return semantic::makeBox(transformType(type->elem_));
-19:     }
-20:     if (type->kind_ == kKind::VEC) {
-21:         return semantic::makeVec(transformType(type->elem_));
-22:     }
-23:     if (type->kind_ == kKind::REF) {
-24:         return semantic::makeRef(transformType(type->elem_), type->isMut_);
-25:     }
-26:     if (type->kind_ == kKind::ARRAY) {
-27:         return semantic::makeArray(transformType(type->elem_), manifestConstInt(type->arrayLength_));
-28:     }
-29:     if (type->kind_ == kKind::UNIT) {
-30:         return semantic::makeUnit();
-31:     }
-32:     throw "transformType";
-33:     return nullptr;
-34: }
-35: 
-36: void Checker::collect(Crate* crate) {
-37:     // 1st time: register
-38:     auto all = crate->items_;
-39:     auto registerFuncAndConst = [&](Item* item, std::map<std::string, funcSignature> &funcSig,
-40:                                     std::map<std::string, constSignature> &constSig) {
-41:         if (auto func = dynamic_cast<funcItem*>(item); func) {
-42:             std::string funcName = func->name_;
-43:             if (funcSig.count(funcName) || constSig.count(funcName)) {
-44:                 error("duplicate function name (with function or constant) : " + funcName);
-45:             }
-46:             else {
-47:                 funcSig[funcName];
-48:             }
-49:         }
-50:         if (auto value = dynamic_cast<constItem*>(item); value) {
-51:             std::string constName = value->name_;
-52:             if (funcSig.count(constName) || constSig.count(constName)) {
-53:                 error("duplicate constant name (with function or constant) : " + constName);
-54:             }
-55:             else {
-56:                 constSig[constName];
-57:                 constSig[constName].value_ = value->value_;
-58:             }
-59:         }
-60:     };
-61:     for (Item* item : all) {
-62:         registerFuncAndConst(item, table_.funcSig, table_.constSig);
-63:         if (auto stru = dynamic_cast<structItem*>(item); stru) {
-64:             std::string struName = stru->name_;
-65:             if (table_.structSig.count(struName)) {
-66:                 error("duplicate struct name : " + struName);
-67:             }
-68:             else if (struName == "i32" || struName == "u32" || struName == "isize" || struName == "usize") {
-69:                 error("struct attempted to use protected name : " + struName);
-70:             }
-71:             else {
-72:                 table_.structSig[struName];
-73:             }
-74:         }
-75:         if (auto impl = dynamic_cast<ImplItem*>(item); impl) {
-76:             std::string implName = impl->type_->name_;
-77:             if (impl->type_->kind_ != kKind::STRUCT) {
-78:                 error("attempted to implement a non-struct type, name = " + implName);
-79:             }
-80:             else {
-81:                 for (Item* inner : impl->items_) {
-82:                     registerFuncAndConst(inner, table_.methods[implName], table_.associatedConsts[implName]);
-83:                 }
-84:             }
-85:         }
-86:     }
-87:     for (const auto& [name, anything] : table_.methods) {
-88:         if (table_.structSig.count(name) == 0) {
-89:             error("non-existing struct " + name + " have methods");
-90:         }
-91:     }
-92:     for (const auto& [name, anything] : table_.associatedConsts) {
-93:         if (table_.structSig.count(name) == 0) {
-94:             error("non-existing struct " + name + " have constants");
-95:         }
-96:     }
-97:     return;
-98: }
-99: 
-100: void Checker::error(std::string message) {
-101:     std::cerr << "error occurred!\n" << message << std::endl;
-102:     reject_ = true;
-103:     return;
-104: }
-
-(End of file - total 104 lines)
-</content>
-```
-
-**Tool: read**
-
-**Input:**
-```json
-{
-  "filePath": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.h"
-}
-```
-
-**Output:**
-```
-<path>/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.h</path>
-<type>file</type>
-<content>
-1: #pragma once
-2: #include "symbol.h"
-3: #include "type.h"
-4: #include "../ast/ast.h"
-5: 
-6: struct Checker {
-7:     bool checkCrate(Crate* rt);
-8: 
-9:     long long manifestConstInt(ConstValue* value);
-10:     void collect(Crate* crate);
-11:     semType* transformType(Type* t);
-12: 
-13:     void checkItem(Item* item);
-14:     semType* infer(Expr* expr);
-15:     semType* expect(Expr* expr, semType* wish);
-16: 
-17:     void error(std::string message);
-18: 
-19:     globalTable table_;
-20:     scopeStack scope_;
-21:     semType* currentRet_ = nullptr;
-22:     std::string currentStruct_;
-23:     bool reject_ = false;
-24: };
-
-(End of file - total 24 lines)
-</content>
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 22.6s)
-
-_Thinking:_
-
-Let me review:
-
-1. The user corrected me on AAAnamedType: right — AST Type's name_ has no default; it's empty for BOX/VEC/REF/ARRAY. My mistake; acknowledge. Actually array type sets name_="[k, N]" in ast_builder. Ref/Box/Vec empty. So error message shows empty name — minor.
-
-2. Changes:
-- `manifestConstInt(ConstValue* value)` now takes only value and returns 0. Header updated (removed bool& reject).
-- `error()` defined: prints to stderr, sets reject_. Good.
-- protected name check added for i32/u32/isize/usize. But spec: struct named i32 → CE; struct named u32/isize/usize/bool/Box/Vec/Copy/Clone/PartialEq/Eq → UB (don't appear in tests). Rejecting them is harmless (they never appear in positive tests). Hmm, but wait: could a *valid* program have `struct u32`? No. So fine. But code rejects 4 names but not bool/Box/Vec/Copy/Clone/PartialEq/Eq. Inconsistent but harmless — the required one is i32. Note: rejecting u32/isize/usize is also harmless. But there's a subtlety! The check order: `if (table_.structSig.count(struName)) ... else if (struName == protected) ... else insert`. For `struct i32`: error, not inserted. OK. For `impl i32` — AST maps i32 → BUILTIN, so non-struct error. OK.
-
-   But wait: protected names include `Copy`, `Clone`, `PartialEq`, `Eq` for type namespace, and `Box`, `Vec`. UB if declared as struct, so not tested. Fine.
-
-3. Now what about top-level fn/const protected value names (get_i32 etc.)? Not yet added. The user may add later; my review should mention remaining gaps (already listed last time). The user asks "现在 error() 改了，manifestConstInt return 也写了，你看看。" So review the new state.
-
-4. Check build again to make sure it links? checker.cpp still references `checkCrate`? No — checkCrate declared but not defined; is it referenced anywhere? main.cpp doesn't call it. Unreferenced undefined member isn't a link error. `manifestConstInt` returns 0. error defined. So build should link now. Let me build to confirm.
-
-Also `manifestConstInt` returns 0 always — placeholder, fine, but note array lengths will silently be 0 for now; not a crash.
-
-One more potential issue: `manifestConstInt` is declared to return `long long`, then passed to `makeArray(..., unsigned int)` — implicit conversion; fine.
-
-Let me build to verify. Then answer:
-- Acknowledge AAAnamedType correction (AST Type name_ empty; semType has default). Actually let me double check ast.h: `std::string name_;` no initializer. Yes. And in semantic/type.h: `std::string name_ = "AAAunnamedType";`. Right.
-- Build passes now? Verify.
-- Remaining items in step 1: protected value names, top-level receiver, duplicate params, duplicate fields (as before). The user added only the struct protected-name check. Actually let me re-check: they added `i32/u32/isize/usize` only. The protected list also includes bool/Box/Vec/Copy/Clone/PartialEq/Eq (UB though). Fine.
-
-- Another subtle issue: the protected-name check placement. They check `else if (protected)` AFTER duplicate check. For `struct i32` then `struct i32` again: first → protected error (not inserted); second → count fails (not inserted), then protected error again. Minor duplicate errors; fine.
-
-- Another subtlety: `struct i32` is an error, and it's not inserted, so `impl i32`... AST kind for impl target `i32` is BUILTIN anyway.
-
-- One more: the spec says type namespace protected names include `i32, u32, isize, usize, bool, Box, Vec, Copy, Clone, PartialEq, Eq`; compile error only for `i32`; UB for others. The code rejects u32/isize/usize too — harmless (never in tests). But maybe mention that only i32 is strictly needed and the others are UB; rejecting is safe. BUT careful: could rejecting `u32` break a positive test? A positive test can't declare `struct u32` (UB). So safe.
-
-Actually wait, there might be a hidden trap: struct named `bool`? code doesn't reject but it's UB — not tested. Fine.
-
-- `error()` output goes to stderr; exit code comes from checkCrate returning !reject_ presumably. Not yet written.
-
-- Also `#include <iostream>` added. `std::endl` fine.
-
-Let me rebuild to confirm link success.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cmake --build target/build -j 2>&1 | tail -8",
-  "timeout": 180000,
-  "workdir": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler"
-}
-```
-
-**Output:**
-```
-[  9%] Building CXX object CMakeFiles/rxcc.dir/src/semantic/checker.cpp.o
-[ 18%] Linking CXX executable rxcc
-[100%] Built target rxcc
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 17.2s)
-
-_Thinking:_
-
-Builds and links now. Let me summarize the review:
-
-1. Correction acknowledged: AST Type's name_ is default-empty (no "AAAunnamedType" — that's semType). So `impl Box<i32>` prints empty name; cosmetic only. And I was wrong to say it would print AAAunnamedType. Good that the user caught it.
-
-2. Build now passes (I ran it).
-
-3. error() implementation is fine: prints + sets reject_. Note: `reject_ = true` and `error` message; good.
-
-4. manifestConstInt returns 0 — placeholder, fine; but array lengths silently become 0 now, which means valid array tests will pass collect but later check will compare lengths (e.g., `[i32; 4]` = `[i32; 0]` won't match initializer length 4) → false errors once pass 3/check runs. It's a stub; just be aware not to forget it before running arrays suite.
-
-5. Struct protected-name check: added i32/u32/isize/usize. Strictly only i32 is CE; the others are UB (no tests). Rejecting them is harmless, but note the spec also lists bool/Box/Vec/Copy/Clone/PartialEq/Eq as protected type names — declaring a struct with those names is UB, so no need to handle. If they want consistency, could check all, but not needed. Actually careful: `struct Copy`? UB, not tested. OK.
-
-6. Remaining step-1 gaps unchanged:
-   - top-level fn/const protected value names (get_i32/print_i32/println_i32) → CE.
-   - top-level fn with receiver → CE.
-   - duplicate params → CE.
-   - duplicate fields → CE.
-   These are still missing. Some can be deferred to check phase, but Phase 1 suite (`protected-names`, `namespace-errors`) needs them.
-
-7. Then steps 2 & 3 of collect (eval all consts + cycle detection; resolve types) still missing.
-
-Also, maybe note a subtle thing about the struct protected check order: if `struct i32` appears twice, two errors; fine.
-
-Another subtle thing: `error()` uses `std::cerr` + `std::endl`; fine.
-
-One more consideration: `checkCrate` undefined but unreferenced → links fine. When they wire main.cpp, they must define it.
-
-Also: does `error()` get called before `reject_` initialization? reject_ = false default; fine.
-
-Should I mention that `manifestConstInt` should probably be `evalConst` returning a value + type eventually? Not needed now.
-
-Keep the reply concise: correction accepted, build passes, two notes (stub returns 0; protected check nuance), remaining gaps list short. The user asked "你看看" — a review. Not editing.
-
-确认：是我看错了。`"AAAunnamedType"` 是 `semType` 的默认值，AST 的 `Type::name_` 无默认初始化（空字符串），所以 `impl Box<i32>` 的报错里是空名字，纯观感小问题，不是大问题。你纠正得对。
-
-我重新 build 了一下：**编译链接现在通过了**（上一条的 `undefined reference` 和 no-return 警告都消失）。`error()` 的实现没问题：打印 + `reject_ = true`。
-
-剩下的点：
-
-1. **`manifestConstInt` 现在恒返回 0**——作为占位没问题，但提醒一下：在这三个常量步骤写完前，任何 `[T; N]` 都会被算成 `[T; 0]`，别在这期间用 arrays 相关 suite 判断对错。
-2. **保护名检查**：你加了 `i32/u32/isize/usize`。严格说只有 `struct i32` 是 CE，`u32/isize/usize/bool/Box/Vec/...` 那些是 UB（测试不会出现），拒掉它们无害。不放心的就只有一点：别把 `struct` 名和字面量 `i32` 搞混——没问题。
-3. **第 1 小遍还差四个负例检查**（上次列过，还没加）：
-   - 顶层 fn/const 叫 `get_i32`/`print_i32`/`println_i32` → CE（`protected-names` suite）
-   - 顶层 `fn f(self)` → CE（看 `func->parameter_` 里的 `isSelf_`）
-   - 函数参数重名 → CE（`rej-duplicate-parameter`）
-   - 结构体字段重名 → CE（`rej-duplicate-field`）
-4. **第 2、3 小遍还没开始**：全量常量求值 + 环检测；`transformType` 填字段/签名/常量类型、`Self`、未知 struct、ARRAY 的 usize 检查。
-
-改完前三个检查，再跑一遍 `make test FILTER=official:semantic:namespace-errors STAGE=semantic` 看看第 1 小遍的成绩，就可以进第 2 小遍了。
-
----
-
-## User
-
-我看了一下，parser.g4 里面确实特别指出第一个参数可以是 self，那为什么你又说 fn f(self) 要拒绝呢？我不太懂 Rust/Rx，是因为只有一个参数或者没有 &,mut 吗？还是别的原因？
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 16.9s)
-
-_Thinking:_
-
-The user asks: parser.g4 allows `self` as first parameter; why do I say top-level `fn f(self)` must be rejected? Is it because of only one parameter or missing &/mut, or something else?
-
-Answer: It's about **location**, not the form of self. The grammar is shared for all function definitions (top-level and impl-associated). The parser is syntax-only; it accepts selfParam anywhere. Semantics: `self` receiver is only valid in functions **inside an inherent impl**; a top-level function has no receiver type (there's no Self). The spec says (functions.html): "Top-level functions accept only ordinary parameters, whereas functions within inherent `impl` blocks may also include a receiver parameter." And `Self` denotes the struct being declared or the target of current impl; neither is an ordinary identifier, and "Self cannot be used in top-level functions declared outside of an impl block" (names.html).
-
-So the rejection is not about `&`/`mut`/number of params — `fn f(self)`, `fn f(mut self)`, `fn f(&self)`, `fn f(&mut self)` are all invalid at top level. The error exists in test `rej-a-top-level-function-cannot-have-a-receiver.rx`. The AST builder sets `isSelf_` on the Param; semantic check: if funcItem is top-level (not registered via impl) and any param has isSelf_ → error.
-
-Also: why does the grammar allow it at all? Because in Rust's grammar, function definitions are the same production in impl and outside; the parser can't (or doesn't) contextually restrict it. ANTLR grammar mirrors that. The AST builder `visitFunctionDefinition` handles functionParameters identically. So semantic must check context.
-
-Another nuance: methods vs associated functions — within impl, self receiver makes it a method. Also `self` must be first parameter; grammar enforces via selfParam being first alternative. Multiple self? Grammar: `functionParameters: selfParam (COMMA functionParam)*` or `functionParam (...)`; so at most one self and only first. Fine.
-
-Also `Self` type in a top-level function signature (e.g., `fn f(x: Self)`) should be an error too (names.html: Self cannot be used in top-level functions outside impl). That's handled in transformType with currentStruct_ empty.
-
-Keep answer concise: it's a context rule, parser accepts it anywhere because grammar is shared; semantics only permits receiver inside impl; all four forms invalid at top level; test exists. Also mention the general pattern: parser guarantees syntax, semantic guarantees meaning — same reason `impl i32` parses fine.
-
-跟 `&`/`mut`/参数个数都无关，是**位置（上下文）**问题。
-
-parser.g4 是"语法"层面：Rust 里顶层函数和 impl 里的函数共用同一条函数定义产生式，语法上没法区分，所以 `selfParam` 在两边都能解析进来。但语义上：`self` 接收者**只允许出现在 inherent impl 的函数里**（spec 原文："Top-level functions accept only ordinary parameters, whereas functions within inherent `impl` blocks may also include a receiver parameter"）。顶层函数没有一个"当前结构体"可以让 `self` 指向——`Self` 在顶层函数里也是禁止的（names.html：“`Self` cannot be used in top-level functions declared outside of an `impl` block”）。
-
-所以这四种顶层写法全都非法，不是因为形式，而是因为没有 impl：
-
-```rust
-fn f(self) {}       // 错
-fn f(mut self) {}   // 错
-fn f(&self) {}      // 错
-fn f(&mut self) {}  // 错
-```
-
-你 AST 里 `visitFunctionDefinition` 对顶层和 impl 内的函数走的是同一个函数，`Param.isSelf_` 会被置 true——所以语义阶段必须看**当前是否在 impl 里**来判断。而在 impl 内这四种都是合法的（后面方法调用可变性检查用 `selfRef_`/`selfMut_`）。
-
-这跟前两天 `impl i32` 是一回事：parser 不帮你做上下文判断，它只保证"语法像 Rx"，"意思说得通"是 collect/check 的活。对应负例就是你测试目录里的 `rej-a-top-level-function-cannot-have-a-receiver.rx`。
-
----
-
-## User
-
-我加了这几个检查，不过我写了一个 template，你觉得这样好吗？
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 13.1s)
-
-_Thinking:_
-
-The user says they added those checks, but wrote a template. Let me read the current checker.cpp to review. Let me read the file.
-
-**Tool: read**
-
-**Input:**
-```json
-{
-  "filePath": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp"
-}
-```
-
-**Output:**
-```
-<path>/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp</path>
-<type>file</type>
-<content>
-1: #include "checker.h"
-2: #include <iostream>
-3: 
-4: using kKind = Type::kTypeKind; // AST Type
-5: 
-6: long long Checker::manifestConstInt(ConstValue* value) {
-7:     return 0;
-8: }
-9: 
-10: semType* Checker::transformType(Type* type){
-11:     if (type->kind_ == kKind::BUILTIN) {
-12:         return semantic::makeBuiltin(type->name_);
-13:     }
-14:     if (type->kind_ == kKind::STRUCT) {
-15:         return semantic::makeStruct(type->name_);
-16:     }
-17:     if (type->kind_ == kKind::BOX) {
-18:         return semantic::makeBox(transformType(type->elem_));
-19:     }
-20:     if (type->kind_ == kKind::VEC) {
-21:         return semantic::makeVec(transformType(type->elem_));
-22:     }
-23:     if (type->kind_ == kKind::REF) {
-24:         return semantic::makeRef(transformType(type->elem_), type->isMut_);
-25:     }
-26:     if (type->kind_ == kKind::ARRAY) {
-27:         return semantic::makeArray(transformType(type->elem_), manifestConstInt(type->arrayLength_));
-28:     }
-29:     if (type->kind_ == kKind::UNIT) {
-30:         return semantic::makeUnit();
-31:     }
-32:     throw "transformType";
-33:     return nullptr;
-34: }
-35: 
-36: template<typename tp>
-37: bool duplicatedName(std::vector<tp> params) {
-38:     std::map<std::string, bool> mem;
-39:     for (tp now : params) {
-40:         if (mem[now.name_]) {
-41:             return true;
-42:         }
-43:         mem[now.name_] = true;
-44:     }
-45:     return false;
-46: }
-47: 
-48: void Checker::collect(Crate* crate) {
-49:     // 1st time: register
-50:     auto all = crate->items_;
-51:     auto registerFuncAndConst = [&](Item* item, std::map<std::string, funcSignature> &funcSig,
-52:                                     std::map<std::string, constSignature> &constSig, bool insideImpl) {
-53:         if (auto func = dynamic_cast<funcItem*>(item); func) {
-54:             std::string funcName = func->name_;
-55:             if (funcSig.count(funcName) || constSig.count(funcName)) {
-56:                 error("duplicate function name (with function or constant) : " + funcName);
-57:             }
-58:             else if (funcName == "get_i32" || funcName == "print_i32" || funcName == "println_i32") {
-59:                 error("function attempted to use protected name : " + funcName);
-60:             }
-61:             else if (!insideImpl && func->parameter_.size() != 0 && func->parameter_[0].isSelf_) {
-62:                 error("top-level function attempted to use self : " + funcName);
-63:             }
-64:             else if (duplicatedName<Param>(func->parameter_)) {
-65:                 error("duplicate function parameter name : " + funcName);
-66:             }
-67:             else {
-68:                 funcSig[funcName];
-69:             }
-70:         }
-71:         if (auto value = dynamic_cast<constItem*>(item); value) {
-72:             std::string constName = value->name_;
-73:             if (funcSig.count(constName) || constSig.count(constName)) {
-74:                 error("duplicate constant name (with function or constant) : " + constName);
-75:             }
-76:             else if (constName == "get_i32" || constName == "print_i32" || constName == "println_i32") {
-77:                 error("constant attempted to use protected name : " + constName);
-78:             }
-79:             else {
-80:                 constSig[constName];
-81:                 constSig[constName].value_ = value->value_;
-82:             }
-83:         }
-84:     };
-85:     for (Item* item : all) {
-86:         registerFuncAndConst(item, table_.funcSig, table_.constSig, false);
-87:         if (auto stru = dynamic_cast<structItem*>(item); stru) {
-88:             std::string struName = stru->name_;
-89:             if (table_.structSig.count(struName)) {
-90:                 error("duplicate struct name : " + struName);
-91:             }
-92:             else if (struName == "i32" || struName == "u32" || struName == "isize" || struName == "usize") {
-93:                 error("struct attempted to use protected name : " + struName);
-94:             }
-95:             else if (duplicatedName<structField>(stru->fields_)) {
-96:                 error("duplicate struct field name : " + struName);
-97:             }
-98:             else {
-99:                 table_.structSig[struName];
-100:             }
-101:         }
-102:         if (auto impl = dynamic_cast<ImplItem*>(item); impl) {
-103:             std::string implName = impl->type_->name_;
-104:             if (impl->type_->kind_ != kKind::STRUCT) {
-105:                 error("attempted to implement a non-struct type, name = " + implName);
-106:             }
-107:             else {
-108:                 for (Item* inner : impl->items_) {
-109:                     registerFuncAndConst(inner, table_.methods[implName], table_.associatedConsts[implName], true);
-110:                 }
-111:             }
-112:         }
-113:     }
-114:     for (const auto& [name, anything] : table_.methods) {
-115:         if (table_.structSig.count(name) == 0) {
-116:             error("non-existing struct " + name + " have methods");
-117:         }
-118:     }
-119:     for (const auto& [name, anything] : table_.associatedConsts) {
-120:         if (table_.structSig.count(name) == 0) {
-121:             error("non-existing struct " + name + " have constants");
-122:         }
-123:     }
-124:     return;
-125: }
-126: 
-127: void Checker::error(std::string message) {
-128:     std::cerr << "error occurred!\n" << message << std::endl;
-129:     reject_ = true;
-130:     return;
-131: }
-
-(End of file - total 131 lines)
-</content>
-```
-
-**Tool: read**
-
-**Input:**
-```json
-{
-  "filePath": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.h"
-}
-```
-
-**Output:**
-```
-<path>/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.h</path>
-<type>file</type>
-<content>
-1: #pragma once
-2: #include "symbol.h"
-3: #include "type.h"
-4: #include "../ast/ast.h"
-5: 
-6: struct Checker {
-7:     bool checkCrate(Crate* rt);
-8: 
-9:     long long manifestConstInt(ConstValue* value);
-10:     void collect(Crate* crate);
-11:     semType* transformType(Type* t);
-12: 
-13:     void checkItem(Item* item);
-14:     semType* infer(Expr* expr);
-15:     semType* expect(Expr* expr, semType* wish);
-16: 
-17:     void error(std::string message);
-18: 
-19:     globalTable table_;
-20:     scopeStack scope_;
-21:     semType* currentRet_ = nullptr;
-22:     std::string currentStruct_;
-23:     bool reject_ = false;
-24: };
-
-(End of file - total 24 lines)
-</content>
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 24.1s)
-
-_Thinking:_
-
-Review the template `duplicatedName`:
-
-```cpp
-template<typename tp>
-bool duplicatedName(std::vector<tp> params) {
-    std::map<std::string, bool> mem;
-    for (tp now : params) {
-        if (mem[now.name_]) {
-            return true;
-        }
-        mem[now.name_] = true;
-    }
-    return false;
-}
-```
-
-Issues:
-1. **Pass by value**: `std::vector<tp> params` copies the whole vector (and each Param/structField contains strings and pointers). Should be `const std::vector<tp>&`.
-2. **Loop copies each element** (`for (tp now : params)`) — should be `const tp&`.
-3. `std::map<std::string, bool> mem` — could use `std::set<std::string>` or `std::unordered_set`; map<string,bool> works but set is clearer. Minor.
-4. **`mem[now.name_]` with operator[] inserts; correct logic works**: first occurrence inserts false → `if(false)` no return; sets true. Second occurrence → true → return. Actually careful: `mem[now.name_]` on first occurrence default-constructs bool false, condition false, then sets true. Fine. Using `mem.count` would be more idiomatic. Minor.
-5. **Template unnecessary?** It works for both Param and structField since both have `name_`. The template is a reasonable generic helper. But could be a single non-template function taking `const std::vector<std::string>&` or use a generic lambda. Actually the cleanest: extract names? Not necessary. The template is acceptable but overkill; a `std::set` inserted with `.insert(name).second` is simpler:
-
-```cpp
-inline bool duplicatedName(const std::vector<std::string>& names) // no
-```
-
-Since Param and structField are distinct types, template is one way; another is a helper taking iterators. Honestly the template is fine but should take const refs. I'd praise the idea and point the const-ref detail.
-
-6. **Method parameters include `self`**: `func->parameter_` for methods includes self as first Param with name "self". Duplicate param check on methods would treat multiple self? Grammar prevents duplicates. Fine. But top-level function with self: the duplicate check is in an `else if` chain after the self check, so `fn f(self, self)`? Grammar: selfParam only first; `fn f(self, x, x)` would hit duplicate check. Fine.
-
-7. **Order of else-if checks**: 
-```cpp
-if (funcSig.count || constSig.count) -> duplicate
-else if (protected name) -> error
-else if (!insideImpl && self) -> error
-else if (duplicatedName) -> error
-else register
-```
-All error branches skip registration. Consequence: a function named e.g. `print_i32` won't be registered → later references resolve to nothing, maybe more errors, but reject already set. Fine.
-
-However, there is a **subtle issue with protected name checks and the value namespace**: top-level const named `get_i32` errors; local bindings named these are UB. OK.
-
-8. **A more significant issue: `duplicatedName` on struct fields**. Fine. But note: struct with duplicate field name is error; they don't register the struct → `impl S` later would say non-existing struct too (extra error). Fine, reject set anyway.
-
-9. **Protected struct names**: still only i32/u32/isize/usize; bool/Box/Vec/Copy/... are UB. Fine.
-
-10. **The struct protected-name check is "else if" after duplicate check** — if a struct is named i32 and declared twice, two errors; fine.
-
-11. **New: value protected names for methods?** They check `funcName == get_i32...` for impl methods too (inside `registerFuncAndConst`). Is that correct? Spec protected value namespace: top-level function or constant with protected I/O name is CE. What about an associated function named `print_i32` inside an impl? Hmm. The spec says "declaring a top-level function or constant with a protected I/O name" is CE. For associated items, the protected name rule... names.html: "These protected names remain valid lexical identifiers. They may be used in other namespaces or as field and associated-item names". Wait! Re-read: "They may be used in other namespaces or as **field and associated-item names** (for example, a field named `Vec` is valid)." That sentence is about type-namespace protected names (i32, u32, ..., Copy etc.) and derive entries? Let me parse: "The following names are protected in their respective namespaces: Type: i32, u32, ...; Value: get_i32, print_i32, println_i32; Derive entry: Copy.... These protected names remain valid lexical identifiers. They may be used in other namespaces or as field and associated-item names (for example, a field named Vec is valid)."
-
-So type-namespace protected names can be used as field/associated-item names. But what about value-namespace protected names as associated-item names? "They may be used in other namespaces" — the value protected names used in other namespaces (e.g., as a struct name?) Hmm, "other namespaces" — get_i32 is protected in **value** namespace; using it in type namespace? A struct named get_i32 might be allowed? And local bindings named get_i32 are UB (per test guarantee). Associated items... are they in the "value namespace"? An associated function `S::get_i32` is not "top-level"; the protected rule says "declaring a top-level function or constant". So an associated function named `get_i32` inside impl is probably **allowed**! The current code rejects it (insideImpl=true still checks protected names). That could be a false positive — is there a positive test with an assoc item named print_i32? The protected-names acc test: `acc-builtin-type-names-may-be-fields-associated-items-and-ordinary-values.rx`:
-
-```rust
-struct S {
-    Vec: i32,
-}
-impl S {
-    const Box: i32 = 2;
-}
-fn main() {
-    let Vec = S { Vec: S::Box };
-}
-```
-
-This has assoc const named `Box` (type-namespace protected name used as associated-item name). It does NOT test `print_i32` as associated item. But per spec, the value-namespace protected names are only protected against top-level fn/const declarations; associated items live in the struct's associated namespace, not the top-level value namespace. Hmm, but is an associated item in the "value namespace"? The names.html namespace table says "Function, constant, local binding, or self in an expression" → Value. Associated items belong to the struct's associated-value namespace (per names.html: "All inherent implementations of a struct share a single associated-value namespace"). So they're a different namespace from top-level value namespace.
-
-The protected-name statement: "Value: get_i32, print_i32, println_i32" and "Other redeclarations of protected builtins within their respective namespaces are compile-time errors, including defining a struct named i32 or declaring a top-level function or constant with a protected I/O name." It explicitly says **top-level** for I/O names. So an impl method named get_i32 should be legal? Hmm, but would that be sensible? "They may be used in other namespaces or as field and associated-item names". Actually that sentence is about "These protected names" generally (including value ones?): they may be used as field and associated-item names. So yes, associated item named `print_i32` is allowed. Wait, but "associated-item names" — the example only mentions field named Vec. Let me re-read carefully:
-
-"These protected names remain valid lexical identifiers. They may be used in other namespaces or as field and associated-item names (for example, a field named `Vec` is valid). Because inherent implementations can only be declared for user-defined structs, inherent methods cannot be added to protected builtin types."
-
-I think this means: protected names are protected only in their own namespace. E.g., `i32` (type namespace) can be a field name or associated item name. `get_i32` (value namespace) can be... a struct name (type namespace), a field name, an associated item name? The associated-value namespace is a distinct namespace from top-level value namespace. Given the explicit "top-level function or constant" in the CE rule, I'd say associated items named `get_i32` are allowed, though it's likely tests don't cover it. The user's code rejects them — is that a risk? If a positive test had `impl S { fn print_i32(&self) {} }`, they'd wrongly reject. Is there such a test? Let me grep the tests for impl items with protected names. The acc test has `const Box` only. Let me grep all semantic tests for "fn print_i32", "fn get_i32", etc.
-
-Also they check const names `get_i32` etc. for associated consts too (inside registerFuncAndConst with insideImpl — the const branch doesn't check insideImpl at all: `else if (constName == ...)` always. So assoc const named print_i32 rejected). Again maybe too strict.
-
-Let me grep tests to see if any positive test uses protected I/O names as associated items. If none, it's harmless for the official suite but still semantically questionable; code review may care. Let me check.
-
-Also one more thing: `duplicatedName` is defined as a free template function in checker.cpp at global scope. Params: `std::vector<tp>` by value — mention `const&`.
-
-Also: `func->parameter_[0].isSelf_` — for methods inside impl with `self`, okay; but what about self at position 0 only? Grammar ensures. OK.
-
-Also possible issue: for top-level function, if the first param is self, we error but continue to `else if` chain? It's an else-if, so no duplicate check. Fine.
-
-Potential issue: protected name check for functions happens before self check; if `fn print_i32(self)`, only one error. Fine.
-
-Let me grep for protected names in impl in tests, then answer.
-
-Also, is there a positive test with `let Vec = ...` (local named Vec)? The acc test has `let Vec = S { Vec: S::Box };` — local named `Vec` is a type-namespace protected name used as value; allowed. Not relevant.
-
-Let me search tests for functions/consts named get_i32/print_i32/println_i32 inside impl.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic\"; grep -rn \"fn get_i32\\|fn print_i32\\|fn println_i32\\|const get_i32\\|const print_i32\\|const println_i32\" . | head -20; echo ---; grep -rln \"impl\" . | xargs grep -ln \"print_i32\\|get_i32\\|println_i32\" 2>/dev/null | head"
-}
-```
-
-**Output:**
-```
----
-./builtin-io/manifest.json
-./comprehensive-owned-tree/acc-clone-mutate-remove-tree.rx
-./comprehensive-stack-machine/acc-integer-stack-machine.rx
-./constants-and-paths/acc-array-lengths-compare-by-value-associated-constants-do-not-reserve-unqualified-locals.rx
-./evaluation-order-and-temporaries/acc-ordinary-assignment-is-right-first-compound-operand-relative-order-is-not-tested.rx
-./lifetimes-and-use/acc-lifetimes-and-unused-valid-import-aliases-do-not-affect-rx-resolution.rx
-./methods-and-self/acc-receiver-auto-borrows-and-repeated-box-reference-dereferences.rx
-./trait-dispatch-and-reference-equality/acc-generated-clones-bypass-dot-lookup-same-type-mutable-reference-equality-borrows-operands.rx
-./vec-index-mutability/acc-immutable-binding-of-mutable-vector-reference.rx
-./vec-index-mutability/acc-shared-coercions-and-receivers-on-immutable-vector.rx
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 25.2s)
-
-_Thinking:_
-
-No tests define an associated item with a protected I/O name. So rejecting assoc items named get_i32/print_i32/println_i32 won't break the official suite. But per spec, the CE rule says "top-level function or constant" — associated items are arguably not covered; the protected-names sentence "They may be used ... as field and associated-item names" suggests assoc items are fine. So the user's check is stricter than the spec. It's harmless for tests, but for Code Review correctness, might mention: protected I/O names should only be checked at top level (insideImpl == false), because assoc items live in a different namespace and spec only calls out "top-level function or constant". Since test guarantee says UB for local bindings with those names, but nothing about assoc items. I'd suggest guarding with `!insideImpl` for the I/O name check, mirroring the spec wording. It's low-stakes; mention it as a precision issue.
-
-Now review the template:
-
-```cpp
-template<typename tp>
-bool duplicatedName(std::vector<tp> params) {
-    std::map<std::string, bool> mem;
-    for (tp now : params) {
-        if (mem[now.name_]) return true;
-        mem[now.name_] = true;
-    }
-    return false;
-}
-```
-
-Points:
-1. Good idea: shared between Param and structField. Works because both have `name_`.
-2. **Pass by value + loop by value**: copies vector and each element (strings/pointers). Use `const std::vector<tp>&` and `const tp&`. Not a correctness bug but code review will notice. Also `std::map<std::string,bool>` → `std::set<std::string>` (or `unordered_set`), and use `insert().second`:
-```cpp
-template <typename T>
-bool duplicatedName(const std::vector<T>& items) {
-    std::set<std::string> seen;
-    for (const T& x : items)
-        if (!seen.insert(x.name_).second) return true;
-    return false;
-}
-```
-3. Naming: functions usually start with lowercase (their style: `manifestConstInt`, `transformType`, so `duplicatedName` is consistent-ish; fine). Could name `hasDuplicateName`.
-4. Template could be avoided with a small helper extracting names, but template is fine.
-5. Note: `duplicatedName<Param>(func->parameter_)` explicit template arg is unnecessary (deducible), but harmless.
-6. One subtle: methods' parameter_ includes self; if a method had `self` twice (impossible by grammar) fine. Top-level `fn f(self)` errors before duplicate check anyway.
-7. Placement in global namespace in checker.cpp — fine (internal), could be `static`/anonymous namespace to avoid potential ODR/link issues if another TU defines same template. Templates are fine across TUs (implicit instantiation), no ODR issue unless different definitions. OK.
-
-Other review points for the new checks:
-
-A. **Protected names in impl**: as discussed, spec says top-level; user checks regardless of `insideImpl`. Suggest `!insideImpl` guard for I/O names. Actually wait — let me reconsider. Protected value namespace = `get_i32`, `print_i32`, `println_i32`. Does "value namespace" include associated values? The spec namespaces table: "Function, constant, local binding, or self in an expression → Value". Associated items are looked up via `Type::member` where prefix is Type namespace... The associated namespace is per-struct. names.html: "All inherent implementations of a struct share a single associated-value namespace". So it's a separate namespace ("associated-value"), not the global value namespace. The CE rule: "Other redeclarations of protected builtins within their respective namespaces are compile-time errors, including defining a struct named i32 or declaring a top-level function or constant with a protected I/O name." — explicitly top-level. And "They may be used in other namespaces or as field and associated-item names". So yes: assoc fn/const named get_i32/print_i32/println_i32 is allowed. The user's code falsely rejects. Since tests don't cover, it's not urgent, but recommend the guard.
-
-Hmm wait, but actually let me double-check "associated-item names" phrase again: "These protected names remain valid lexical identifiers. They may be used in other namespaces or as field and associated-item names (for example, a field named `Vec` is valid)." This says protected names may be used as associated-item names. So yes, assoc items with protected names are valid (in different namespaces). Hmm, but is an associated item a "different namespace" from the value namespace? The sentence grants fields and associated items explicitly, so yes.
-
-B. **Struct field dup check placement**: they check after protected check; fine. But note: fields are checked in pass 1; good.
-
-C. **Function param dup check**: catches top-level and impl. Note: method parameter list includes self ("self") — if someone writes `fn f(self, self: i32)`? Grammar: functionParameters: selfParam (COMMA functionParam)*; functionParam is identifierBinding COLON type, and `self` is a keyword, not IDENTIFIER, so can't. Fine.
-
-D. **New issue: duplicate detection for functions/consts that fail an earlier check** — e.g., two functions named `print_i32`: first → protected error (not registered), second → also protected error (not duplicate). Two errors, still reject. Fine.
-
-E. **Order-of-checks subtlety**: `if (funcSig.count || constSig.count)` duplicate first; a function named `get_i32` will not be registered, so a later `const get_i32` also errors as protected (not duplicate). Fine.
-
-F. **The `else if (!insideImpl && ...isSelf_)` check**: good. But `insideImpl` for **associated functions** (no self) is fine. One nuance: an impl function with receiver is a method; without is associated function. Both allowed.
-
-G. Should `duplicatedName` be a template or a static helper? Fine.
-
-H. Also note `duplicatedName<Param>` with explicit template argument — style.
-
-I. Also check `std::map`/`std::string` includes: checker.cpp includes checker.h → symbol.h includes <map>, type.h includes <string>. Fine. Template uses std::vector — included via symbol.h.
-
-J. Also mention: `struct i32` protected check now rejects u32/isize/usize — harmless as discussed.
-
-K. Also maybe: struct protected names should also include `bool`/`Box`/`Vec`/`Copy`/`Clone`/`PartialEq`/`Eq`? They're UB, so no. Skip.
-
-Now let me also double check: does `duplicatedName` work for `structField`? structField has `name_`; yes. Param has name_; yes.
-
-Let me answer: template idea good; fix const refs and set; use insert().second. Mention protected-I/O check should be top-level-only per spec (current code rejects assoc items named print_i32 — official tests don't cover, but spec-wise wrong; guard with `!insideImpl`). Everything else looks right. Also build check? Probably still builds. The user didn't ask to build; could quickly build to be safe. Let me not over-do; the code likely compiles. Actually let me run a quick build to catch any warning/issue with the template (e.g., `duplicatedName<Param>` deduction fine). Quick incremental build is cheap.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cmake --build target/build -j 2>&1 | tail -5",
-  "timeout": 180000,
-  "workdir": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler"
-}
-```
-
-**Output:**
-```
-[  9%] Building CXX object CMakeFiles/rxcc.dir/src/semantic/checker.cpp.o
-[ 18%] Linking CXX executable rxcc
-[100%] Built target rxcc
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 17.4s)
-
-_Thinking:_
-
-Build passes. Now compose the review.
-
-Main points:
-1. Template idea is good — one helper for Param/structField. Build passes.
-2. Improvements:
-   - `std::vector<tp> params` by value + `for (tp now : params)` copies → const refs.
-   - `std::map<std::string,bool>` → `std::set<std::string>`, or `insert(...).second`.
-   - explicit `duplicatedName<Param>` unnecessary but fine.
-3. Semantic precision: protected I/O names only apply to **top-level** fn/const; assoc items are in the associated-value namespace and per spec may use protected names (like `impl S { const Box ... }`). Current code rejects assoc fn/const named get_i32 because it checks inside `registerFuncAndConst` regardless of insideImpl. Suggest `!insideImpl && (name == ...)`. Official tests don't cover it (no pos/neg test uses protected I/O name as assoc item), so not urgent; but Code Review correctness.
-4. Also note: the value-protected check placement before self/dup is fine.
-5. Everything else reviewed earlier is fine.
-
-Wait, actually let me think about whether `get_i32` as an associated function name could appear in a positive test. I grepped and found none. But there's `acc-builtin-type-names-may-be-fields-associated-items-and-ordinary-values.rx` which uses `const Box` as assoc const. `Box` is a *type-namespace* protected name, and that test proves protected type names can be associated items. For value-namespace protected names (get_i32...), the analogous test isn't present. The spec sentence "They may be used in other namespaces or as field and associated-item names" supports allowing. So recommend guard.
-
-Also, one more subtle issue: the value protected names check applies to *methods* named `print_i32`... yes same point.
-
-Additional thought: The duplicate-parameter check for **methods** includes `self` in parameter_. If a method is `fn f(&self, x: i32, x: i32)` → duplicate x detected. Good.
-
-One more: In `duplicatedName`, `mem[now.name_]` — on first insert returns false, sets true. Fine, but if a name is empty? Param names can't be empty. structField names can't be empty. Fine.
-
-Let me write concise review. Mention build passes. Then the two improvements. Then the semantic precision point. Use code snippet for the improved helper.
-
-build 通过了，模板思路挺好——`Param` 和 `structField` 都有 `name_`，一个 helper 覆盖两处，避免复制粘贴。两个可改进点：
-
-**1. 模板本身的签名（Code Review 会挑）**
-
-```cpp
-template<typename tp>
-bool duplicatedName(std::vector<tp> params) {     // 按值拷贝整个 vector
-    std::map<std::string, bool> mem;
-    for (tp now : params) {                        // 每个元素又拷一份
-```
-
-改成 const 引用 + `set`：
-
-```cpp
-template <typename T>
-bool duplicatedName(const std::vector<T>& items) {
-    std::set<std::string> seen;
-    for (const T& x : items)
-        if (!seen.insert(x.name_).second) return true;   // false = 已存在
-    return false;
-}
-```
-
-`insert().second` 一步完成"查重+登记"，比 `mem[name]` 先读后写更直白。调用处 `duplicatedName<Param>(...)` 的显式实参可以省掉（能推导）。helper 建议放匿名 namespace（纯内部工具）。
-
-**2. 一个语义精度问题：受保护 **值** 名只限制顶层**
-
-spec 原文是 "declaring a **top-level** function or constant with a protected I/O name" 是 CE；同时说保护名 "may be used in other namespaces or as field and associated-item names"。也就是说 `impl S { fn print_i32(&self) {} }` 这种**关联项**用保护 I/O 名应该是合法的（关联项在 struct 自己的 associated-value 命名空间，不是顶层值空间）——你的 `acc-builtin-type-names-...` 里 `const Box` 就是这个道理，只不过那个用的是类型空间保护名。
-
-你现在 `registerFuncAndConst` 不管 `insideImpl` 都检查 I/O 保护名，会把这种关联项误拒。加上条件即可：
-
-```cpp
-else if (!insideImpl && (funcName == "get_i32" || ...)) error(...);
-```
-
-官方 semantic 测试里没有用保护 I/O 名当关联项的正例，所以这个不阻塞过测，但按规范应该这么写。顺带：结构体保护名同理，"`struct i32` 是 CE、其余是 UB"你已经覆盖了。
-
-其他检查（顶层 self、参数重名、字段重名、关联项交叉查重、未知 struct 扫描）都没问题。
-
----
-
-## User
-
-======================================================= failures =======================================================
-
-1) official:semantic:namespace-errors/rej-unresolved-value-name.rx@semantic
-   semantic / 0.06s
-   Unresolved value name.
-
-    compiler exited 0, expected 1
-
-   logs: target/tests/run-bpbjy9kg/0002
-
-2) official:semantic:namespace-errors/rej-unresolved-signature-type.rx@semantic
-   semantic / 0.06s
-   Unresolved signature type.
-
-    compiler exited 0, expected 1
-
-   logs: target/tests/run-bpbjy9kg/0003
-
-3) official:semantic:namespace-errors/rej-a-block-local-name-cannot-escape.rx@semantic
-   semantic / 0.09s
-   A block-local name cannot escape.
-
-    compiler exited 0, expected 1
-
-   logs: target/tests/run-bpbjy9kg/0010
-
-4) official:semantic:namespace-errors/rej-a-binding-is-invisible-in-its-own-initializer.rx@semantic
-   semantic / 0.06s
-   A binding is invisible in its own initializer.
-
-    compiler exited 0, expected 1
-
-   logs: target/tests/run-bpbjy9kg/0011
-
-5) official:semantic:namespace-errors/rej-a-local-shadows-a-function-without-callable-fallback.rx@semantic
-   semantic / 0.09s
-   A local shadows a function without callable fallback.
-
-    compiler exited 0, expected 1
-
-   logs: target/tests/run-bpbjy9kg/0012
-
-6) official:semantic:namespace-errors/rej-self-outside-a-struct-impl.rx@semantic
-   semantic / 0.06s
-   Self outside a struct/impl.
-
-    compiler exited 0, expected 1
-
-   logs: target/tests/run-bpbjy9kg/0013
-
-7) official:semantic:namespace-errors/rej-self-outside-a-method.rx@semantic
-   semantic / 0.10s
-   self outside a method.
-
-    compiler exited 0, expected 1
-
-   logs: target/tests/run-bpbjy9kg/0014
-
-8) official:semantic:namespace-errors/rej-named-field-structs-are-not-callable-constructors.rx@semantic
-   semantic / 0.10s
-   Named-field structs are not callable constructors.
-
-    compiler exited 0, expected 1
-
-   logs: target/tests/run-bpbjy9kg/0016
-
-============================================= 8 failed, 8 passed in 23.79s ============================================= 结果如上。 
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 17.5s)
-
-_Thinking:_
-
-The user ran the namespace-errors suite after adding checks. 8 failed, 8 passed. The failures are all "compiler exited 0, expected 1" — these are check-phase errors (unresolved value names, block-local escaping, binding invisible in its own initializer, local shadows function, Self outside impl, self outside method, named-field structs not callable). Also `rej-unresolved-signature-type.rx` — that's a collect pass 3 issue (signature type missing). Wait, `rej-unresolved-signature-type` should be caught in collect step 3, and `rej-self-outside-a-struct-impl`/`rej-self-outside-a-method` also collect/check phase.
-
-Let me look at what the current state is. Earlier, before running tests, main.cpp wasn't wired to Checker at all. The user apparently wired it (since now the compiler exits 0 on all tests and 8 pass). Which 8 passed? Presumably the collect-phase checks (duplicates, protected names, impls, etc.). Let me see the suite: namespace-errors has 16 tests (8 failed listed, 8 passed). Let me list the files and manifests.
-
-The user's message is just the test output — they want me to explain/continue. The 8 remaining failures are expected because check phase (pass 2) isn't implemented yet. But some are collect responsibilities:
-
-1. `rej-unresolved-value-name.rx` — check phase: `let x = missing;`
-2. `rej-unresolved-signature-type.rx` — collect pass 3! `fn f(x: Missing)` — transformType STRUCT branch must check table_.structSig. Currently transformType doesn't check; but is transformType even called? collect only does pass 1. Pass 3 not written. So expected failure.
-3. `rej-a-block-local-name-cannot-escape.rx` — check phase (scope).
-4. `rej-a-binding-is-invisible-in-its-own-initializer.rx` — check phase.
-5. `rej-a-local-shadows-a-function-without-callable-fallback.rx` — check phase.
-6. `rej-self-outside-a-struct-impl.rx` — likely `struct S { x: Self }` no... let me read the test. "Self outside a struct/impl." Could be a top-level function with type Self, or a struct field Self? Actually Self IS allowed in struct declaration (`struct Node { children: Vec<Self> }`). "Self outside a struct/impl" — maybe `fn f(x: Self)` at top level. That's transformType check (currentStruct_ empty) — collect pass 3.
-7. `rej-self-outside-a-method.rx` — `self` used in a top-level function body or assoc fn without receiver — check phase (path expr "self"). Or `fn f(self)` without impl is already caught. Let me look.
-8. `rej-named-field-structs-are-not-callable-constructors.rx` — check phase: `S(3)` call where S is struct.
-
-Let me read these test files to determine exactly which phase catches them. Also check which 8 passed (to confirm the current collect checks pass). Let me read the manifest and the 8 failure files.
-
-Also verify main.cpp now calls Checker. Let me read main.cpp and check the git diff.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/namespace-errors\"; for f in rej-unresolved-value-name.rx rej-unresolved-signature-type.rx rej-a-block-local-name-cannot-escape.rx rej-a-binding-is-invisible-in-its-own-initializer.rx rej-a-local-shadows-a-function-without-callable-fallback.rx rej-self-outside-a-struct-impl.rx rej-self-outside-a-method.rx rej-named-field-structs-are-not-callable-constructors.rx; do echo \"=== $f\"; cat \"$f\"; done"
-}
-```
-
-**Output:**
-```
-=== rej-unresolved-value-name.rx
-use rx::core::*;
-
-fn main() {
-    let x = absent;
-}
-=== rej-unresolved-signature-type.rx
-use rx::core::*;
-
-fn f(x: Missing) {}
-fn main() {}
-=== rej-a-block-local-name-cannot-escape.rx
-use rx::core::*;
-
-fn main() {
-    {
-        let x = 1;
-    }
-    println_i32(x);
-}
-=== rej-a-binding-is-invisible-in-its-own-initializer.rx
-use rx::core::*;
-
-fn main() {
-    let x = x;
-}
-=== rej-a-local-shadows-a-function-without-callable-fallback.rx
-use rx::core::*;
-
-fn f() {}
-fn main() {
-    let f = 1;
-    f();
-}
-=== rej-self-outside-a-struct-impl.rx
-use rx::core::*;
-
-fn f(x: Self) {}
-fn main() {}
-=== rej-self-outside-a-method.rx
-use rx::core::*;
-
-fn main() {
-    println_i32(self);
-}
-=== rej-named-field-structs-are-not-callable-constructors.rx
-use rx::core::*;
-
-struct S {
-    x: i32,
-}
-fn main() {
-    let x = S(1);
-}
-
-```
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "sed -n '80,120p' /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/main.cpp; echo ===; grep -n \"checkCrate\" /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp"
-}
-```
-
-**Output:**
-```
-        }
-        ASTVisitor visitor;
-        auto* crate = std::any_cast<Crate*>(visitor.visit(root));
-        if (dumpAst) {
-            dumpCrate(crate);
-        }
-
-        Checker checker;
-        checker.checkCrate(crate);
-        if (checker.reject_) {
-            throw 0;
-        }
-
-        // TODO：下一步在这里做语义检查（名称解析 + 类型检查），先直接接受
-        return 0;
-    } catch (const std::exception& e) {
-        std::cerr << "internal error: " << e.what() << "\n";
-        return 1;
-    } catch (...) {
-        std::cerr << "internal error\n";
-        return 1;
-    }
-}
-===
-133:void Checker::checkCrate(Crate* crate) {
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 15.1s)
-
-_Thinking:_
-
-Let me read the rest of main.cpp (the try/catch) and the new checkCrate in checker.cpp. Note: main.cpp now does:
-```cpp
-Checker checker;
-checker.checkCrate(crate);
-if (checker.reject_) {
-    throw 0;
-}
-...
-} catch (const std::exception& e) {...}
-catch (...) { std::cerr << "internal error\n"; return 1; }
-```
-
-`throw 0;` → caught by `catch (...)` → returns 1. That works but prints "internal error" to stderr — ugly but functional. Hmm, but wait: `throw 0` is an int; `catch (const std::exception&)` doesn't catch; `catch (...)` catches and returns 1 with "internal error" message. For tests, exit code 1 is what matters. But this is a hack; better structure: `if (!checker.checkCrate(crate)) return 1;`. Also they call `checker.checkCrate(crate)` and ignore its return (checkCrate is bool). Let me read checkCrate.
-
-Also `checker.reject_` is public. Let me read the file bottom.
+The user says they wrote something (likely infer + lookupValue + checkBlock/checkStatement). Let me read the current checker.cpp relevant portions to review. Let me look at the whole new section (from lookupValue onwards) and checker.h.
 
 **Tool: read**
 
@@ -2433,7 +365,7 @@ Also `checker.reject_` is public. Let me read the file bottom.
 ```json
 {
   "filePath": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp",
-  "offset": 125
+  "offset": 500
 }
 ```
 
@@ -2442,155 +374,137 @@ Also `checker.reject_` is public. Let me read the file bottom.
 <path>/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp</path>
 <type>file</type>
 <content>
-125: }
-126: 
-127: void Checker::error(std::string message) {
-128:     std::cerr << "error occurred!\n" << message << std::endl;
-129:     reject_ = true;
-130:     return;
-131: }
-132: 
-133: void Checker::checkCrate(Crate* crate) {
-134:     collect(crate);
-135:     return;
-136: }
+500:                     for (size_t i = start; i < func->parameter_.size(); ++i) {
+501:                         sig.params_.push_back(transformType(func->parameter_[i].type_));
+502:                     }
+503:                 }
+504:             }
+505:             currentStruct_ = mem;
+506:         }
+507:     }
+508: }
+509: 
+510: semType* Checker::lookupValue(std::string name) { // I think the spec said that using function as a value is an UB?
+511:     if (scope_.memory_.find(name) != scope_.memory_.end() && !scope_.memory_[name].empty()) {
+512:         return scope_.memory_[name].top().type_;
+513:     }
+514:     auto sig = findConst("", name);
+515:     if (sig == nullptr) {
+516:         error("can't resolve name in lookupValue : " + name);
+517:         return semantic::makeError();
+518:     }
+519:     return sig->type_;
+520: }
+521: 
+522: semType* Checker::infer(Expr* expr) {
+523:     if (auto lit = dynamic_cast<intLitExpr*>(expr); lit) {
+524:         std::string suf = intSuffix(lit->value_);
+525:         return suf.empty() ? semantic::makeBuiltin("i32") : semantic::makeBuiltin(suf);
+526:     }
+527:     if (auto lit = dynamic_cast<boolLitExpr*>(expr); lit) {
+528:         return semantic::makeBuiltin("bool");
+529:     }
+530:     if (auto unit = dynamic_cast<unitExpr*>(expr); unit) {
+531:         return semantic::makeUnit();
+532:     }
+533:     if (auto block = dynamic_cast<blockExpr*>(expr); block) {
+534:         return checkBlock(block, nullptr);
+535:     }
+536:     if (auto path = dynamic_cast<pathExpr*>(expr); path) {
+537:         if (path->path_.size() == 1) {
+538:             std::string name = path->path_[0].name_;
+539:             return lookupValue(name);
+540:         }
+541:         else if (path->path_.size() == 2) {
+542:             std::string callee = path->path_[0].name_, name = path->path_[1].name_;
+543:             if (callee == "Self") {
+544:                 auto sig = findConst(currentStruct_, name);
+545:                 if (sig == nullptr) {
+546:                     error("can't resolve name in lookupValue : " + name);
+547:                     return semantic::makeError();
+548:                 }
+549:                 return sig->type_;
+550:             }
+551:             else {
+552:                 auto sig = findConst(callee, name);
+553:                 if (sig == nullptr) {
+554:                     error("can't resolve name in lookupValue : " + name);
+555:                     return semantic::makeError();
+556:                 }
+557:                 return sig->type_;
+558:             }
+559:         }
+560:         else {
+561:             error("length of a pathExpr appears to be longer than 2:");
+562:             return semantic::makeError();
+563:         }
+564:     }
+565:     return semantic::makeError();
+566: }
+567: 
+568: void Checker::checkItem(Item* item){
+569:     if (auto func= dynamic_cast<funcItem*>(item); func) {
+570:         checkFunction(func, "");
+571:     }
+572:     else if (auto impl = dynamic_cast<ImplItem*>(item); impl) {
+573:         if (impl->type_->kind_ != Type::kTypeKind::STRUCT) {
+574:             return;
+575:         }
+576:         for (Item* down : impl->items_) {
+577:             if (auto func = dynamic_cast<funcItem*>(down); func){
+578:                 checkFunction(func, impl->type_->name_);
+579:             }
+580:         }
+581:     }
+582: }
+583: 
+584: void Checker::checkFunction(funcItem* func, const std::string& owner) {
+585:     std::string mem = currentStruct_;
+586:     currentStruct_ = owner;
+587:     funcSignature* sig = owner.empty() ? &table_.funcSig[func->name_] : &table_.methods[owner][func->name_];
+588:     currentRet_ = sig->retType_; // Finally use this currentRet_ ! I can't remember the times where I type current and enter and I get currentRet instead of currentStruct_ .
+589:     scope_.levelUp();
+590:     for (auto para : func->parameter_) {
+591:         scope_.push(para.name_, localShadowing(transformType(para.type_), para.isMut_));
+592:     }
+593:     checkBlock(static_cast<blockExpr*>(func->body_), currentRet_);
+594:     scope_.levelDown();
+595:     currentStruct_ = mem; // +1, what can I say
+596:     return;
+597: }
+598: 
+599: semType* Checker::checkBlock(blockExpr* block, semType* expected) {
+600: 
+601: }
+602: 
+603: void Checker::checkStatement(Stmt* stmt) {
+604: 
+605: }
+606: 
+607: void Checker::error(std::string message) {
+608:     std::cerr << "error occurred!\n" << message << std::endl;
+609:     reject_ = true;
+610:     return;
+611: }
+612: 
+613: void Checker::checkCrate(Crate* crate) {
+614:     collect(crate);
+615:     if (reject_) {
+616:         return;
+617:     }
+618:     evaluateConstants(crate);
+619:     if (reject_) {
+620:         return;  
+621:     }
+622:     evaluateTypes(crate); // stage 0 ended: register all functions, structs, constvalues, implements ; evaluated constvalues ; evaluated all types mentioned in former items
+623: 
+624: 
+625:     return;
+626: }
 
-(End of file - total 136 lines)
+(End of file - total 626 lines)
 </content>
 ```
-
-**Tool: read**
-
-**Input:**
-```json
-{
-  "filePath": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/main.cpp",
-  "offset": 55,
-  "limit": 60
-}
-```
-
-**Output:**
-```
-<path>/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/main.cpp</path>
-<type>file</type>
-<content>
-55:     }
-56:     std::stringstream buffer;
-57:     buffer << in.rdbuf();
-58: 
-59:     try {
-60:         ErrorListener listener;
-61: 
-62:         ANTLRInputStream input(buffer.str());
-63:         RxLexer lexer(&input);
-64:         lexer.removeErrorListeners();          // 关掉默认"报错后继续"的行为
-65:         lexer.addErrorListener(&listener);
-66: 
-67:         CommonTokenStream tokens(&lexer);
-68:         tokens.fill();
-69: 
-70:         RxParser parser(&tokens);
-71:         parser.removeErrorListeners();
-72:         parser.addErrorListener(&listener);
-73: 
-74:         tree::ParseTree* root = parser.crate();   // crate = 整个文件
-75:         if (listener.hasError) {
-76:             return 1;                              // 语法错误 → 拒绝
-77:         }
-78:         if (dumpTree) {
-79:             std::cout << root->toStringTree(&parser) << "\n";
-80:         }
-81:         ASTVisitor visitor;
-82:         auto* crate = std::any_cast<Crate*>(visitor.visit(root));
-83:         if (dumpAst) {
-84:             dumpCrate(crate);
-85:         }
-86: 
-87:         Checker checker;
-88:         checker.checkCrate(crate);
-89:         if (checker.reject_) {
-90:             throw 0;
-91:         }
-92: 
-93:         // TODO：下一步在这里做语义检查（名称解析 + 类型检查），先直接接受
-94:         return 0;
-95:     } catch (const std::exception& e) {
-96:         std::cerr << "internal error: " << e.what() << "\n";
-97:         return 1;
-98:     } catch (...) {
-99:         std::cerr << "internal error\n";
-100:         return 1;
-101:     }
-102: }
-
-(End of file - total 102 lines)
-</content>
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 24.2s)
-
-_Thinking:_
-
-Now I understand the state. `checkCrate` calls `collect` only. Passes 1 of collect is done. The 8 failures are all cases that require check phase or collect pass 3:
-
-1. `rej-unresolved-value-name.rx` — `let x = absent;` → check phase (path resolution vs locals/consts/functions).
-2. `rej-unresolved-signature-type.rx` — `fn f(x: Missing) {}` → collect pass 3 (transformType STRUCT existence) — belongs to collect's third step!
-3. `rej-a-block-local-name-cannot-escape.rx` — check phase scope popping.
-4. `rej-a-binding-is-invisible-in-its-own-initializer.rx` — check phase (`let x = x;` initializer evaluated before binding visible).
-5. `rej-a-local-shadows-a-function-without-callable-fallback.rx` — check phase (local shadows fn, no fallback).
-6. `rej-self-outside-a-struct-impl.rx` — `fn f(x: Self)` at top level → transformType Self handling (collect pass 3 / check signatures).
-7. `rej-self-outside-a-method.rx` — `println_i32(self)` → check phase (self path lookup outside method).
-8. `rej-named-field-structs-are-not-callable-constructors.rx` — `S(1)` → check phase call resolution (struct not callable).
-
-So the test result is exactly as expected: all 8 failures are "not yet implemented" check-phase (or pass 3) features. The 8 passed are the collect phase-1 checks (duplicates, protected, impl target, params, fields, etc.). Let me verify which passed: namespace-errors manifest has 16 entries; the 8 failed are listed. The other 8: acc-named-field-struct-and-function-may-share-a-spelling, rej-duplicate-top-level-function, rej-duplicate-constant, rej-function-and-constant-share-the-value-namespace, rej-duplicate-struct, rej-duplicate-field, rej-duplicate-parameter, rej-a-top-level-function-cannot-have-a-receiver. Yes, those are exactly the pass-1 checks. 
-
-So the user should:
-- Add collect pass 2 (eval consts) and pass 3 (transform types) — this will catch #2 (`rej-unresolved-signature-type`) and #6 (`Self` outside impl) if transformType checks both. Note: `fn f(x: Missing) {}` — pass 3 resolves function parameter types, so transformType STRUCT branch must check existence. `fn f(x: Self)` — transformType STRUCT name "Self" with currentStruct_ empty → error.
-- Then check phase for #1, #3, #4, #5, #7, #8.
-
-But wait — the user's current focus: they ran namespace-errors, 8/16 pass. The natural next step is the rest of collect (steps 2 and 3), which will fix 2 of the 8 failures and is required anyway before Phase 2.
-
-Also, there are some code-review points visible now:
-- `main.cpp`: `checker.checkCrate(crate); if (checker.reject_) throw 0;` — ugly. `checkCrate` returns void! The header declares `bool checkCrate(Crate* rt)` but checker.cpp defines `void Checker::checkCrate(Crate* crate)`. Wait! Header says `bool checkCrate(Crate* rt);` and checker.cpp line 133: `void Checker::checkCrate(Crate* crate)`. That's a conflicting declaration — the code compiled? Let me check: the build passed earlier... The definition `void Checker::checkCrate(Crate*)` vs declaration `bool checkCrate(Crate*)` — these are different function types; a member function definition must match declaration exactly. It should be a compile error: "error: conflicting return type specified for 'virtual void Checker::checkCrate(Crate*)'"? Actually it's not virtual. Let me think: In C++, `bool Checker::checkCrate(Crate* rt)` declared in class; definition must have the same return type. `void Checker::checkCrate(...)` would be an error: "error: no declaration matches 'void Checker::checkCrate(Crate*)'". Wait, but earlier build passed at 18%? The build I ran was before this latest edit? The user then edited files again (checked). The current build might fail! Let me rebuild to check.
-
-Actually wait, maybe I misread the header. Let me re-read checker.h from the last read: line 7: `bool checkCrate(Crate* rt);`. And checker.cpp line 133: `void Checker::checkCrate(Crate* crate) {`. This mismatch should be a compile error. But the user says tests ran (8 failed, 8 passed) — so it compiled. Unless... `bool` and `void`? Hmm, GCC would definitely error: "error: conflicting return type specified for 'void Checker::checkCrate(Crate*)'"? Let me check by rebuilding. Maybe the user's latest edit introduced the mismatch after their test run? The test output they pasted shows tests ran; maybe they had `bool` then. The current file may be newer. Let me build now to see.
-
-Also `main.cpp` calling `checker.checkCrate(crate)` ignoring the bool return and using `throw 0` — the catch(...) prints "internal error" for negative tests. That's noisy but exit code is right. However, `throw 0` inside try, caught by catch(...) → return 1 + "internal error" printed. It works but is hacky. Better: `if (!checker.checkCrate(crate)) return 1;` and define checkCrate returning `!reject_`. But syntax errors return 1 without extra print; the "internal error" print for semantic errors is misleading. Suggest cleanup.
-
-Let me rebuild to verify the mismatch.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cmake --build target/build -j 2>&1 | tail -15",
-  "timeout": 180000,
-  "workdir": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler"
-}
-```
-
-**Output:**
-```
-[  9%] Building CXX object CMakeFiles/rxcc.dir/src/main.cpp.o
-[ 18%] Building CXX object CMakeFiles/rxcc.dir/src/semantic/checker.cpp.o
-[ 27%] Linking CXX executable rxcc
-[100%] Built target rxcc
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 13.1s)
-
-_Thinking:_
-
-It built. So maybe the header now says `void checkCrate`? Let me re-read checker.h (the read earlier at this turn was cached from before... I read it in the previous turn. The user may have edited it. Let me re-read now to be sure.
-
-Actually my last read of checker.h was in the previous user turn, showing `bool checkCrate(Crate* rt);`. Then the user edited to add checks but I read checker.cpp/h at the start of that turn. Then the user ran tests. The files might have changed again. My re-read of checker.cpp shows `void Checker::checkCrate(Crate* crate)`. So the header must have changed to match (void). Let me read checker.h fresh.
 
 **Tool: read**
 
@@ -2614,8036 +528,7886 @@ Actually my last read of checker.h was in the previous user turn, showing `bool 
 6: struct Checker {
 7:     void checkCrate(Crate* rt);
 8: 
-9:     long long manifestConstInt(ConstValue* value);
-10:     void collect(Crate* crate);
-11:     semType* transformType(Type* t);
-12: 
-13:     void checkItem(Item* item);
-14:     semType* infer(Expr* expr);
-15:     semType* expect(Expr* expr, semType* wish);
-16: 
-17:     void error(std::string message);
+9:     Constant calculateConst(ConstValue* value, std::string owner);
+10:     Constant manifestConst(std::string owner, std::string name);
+11:     constSignature* findConst(const std::string& owner, const std::string& name);
+12:     bool checkConstInit(const ConstValue* value, semType* expected, const std::string& owner);
+13:     void collect(Crate* crate);
+14:     void evaluateConstants(Crate* crate);
+15:     semType* transformType(Type* t);
+16:     void evaluateTypes(Crate* crate);
+17: 
 18: 
-19:     globalTable table_;
-20:     scopeStack scope_;
-21:     semType* currentRet_ = nullptr;
-22:     std::string currentStruct_;
-23:     bool reject_ = false;
-24: };
+19:     void checkItem(Item* item);
+20:     void checkFunction(funcItem* func, const std::string& owner);
+21:     semType* checkBlock(blockExpr* block, semType* expected);
+22:     void checkStatement(Stmt* stmt);
+23:     bool isPlaceable(Expr* expr);
+24:     bool isMutablePlaceable(Expr* expr);
+25:     semType* lookupValue(std::string name);
+26:     semType* infer(Expr* expr);
+27:     semType* expect(Expr* expr, semType* wish);
+28: 
+29:     void error(std::string message);
+30: 
+31:     globalTable table_;
+32:     scopeStack scope_;
+33:     semType* currentRet_ = nullptr;
+34:     std::string currentStruct_;
+35:     bool reject_ = false;
+36: };
 
-(End of file - total 24 lines)
+(End of file - total 36 lines)
 </content>
 ```
 
 ---
 
-## Assistant (Build · DeepSeek V4.1 Flash · 23.7s)
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 22.9s)
 
 _Thinking:_
 
-Header is now `void checkCrate`. OK.
+Review their current code:
 
-Now let me analyze the test results and give a clear plan. The 8 failures and where they belong:
+1. **`lookupValue`**: now fixed the empty-stack check and top-level const lookup. But it uses `scope_.memory_[name]` after find; safe now due to empty check. Still could use `scope_.find`. Fine. One issue: `findConst("", name)` returns nullptr if not found; error message says "can't resolve name in lookupValue". Fine.
+   - Could there be a const whose `type_` is nullptr? If evaluateTypes succeeded, no. But if a const's type failed (makeError), we early-returned? evaluateTypes can set reject_ but checkCrate currently doesn't return after evaluateTypes yet (they haven't added bodies). Once check bodies run with reject_ potential — if evaluateTypes errors, checkCrate should early-return (they'll add). For now fine.
 
-Pass 1 (collect step 1) — DONE, 8 passed presumably those.
+2. **`infer`**: handles intLit, boolLit, unit, block, path (1/2/3+). Missing: unary/binary/cast/call/etc. — expected at this stage. But note the 3+ error message has a trailing colon and no name; fine.
+   - `path` 2-segment: `Self` uses `findConst(currentStruct_, name)`. If currentStruct_ empty (top-level function), `findConst("", name)` → top-level const lookup, which would wrongly accept `Self::N` at top level (e.g., `fn main() { let x = Self::N; }` where N is a top-level const). It should error "Self outside impl". Minor negative test `rej-self-outside-a-method` is about expression `self`, not `Self::`; but correctness: add guard `if (currentStruct_.empty()) error(...)`. Note `rej-self-outside-a-struct-impl` is about types, already handled.
+   - `infer` doesn't handle `refExpr`/`deref`/`field`/`index`/`structInit`/`array`/`repeatedArray`/`methodCall`/`if`/`while`/`loop`/`break`/`return`/`continue`/`call`/`unary`/`binary`/`cast` — returns makeError silently (no message). For now, that's a placeholder; but be careful: returning makeError silently means tests with, e.g., `println_i32(1+2)` won't error, but treat as error type; no crash. Fine for step 1.
+   - Note: `infer(path)` handling is where `Self::` values are resolved. For `Config::N` it uses `findConst(callee, name)` → associated consts. Good.
+   - **Function used as value**: 1-seg name that matches a function → findConst fails → error. Good (UB anyway).
 
-Remaining failures:
-1. `rej-unresolved-signature-type.rx` (`fn f(x: Missing)`) — **collect step 3** (transformType STRUCT existence check). Currently transformType doesn't verify.
-2. `rej-self-outside-a-struct-impl.rx` (`fn f(x: Self)`) — **collect step 3** (Self handling; currentStruct_ empty → error).
-3. `rej-unresolved-value-name.rx` — check phase.
-4. `rej-a-block-local-name-cannot-escape.rx` — check phase.
-5. `rej-a-binding-is-invisible-in-its-own-initializer.rx` — check phase.
-6. `rej-a-local-shadows-a-function-without-callable-fallback.rx` — check phase.
-7. `rej-self-outside-a-method.rx` — check phase (path `self`).
-8. `rej-named-field-structs-are-not-callable-constructors.rx` — check phase (call of struct).
+3. **`checkBlock` and `checkStatement` are empty stubs** — that's the main missing piece for step 1. They compile now (link OK) but do nothing: `checkFunction` calls `checkBlock` → returns nothing/UB! It's declared `semType*` but has no return → UB. Build will warn "no return statement" and calling it is UB. Must implement. The user said "我写了一下" — maybe they only wrote lookupValue+infer and stubs. We need to tell them what to fill:
+   - `checkBlock`: levelUp; for stmts checkStatement; if tail: expect(tail, expected) else unit; compare with expected? Return; levelDown.
+   - `checkStatement`: let/exprStmt.
+   - Wire checkCrate: after evaluateTypes, for each item checkItem.
 
-Also note: main.cpp hack `throw 0` → catch(...) prints "internal error" and returns 1. The exit code is right, but the stderr message is misleading for semantic errors, and `throw 0` is not a great pattern. Suggest:
+4. **checkCrate doesn't call checkItem loop** — still missing (I mentioned last time; they added comment but no loop). Add.
+
+5. `expect` declared but not defined → link error if used. checkBlock will use it. For now maybe implement a minimal expect or call infer only. If they write checkBlock using expect, they must implement expect. Minimal expect:
+   ```cpp
+   semType* Checker::expect(Expr* e, semType* wish) {
+       if (wish == nullptr) return infer(e);
+       // literal handling: intLit unsuffixed + wish integer → wish type
+       if (auto* lit = dynamic_cast<intLitExpr*>(e)) {
+           std::string suf = intSuffix(lit->value_);
+           semType* t = suf.empty() ? ... : makeBuiltin(suf);
+           if (suf.empty() && isIntegerType(wish)) return wish;
+           if (!typeEqual(t, wish)) error(...);
+           return t;
+       }
+       if (auto* b = dynamic_cast<blockExpr*>(e)) return checkBlock(b, wish);
+       semType* t = infer(e);
+       if (!typeEqual(t, wish)) error("type mismatch");
+       return makeError()? or t;
+   }
+   ```
+   Note typeEqual with ERROR returns true, so no cascading.
+   
+   Also `isPlaceable`/`isMutablePlaceable` declared not defined; not used yet → no link error. Fine for step 1; step 2/assignment.
+
+6. `lookupValue` comment: using function as value is UB — correct.
+
+7. The 2-segment path in `infer`: for `Self` at top level, currentStruct_ empty → findConst("", name) → could resolve a top-level const incorrectly. Add guard.
+
+8. `checkFunction` pushes params including self. For by-value `self`, localShadowing isMut_ = para.isMut_ — for `&mut self` it's true (from AST quirk). Place checks on `self` might be affected later; note for Phase 4.
+
+9. Another important one: `checkFunction` uses `sig.retType_` — for method signatures params weren't used; fine.
+
+10. `checkBlock` expected semantics: if body's tail is absent and expected is non-unit, should error. Plan:
+    ```cpp
+    semType* Checker::checkBlock(blockExpr* block, semType* expected) {
+        scope_.levelUp();
+        for (Stmt* s : block->stmts_) if (s) checkStatement(s);
+        semType* result = block->tail_ ? expect(block->tail_, expected) : semantic::makeUnit();
+        if (block->tail_ == nullptr && expected != nullptr && !typeEqual(result, expected)) {
+            error("function body does not produce the declared type");
+        }
+        scope_.levelDown();
+        return result;
+    }
+    ```
+    Hmm, but expected could be nullptr for expression blocks; then result is unit if no tail. For blocks with tail and expected null, expect(tail,null)=infer(tail). Good.
+    But careful: checkBlock is also used for `if` branches etc. with expected maybe nullptr; fine.
+
+11. `checkStatement`:
+    ```cpp
+    if (auto* let = dynamic_cast<letStmt*>(stmt)) {
+        semType* wish = let->type_ ? transformType(let->type_) : nullptr;
+        semType* t = expect(let->init_, wish);
+        scope_.push(let->name_, localShadowing(t, let->isMut_));
+    } else if (auto* es = dynamic_cast<exprStmt*>(stmt)) {
+        infer(es->expr_);
+    }
+    ```
+    Note: `let->init_` never null in grammar (always has = expression). Fine.
+    Note: transformType(let->type_) inside function: Self handled via currentStruct_. Good.
+
+12. Also `checkFunction` should maybe push a function-level scope containing params only (it does levelUp then push params), and checkBlock adds another level for body. That's fine (extra level harmless).
+
+So the review: lookupValue/infer path part good; but step 1 isn't runnable yet because checkBlock/checkStatement are empty, expect missing, checkCrate not wired. Tell them exactly what to write (they asked "你看看" so review + guidance). Also mention the Self guard.
+
+Should I write these myself? The user said "我写了一下，你看看" — review. Previously they then say "你帮我改一下". I'll review with concrete code snippets for checkBlock/checkStatement/expect and the wiring, so they can paste/complete. Keep it concise.
+
+Let me also double-check `checkBlock` signature returns semType* and empty body → UB; build may warn. Let me build to see. Actually build probably passes with warning (no return). Let me check quickly? Not necessary; mention.
+
+Also check `infer` path 3+ message: `error("length of a pathExpr appears to be longer than 2:");` — fine.
+
+One more: in infer, `blockExpr` branch passes expected=nullptr; when a block is the function body, checkFunction calls checkBlock(body, currentRet_) directly, so expected works. When a block appears as an expression nested (e.g., `let x = {1};`), expect(init, wish) will need block→checkBlock(block, wish) in expect. So implement in expect.
+
+Let me write the answer:
+
+1. lookupValue now correct; can simplify using scope_.find but fine. Add note: 2-seg Self top-level guard.
+2. infer path branch fine; other branches pending.
+3. checkBlock/checkStatement empty → project links but crashes/UB (nonzero return missing). Implement per snippets.
+4. expect missing → needed by checkBlock; give minimal version.
+5. wiring checkCrate missing checkItem loop.
+6. Tests to run after: names-and-shadowing; expect ~12/16? Let's estimate: the 4 negative name tests + 1 acc could pass; other negatives (self outside method, struct not callable) still fail. So ~12/16 maybe. Run and see.
+
+Also mention builtins registration still missing! They haven't added get_i32/print_i32/println_i32 anywhere (grep earlier? Let me check quickly). If not, `println_i32` calls will error in check phase once calls are implemented. For step 1, infer doesn't handle call so no effect; but once calls added, need builtins. Let me grep for get_i32 in checker.cpp. I didn't see it in the read. Let me check. Actually I can mention it proactively: add builtin registration before check loop. Let me grep.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "grep -n \"get_i32\\|print_i32\\|println_i32\\|expect\" \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp\" | head"
+}
+```
+
+**Output:**
+```
+145:bool Checker::checkConstInit(const ConstValue* value, semType* expected, const std::string& owner) {
+146:    if (expected == nullptr) {
+149:    if (expected->kind_ == semantic::Type::kTypeKind::ERROR) {
+153:        if (!isBoolType(expected)) {
+162:            if (expected->kind_ != semantic::Type::kTypeKind::BUILTIN || expected->name_ != suffix) {
+168:        if (!isIntegerType(expected)) {
+175:        if (!isSignedType(expected)) {
+179:        return checkConstInit(value->inner_, expected, owner);
+210:        if (!typeEqual(cs->type_, expected)) {
+324:            else if (!insideImpl && (funcName == "get_i32" || funcName == "print_i32" || funcName == "println_i32")) {
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 23.7s)
+
+_Thinking:_
+
+No builtin registration and no `Checker::expect` definition. Let me write the review.
+
+Also note `infer` path 2-seg with Self at top level (minor).
+
+Key blockers for step 1:
+- checkBlock/checkStatement empty (no return → UB)
+- expect undefined (link error if used)
+- checkCrate doesn't invoke checkItem
+- builtins not registered (needed once calls work)
+
+Give code snippets:
+
+checkBlock:
+```cpp
+semType* Checker::checkBlock(blockExpr* block, semType* expected) {
+    scope_.levelUp();
+    for (Stmt* stmt : block->stmts_) {
+        if (stmt) checkStatement(stmt);
+    }
+    semType* result = semantic::makeUnit();
+    if (block->tail_) {
+        result = expect(block->tail_, expected);
+    }
+    else if (expected != nullptr && !typeEqual(result, expected)) {
+        error("block does not produce the expected type");
+    }
+    scope_.levelDown();
+    return result;
+}
+```
+Note: if tail exists and expected non-null, expect handles check; no need additional compare (expect does infer+typeEqual or literal adoption). If expected null → infer.
+Careful: `block->tail_` type check with expected: expect returns actual type. Fine.
+
+checkStatement:
+```cpp
+void Checker::checkStatement(Stmt* stmt) {
+    if (auto* let = dynamic_cast<letStmt*>(stmt)) {
+        semType* wish = let->type_ ? transformType(let->type_) : nullptr;
+        semType* t = expect(let->init_, wish);
+        scope_.push(let->name_, localShadowing(t, let->isMut_));   // 必须在 init 之后
+    }
+    else if (auto* es = dynamic_cast<exprStmt*>(stmt)) {
+        infer(es->expr_);
+    }
+}
+```
+
+expect minimal:
+```cpp
+semType* Checker::expect(Expr* expr, semType* wish) {
+    if (wish == nullptr) return infer(expr);
+    if (auto* lit = dynamic_cast<intLitExpr*>(expr)) {
+        std::string suf = intSuffix(lit->value_);
+        if (suf.empty() && isIntegerType(wish)) return wish;   // 无后缀字面量取 expected
+        semType* t = suf.empty() ? semantic::makeBuiltin("i32") : semantic::makeBuiltin(suf);
+        if (!typeEqual(t, wish)) { error("literal type does not match expected type"); return semantic::makeError(); }
+        return t;
+    }
+    if (auto* block = dynamic_cast<blockExpr*>(expr)) {
+        return checkBlock(block, wish);   // expected 穿透块尾
+    }
+    semType* t = infer(expr);
+    if (!typeEqual(t, wish)) {
+        error("type mismatch");
+        return semantic::makeError();
+    }
+    return t;
+}
+```
+Note: typeEqual(ERROR, wish) returns true (their typeEqual), so error types don't cascade.
+
+checkCrate:
+```cpp
+evaluateTypes(crate);
+if (reject_) return;
+for (Item* item : crate->items_) checkItem(item);
+```
+
+builtins:
+```cpp
+table_.funcSig["get_i32"].retType_ = semantic::makeBuiltin("i32");
+table_.funcSig["print_i32"].params_ = {semantic::makeBuiltin("i32")};
+table_.funcSig["print_i32"].retType_ = semantic::makeUnit();
+table_.funcSig["println_i32"].params_ = {semantic::makeBuiltin("i32")};
+table_.funcSig["println_i32"].retType_ = semantic::makeUnit();
+```
+Add at start of collect (before item loop) or checkCrate. Note: if added in collect, the duplicate/protected check for user-defined `print_i32` will report duplicate instead of protected; either is an error. Fine.
+
+Minor review notes:
+- lookupValue: fine now; could use scope_.find.
+- infer 2-seg Self at top-level: add guard if currentStruct_.empty() → error (Self outside impl).
+- infer path error message for 3+ segments should include text maybe; minor.
+- Calls/unary/binary/cast/etc. still placeholders returning makeError silently. Once checkBlock runs on real bodies, many expressions will silently become ERROR type; tests with `println_i32(1+2)` etc. won't be rejected but will also not be checked; that's expected at step 1, but positive tests should still exit 0 because ERROR is treated compatible. Actually careful: makeError() type comparisons return true in their typeEqual, so positive tests pass; negative tests relying on expression errors won't be caught yet. Fine.
+- Wait: infer returns makeError() with no error message for unhandled nodes → reject_ NOT set. Good (no false rejection). But if a positive test has `1 + 2` passed to println_i32, checkBlock → exprStmt? Actually call args will be handled when calls implemented; at step 1, infer(callExpr) returns makeError (no error), so the call isn't checked and positive tests pass. But `rej-unresolved-value-name` uses `let x = absent;` → path branch errors. Good.
+
+Potential issue: `infer` for a path whose const type is ERROR: fine.
+
+Also note: checkFunction currently pushes params then checkBlock (which levelUp again). Fine.
+
+One more: `checkFunction` for methods pushes self param with transformType(para.type_) where para.type_ is REF(Self) — currentStruct_ is owner, so Self resolves. Good. But `transformType` for STRUCT Self uses currentStruct_ and errors if empty. Fine.
+
+I'll present the review + missing pieces with code. Keep it focused. Also note the test expectations after step 1: run names-and-shadowing; the 4 name/scope negatives should pass (`rej-unresolved-value-name`, `rej-a-binding-is-invisible-in-its-own-initializer`, `rej-a-block-local-name-cannot-escape`, `rej-a-local-shadows-a-function-without-callable-fallback`) — wait, the last one needs call handling! At step 1 with no callExpr handler, `f()` → infer returns makeError silently → no error → negative test still fails. So to pass the shadow test, need callExpr handling (even minimal 1-segment). Include note: to pass that, implement minimal call branch now:
+```cpp
+if (auto* call = dynamic_cast<callExpr*>(expr)) {
+    auto* p = dynamic_cast<pathExpr*>(call->callee_);
+    if (!p || p->path_.size() != 1) { /* 2 seg Phase 5 */ return makeError(); }
+    name = p->path_[0].name_;
+    if (scope_.find(name)) { error("called value is not a function"); return makeError(); }
+    auto it = table_.funcSig.find(name);
+    if (it == end) { error("unresolved function"); return makeError(); }
+    auto& sig = it->second;
+    if (args size != params size) error;
+    for i: expect(arg, params[i]);
+    return sig.retType_;
+}
+```
+This also makes println_i32 calls actually checked → need builtins registration. So include both as part of step 1.
+
+Then names-and-shadowing should pass 4 more (including shadow). Let's summarize: after step 1 complete: infer literals/paths/unit/block/call + checkBlock/checkStatement + expect + builtins + wiring → run names-and-shadowing.
+
+Let me write the answer.
+
+看完了。`lookupValue` 和 `infer` 的 path 分支现在没问题（空栈、顶层常量都对了），但**第 1 步还没法跑**：`checkBlock` 和 `checkStatement` 是空函数（`checkBlock` 是非 void 还漏 return），`expect` 只有声明没有定义，`checkCrate` 也还没调 `checkItem` 循环。补这几块：
+
+**1. `checkBlock`**
 
 ```cpp
-Checker checker;
-checker.checkCrate(crate);
-return checker.reject_ ? 1 : 0;
+semType* Checker::checkBlock(blockExpr* block, semType* expected) {
+    scope_.levelUp();
+    for (Stmt* stmt : block->stmts_) {
+        if (stmt) checkStatement(stmt);
+    }
+    semType* result = semantic::makeUnit();
+    if (block->tail_) {
+        result = expect(block->tail_, expected);      // expected 穿透块尾
+    }
+    else if (expected != nullptr && !typeEqual(result, expected)) {
+        error("block does not produce the declared type");   // fn f() -> i32 {} 在这报
+    }
+    scope_.levelDown();
+    return result;
+}
 ```
 
-Since checkCrate is void now. Or make checkCrate return bool and `if (!checker.checkCrate(crate)) return 1;`. Either. Also remove stale TODO comment.
-
-Also, `error()` prints "error occurred!" twice? No, once per error.
-
-One more thing to verify: what 8 passed. Let me quickly run the suite to see pass list? Not needed; but I can infer. Actually, let me verify the passing tests to make sure no false pass (e.g., a negative test passing for wrong reason). The failure list shows 8 expected-1-got-0. The other 8 passed: 1 acc + 7 rej:
-- acc-named-field-struct-and-function-may-share-a-spelling (positive, exit 0) ✓
-- rej-duplicate-top-level-function ✓ (collect)
-- rej-duplicate-constant ✓
-- rej-function-and-constant-share-the-value-namespace ✓
-- rej-duplicate-struct ✓
-- rej-duplicate-field ✓
-- rej-duplicate-parameter ✓
-- rej-a-top-level-function-cannot-have-a-receiver ✓
-
-These are exactly the pass-1 checks. Good — collect step 1 is validated.
-
-Now, the next actionable step: **collect step 3 first? or step 2?** The plan: step 2 (eval all consts) then step 3 (resolve types). For namespace-errors, only step 3 fixes 2 failures. But you can't skip step 2: step 3's ARRAY branch calls manifestConstInt, which needs table lookups. But for these tests there are no arrays. Still, the natural writing order is step 2 then step 3 per plan. However, step 2 needs `manifestConstInt` implemented as recursive evaluator with cycle detection.
-
-I should give them:
-- Interpretation of results: 8 failures all are phase-2/step-3 features; nothing wrong with step 1.
-- The exact mapping of each failure to what will fix it.
-- Suggest doing collect step 3 first or step 2 first? The todo says 1 → 2 → 3. Note that step 2 (eval) for tests like constant-errors; step 3 fixes unresolved signature. Since namespace-errors suite only needs step 3 for 2 tests, maybe do step 3 next (transformType + fill fields/signatures), because it's needed for `rej-unresolved-signature-type` and Self. But the plan order is fine; and step 2 is needed before step 3's ARRAY branch (can call recursively on demand anyway). I'd recommend step 3 (types) next because it unlocks more tests and makes check phase possible (types needed for infer). But per the agreed order, step 2 first. Hmm.
-
-Actually, per now_todolist_3 updated plan: 1 登记 → 2 求值全部常量 → 3 解析类型. The reason step 2 before 3: transformType's ARRAY length assumes constants are DONE. But the evaluator can lazily evaluate anyway. For namespace-errors, step 3 alone fixes 2. For constant-errors, step 2 needed. Both are part of collect; order as planned (2 then 3) is consistent, and step 2 is a small standalone piece. I'd suggest following the plan: implement `manifestConstInt` eval + evalConst loop (step 2), then step 3. But note that `rej-unresolved-signature-type` requires step 3 — so after both, that suite should be 15/16 or 16/16? Let's see: after steps 2+3, the remaining 6 are check-phase. namespace-errors would be 10/16.
-
-Also one caveat: step 3 must handle `Self` correctly:
-- In struct definition: currentStruct_ = struct name while resolving its fields (for `struct Node { children: Vec<Self> }`).
-- In impl: currentStruct_ = impl target while resolving method signatures.
-- Top-level fn: currentStruct_ empty → `Self` → error (fixes rej-self-outside-a-struct-impl).
-- Unknown STRUCT name → error (fixes rej-unresolved-signature-type).
-
-Also step 3 needs to fill:
-- structSig fields (and keep declaration order).
-- funcSig params/ret (skip self param in impl and set selfRef_/selfMut_; top-level has no self by check).
-- methods signatures.
-- const types (resolve const declared types first, per our earlier discussion, then array lengths check).
-- assoc const types.
-
-And the currentStruct_ handling for const evaluation: when evaluating assoc const, set currentStruct_ to owner for `Self::`.
-
-There's also a question about `main.cpp` cleanup; mention.
-
-Also mention one subtle bug risk in transformType now: STRUCT branch returns `makeStruct(name)` without registering/checking. For ARRAY it calls manifestConstInt. Also `throw "transformType"` → fine.
-
-Let me also check: does the user's current `manifestConstInt` signature in header take `(ConstValue* value)` and return long long — yes.
-
-Now the answer should be: 
-1. Interpretation: failures are all check-phase / collect step 3 items — step 1 is validated (the 8 passing are exactly the registration checks).
-2. Table mapping test → what fixes it.
-3. Next step recommendation: finish collect steps 2+3 (eval consts; transformType filling + Self + unknown struct), then check phase. 
-4. Small main.cpp cleanup suggestion.
-
-Keep it reasonably concise. Also note the two "collect step 3" tests mean that even before check phase, you can improve namespace-errors from 8→10 by finishing collect.
-
-Let me write the mapping table:
-
-| 失败 | 谁来修 |
-|---|---|
-| rej-unresolved-signature-type (`x: Missing`) | collect 第 3 步：transformType 查 structSig |
-| rej-self-outside-a-struct-impl (`fn f(x: Self)` 顶层) | collect 第 3 步：currentStruct_ 为空 → 报错 |
-| rej-unresolved-value-name (`let x = absent`) | check：path 查局部→常量→函数 |
-| rej-a-block-local-name-cannot-escape | check：作用域出块 pop |
-| rej-a-binding-is-invisible-in-its-own-initializer (`let x = x`) | check：先解析 init 再声明绑定 |
-| rej-a-local-shadows-a-function... | check：找到局部就停，不退回函数 |
-| rej-self-outside-a-method (`println_i32(self)`) | check：path "self" 只允许在方法体 |
-| rej-named-field-structs-are-not-callable-constructors (`S(1)`) | check：callee 是 struct 名 → 不可调用 |
-
-And suggest main.cpp: replace `throw 0` with return 1 (since checkCrate is void): `checker.checkCrate(crate); return checker.reject_ ? 1 : 0;` — but careful: returning 1 directly inside try is fine. Or make checkCrate bool again and `if (!checker.checkCrate(crate)) return 1;`. The `throw 0` currently prints "internal error" — misleading but works. Mention optional.
-
-Also, the 8 passed include the positive acc test, so collect step 1 doesn't false-reject.
-
-I might also warn: before Phase 2, transformType must be invoked somewhere; currently `collect` never calls it! No step 3 loop exists. Right.
-
-Let me write final answer.
-
-这 8 个失败全是"还没写到那儿"的功能，**第 1 小遍本身没问题**——通过的那 8 个正好就是登记类的检查（重复 fn/const/struct/field/param、函数常量共享值空间、顶层 self、struct 与 fn 同名正例），说明你的注册逻辑在真用例上站住了。
-
-按归属拆一下这 8 个：
-
-| 失败用例 | 归谁修 |
-|---|---|
-| `rej-unresolved-signature-type`（`fn f(x: Missing)`） | **collect 第 3 步**：transformType 的 STRUCT 分支查 `structSig` 不存在就报错 |
-| `rej-self-outside-a-struct-impl`（顶层 `fn f(x: Self)`） | **collect 第 3 步**：`currentStruct_` 为空时遇到 `Self` 报错 |
-| `rej-unresolved-value-name`（`let x = absent`） | check：path 查名（局部→常量→函数） |
-| `rej-a-block-local-name-cannot-escape` | check：出块 `levelDown` / 作用域查询 |
-| `rej-a-binding-is-invisible-in-its-own-initializer`（`let x = x`） | check：先解析初始化式，再声明绑定 |
-| `rej-a-local-shadows-a-function-without-callable-fallback` | check：找到最近局部就停，不退回函数 |
-| `rej-self-outside-a-method`（`println_i32(self)`） | check：`self` 只允许在方法体里查得到 |
-| `rej-named-field-structs-are-not-callable-constructors`（`S(1)`） | check：callee 解析到 struct 名 → 不可调用 |
-
-也就是说：**collect 把第 2、3 步补完后，这个 suite 能到 10/16**，剩下 6 个必须等 check 阶段。
-
-下一步建议按原顺序做完 collect：
-
-1. **第 2 步**：`manifestConstInt` 写成递归求值（INT/BOOL/PATH/NEG），查 `constSig`/`associatedConsts`，用 `state_` 检测环；然后 collect 里遍历所有 const 全量求一遍。
-2. **第 3 步**：`transformType` 补 `Self`/未知 struct；新建一个循环把字段、签名、常量声明类型填进表；注意先解析常量声明类型再解析数组长度。"Missing" 和 "Self" 这两个失败就消了。
-
-顺带一个清理（不阻塞）：`main.cpp` 里 `if (checker.reject_) throw 0;` 会走 `catch (...)`，每个负例 stderr 都会打一行 `internal error`，很误导。既然 `checkCrate` 现在是 `void`，直接：
+**2. `checkStatement`**
 
 ```cpp
-checker.checkCrate(crate);
-return checker.reject_ ? 1 : 0;
-```
-
-（或者把 `checkCrate` 改回返回 `bool`，`if (!checker.checkCrate(crate)) return 1;`——更干净。）那句 `// TODO：下一步在这里做语义检查` 也可以删了。
-
----
-
-## User
-
-我马上要去 code review，我想现场给助教演示一下建出来的 AST 长什么样子，我现在运行 for f in $(find tests/official/semantic -name '*.rx'); do   ./target/build/rxcc --stage semantic --dump-ast "$f" >/dev/null 2>/tmp/e || echo "FAIL $f $(cat /tmp/e)"; done 跑全量得到的结果只能看见 collect 报的一些错，但没有打印 AST，应该是要 --dump-ast，但是 testcase 太多了，能不能告诉我，如何写“挑几个 testcase 输出 AST”？
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 18.3s)
-
-_Thinking:_
-
-The user wants to demonstrate ASTs in code review. Their loop runs with `--dump-ast` but redirects stdout to /dev/null (`>/dev/null`), so AST output is discarded; they only see collect errors (stderr). They want to pick a few testcases and print ASTs for demonstration.
-
-Wait, look closer at their command: `./target/build/rxcc --stage semantic --dump-ast "$f" >/dev/null 2>/tmp/e || ...` — stdout (AST) goes to /dev/null. So they never see AST. They want "挑几个 testcase 输出 AST" — pick a few test cases and output AST.
-
-How to choose good testcases for AST demo? Suggest:
-- Simple ones: a small function (`fn main() {}`), struct + impl, expressions/operators, references, if/while/loop, const, arrays, struct init, method call, nested containers.
-- Where to find: tests/custom directory is empty; they can write a few small .rx files in /tmp or tests/custom. But the user said no modifications? That was the first turn. Now they can create temp files. Suggest using /tmp for demo files, or pick existing small test files.
-
-Let me find a few small representative test files in the suite and show a command loop that prints the file name + AST for selected files. Also note: `--dump-ast` prints to stdout; don't redirect stdout to /dev/null. For demo on screen, maybe disable colors? not needed.
-
-Also note: running rxcc also runs semantic checks now (with errors to stderr); for AST dump, errors don't matter for demo, but maybe choose positive tests so no stderr noise. Actually the AST is dumped before checking, so even negative tests dump AST first (dump happens at line 83-85 before Checker at 87). So stderr noise is fine but positive tests are cleaner.
-
-Command suggestions:
-
-```sh
-# 单个文件
-./target/build/rxcc --stage semantic --dump-ast tests/official/semantic/names-and-shadowing/acc-shadowing-creates-new-storage-while-prior-references-remain-valid.rx
-```
-
-```sh
-# 挑几个：显示文件名 + AST
-for f in \
-  tests/official/semantic/builtin-io/....rx \
-  tests/official/semantic/structs-and-fields/....rx \
-  ...; do
-  echo "===== $f"
-  ./target/build/rxcc --stage semantic --dump-ast "$f" 2>/dev/null || true
-done
-```
-
-Or find smallest files:
-
-```sh
-find tests/official/semantic -name '*.rx' -printf '%s %p\n' | sort -n | head -20
-```
-
-Then pick small ones. Let me actually find the smallest positive tests to recommend. Let me run that list with sizes, and maybe show what the AST dump looks like for one small file to confirm formatting. Also maybe suggest writing 3-4 demo files in /tmp/opencode or tests/custom covering: (1) struct + impl + method, (2) operators/if/while/loop, (3) references/deref/index, (4) const + array + repeat array + struct init + method call. There's a demo aspect: code review wants to show AST covers grammar.
-
-Let me find small files and check a sample AST output. Also their shell loop: `find ... -name '*.rx'` from repo root; `./target/build/rxcc` from repo root. Fine.
-
-Let me run commands to list smallest files (size sorted) and maybe pick from acc tests. Let me do it.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "find tests/official/semantic -name 'acc-*.rx' -printf '%s %p\\n' | sort -n | head -25",
-  "workdir": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler"
-}
-```
-
-**Output:**
-```
-50 tests/official/semantic/entry/acc-explicit-unit-result-and-early-completion.rx
-69 tests/official/semantic/unreachable-checks/acc-a-valid-unreachable-tail-is-allowed.rx
-70 tests/official/semantic/recursive-layout/acc-finite-but-unconstructible-box-recursion-is-legal.rx
-88 tests/official/semantic/recursive-layout/acc-mutual-recursion-broken-by-indirection.rx
-89 tests/official/semantic/constant-errors/acc-forward-constant-reference-and-negation.rx
-115 tests/official/semantic/invalid-impls-and-generics/acc-parenthesized-struct-impl.rx
-116 tests/official/semantic/unreachable-checks/acc-nested-break-does-not-give-an-outer-loop-a-value.rx
-119 tests/official/semantic/namespace-errors/acc-named-field-struct-and-function-may-share-a-spelling.rx
-127 tests/official/semantic/protected-names/acc-builtin-type-names-may-be-fields-associated-items-and-ordinary-values.rx
-147 tests/official/semantic/builtin-io/acc-normal-early-main-return.rx
-152 tests/official/semantic/shifts/acc-constant-folded-shifts-also-mask-the-count.rx
-153 tests/official/semantic/shifts/acc-masked-dynamic-counts-and-signedness-of-i32-shifts.rx
-153 tests/official/semantic/shifts/acc-masked-dynamic-counts-and-signedness-of-u32-shifts.rx
-155 tests/official/semantic/shifts/acc-masked-dynamic-counts-and-signedness-of-isize-shifts.rx
-155 tests/official/semantic/shifts/acc-masked-dynamic-counts-and-signedness-of-usize-shifts.rx
-157 tests/official/semantic/builtin-io/acc-no-separators-added-by-printint-signed-minimum-and-maximum-i-o.rx
-177 tests/official/semantic/casts-and-literals/acc-operator-precedence-and-left-association.rx
-188 tests/official/semantic/source-main-calls/acc-recursive-main-resumes-its-caller.rx
-255 tests/official/semantic/scalar-reference-operators/acc-reference-comparisons-inspect-targets-including-asymmetric-ordering-coercion.rx
-299 tests/official/semantic/casts-and-literals/acc-literal-boundaries-and-bool-casts.rx
-325 tests/official/semantic/copy-clone-and-equality/acc-unique-shared-reference-clone-for-non-clone-target-array-clone-and-scalar-clone.rx
-361 tests/official/semantic/compound-assignment/acc-all-ten-compound-operators-plus-boolean-assignments.rx
-380 tests/official/semantic/reference-coercions/acc-repeated-deref-coercion-and-mutable-to-shared-coercion.rx
-390 tests/official/semantic/blocks-if-and-never/acc-both-parser-representations-of-tails-and-return-as-never.rx
-393 tests/official/semantic/names-and-shadowing/acc-shadowing-creates-new-storage-while-prior-references-remain-valid.rx
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 13.1s)
-
-_Thinking:_
-
-Let me check a couple of these files' content to pick good demo cases, and test the dump output for one to show the format. Let me cat a few and run rxcc dump on one.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "for f in tests/official/semantic/entry/acc-explicit-unit-result-and-early-completion.rx tests/official/semantic/invalid-impls-and-generics/acc-parenthesized-struct-impl.rx tests/official/semantic/names-and-shadowing/acc-shadowing-creates-new-storage-while-prior-references-remain-valid.rx tests/official/semantic/constant-errors/acc-forward-constant-reference-and-negation.rx; do echo \"===== $f\"; cat \"$f\"; done",
-  "workdir": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler"
-}
-```
-
-**Output:**
-```
-===== tests/official/semantic/entry/acc-explicit-unit-result-and-early-completion.rx
-use rx::core::*;
-
-fn main() -> () {
-    return;
-}
-===== tests/official/semantic/invalid-impls-and-generics/acc-parenthesized-struct-impl.rx
-use rx::core::*;
-
-struct S {
-    x: i32,
-}
-impl (S) {
-    fn f(&self) -> i32 {
-        self.x
+void Checker::checkStatement(Stmt* stmt) {
+    if (auto* let = dynamic_cast<letStmt*>(stmt)) {
+        semType* wish = let->type_ ? transformType(let->type_) : nullptr;
+        semType* t = expect(let->init_, wish);                 // 先算 init
+        scope_.push(let->name_, localShadowing(t, let->isMut_)); // 再声明绑定
+    }
+    else if (auto* es = dynamic_cast<exprStmt*>(stmt)) {
+        infer(es->expr_);
     }
 }
-fn main() {}
-===== tests/official/semantic/names-and-shadowing/acc-shadowing-creates-new-storage-while-prior-references-remain-valid.rx
-use rx::core::*;
-
-fn main() {
-    let n = 3;
-    let r = &n;
-    let n = n + 4;
-    {
-        let n = true;
-        println_i32(n as i32);
-    }
-    println_i32(n);
-    println_i32(*r);
-    let s = Same { x: Same() };
-    println_i32(s.x);
-    println_i32(later(4));
-}
-struct Same {
-    x: i32,
-}
-fn Same() -> i32 {
-    8
-}
-fn later(mut x: i32) -> i32 {
-    x += 1;
-    let x = x * 2;
-    x
-}
-===== tests/official/semantic/constant-errors/acc-forward-constant-reference-and-negation.rx
-use rx::core::*;
-
-const B: i32 = -A;
-const A: i32 = 3;
-fn main() {
-    println_i32(B);
-}
-
 ```
 
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "./target/build/rxcc --stage semantic --dump-ast tests/official/semantic/constant-errors/acc-forward-constant-reference-and-negation.rx 2>/dev/null",
-  "workdir": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler"
-}
-```
-
-**Output:**
-```
-Const B
-  Type i32
-  ConstNeg
-    ConstPath A
-Const A
-  Type i32
-  ConstInt 3
-Fn main()
-  Type ()
-  Block
-    ExprStmt
-      Call
-        Path println_i32
-        Path B
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 17.5s)
-
-_Thinking:_
-
-The AST dump works. Now the user wants to demo a few testcases. The issue in their loop: stdout redirected to /dev/null. Let me give them:
-
-1. Explanation: their command discards stdout (`>/dev/null`), that's why no AST; AST goes to stdout, semantic errors go to stderr. Also note dump happens before checking, so even negative tests print AST (then exit 1 maybe; but since dump is before check, they can still capture). Actually with `|| echo FAIL` and stdout discarded, they see errors.
-
-2. A command to select a few testcases and print AST with headers:
-
-```sh
-for f in \
-  tests/official/semantic/entry/acc-explicit-unit-result-and-early-completion.rx \
-  tests/official/semantic/constant-errors/acc-forward-constant-reference-and-negation.rx \
-  tests/official/semantic/invalid-impls-and-generics/acc-parenthesized-struct-impl.rx \
-  tests/official/semantic/names-and-shadowing/acc-shadowing-creates-new-storage-while-prior-references-remain-valid.rx; do
-  echo "========== $f"
-  ./target/build/rxcc --stage semantic --dump-ast "$f" 2>/dev/null
-done
-```
-
-That prints source? No, just AST. For demo maybe also cat the source first.
-
-Better: write a tiny script or use `sed`? The user just wants command. Provide options:
-
-Option A: pick by explicit list.
-Option B: preview small ones: list by size, pick few.
-Option C: use glob patterns.
-Option D: filter by directory (e.g., one per interesting suite):
-```sh
-for d in entry structs-and-fields methods-and-self expressions...; do
-  f=$(find tests/official/semantic/$d -name 'acc-*.rx' | sort | head -1)
-  ...
-done
-```
-
-Maybe suggest creating 3-4 small self-written .rx demo files in /tmp (not in repo) covering all AST node kinds — better for a code review because official tests may be long and contain things beyond the syntax demo. But the user asked "如何写'挑几个 testcase 输出 AST'" — how to write the command to pick a few testcases and output AST.
-
-Notable interest: for the code review, they likely want to demonstrate specific features: struct/impl/method, operators, control flow, references, arrays, const, calls. Could combine a few official tests.
-
-Also caution: `2>/dev/null` hides semantic errors and syntax errors; for demo better keep stderr? For positive tests there may still be "collect" errors? Positive tests produce no errors. Choose acc-* (positive) tests to be safe. But wait, current implementation is incomplete — positive tests should exit 0 since no checks run in check phase, but collect may report errors on valid programs? E.g., default `manifestConstInt` returns 0 — no error. The acc tests with arrays won't error (no type check yet). So all acc tests currently exit 0. Good. But some acc tests may trigger "non-existing struct have methods" if... no. Fine.
-
-One caveat: `--dump-ast` output happens regardless; the semantic checks run after, and if collect calls error(), stderr prints; exit 1. For demo, use acc tests.
-
-Let me also give a one-liner to pretty-print with source: maybe:
-```sh
-show() { echo "===== $1"; sed -n '1,999p' "$1"; echo "----- AST:"; ./target/build/rxcc --stage semantic --dump-ast "$1" 2>/dev/null; }
-```
-A shell function could be handy.
-
-Also suggest a selection strategy: one test per feature area:
-- entry/acc-... (fn/return/unit)
-- constant-errors/acc-forward... (const/neg/path)
-- invalid-impls-and-generics/acc-parenthesized-struct-impl (struct/impl/method/self/field)
-- names-and-shadowing/acc-shadowing... (blocks/let/ref/deref/cast/struct init/call/mut param/compound assign) — a great comprehensive one at 393 bytes.
-- maybe arrays/... for array types + repeat array. Let me find a small one in arrays. And shifts for binary ops. Let me quickly list small acc files in arrays, blocks-if-and-never, methods-and-self, structs-and-fields, references-and-mutability. Maybe not necessary; but recommending 4-6 tests with feature coverage is good.
-
-Let me find one small acc in arrays and one in methods-and-self, blocks-if-and-never.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "for d in arrays structs-and-fields methods-and-self blocks-if-and-never references-and-mutability casts-and-literals; do echo \"== $d\"; find tests/official/semantic/$d -name 'acc-*.rx' -printf '%s %p\\n' | sort -n | head -3; done",
-  "workdir": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler"
-}
-```
-
-**Output:**
-```
-== arrays
-469 tests/official/semantic/arrays/acc-repeat-executes-once-copy-arrays-remain-independent-and-length-one-needs-no-copy.rx
-== structs-and-fields
-584 tests/official/semantic/structs-and-fields/acc-bool-padding-cannot-corrupt-neighboring-fields-or-by-value-copies.rx
-== methods-and-self
-879 tests/official/semantic/methods-and-self/acc-receiver-auto-borrows-and-repeated-box-reference-dereferences.rx
-== blocks-if-and-never
-390 tests/official/semantic/blocks-if-and-never/acc-both-parser-representations-of-tails-and-return-as-never.rx
-== references-and-mutability
-630 tests/official/semantic/references-and-mutability/acc-an-immutable-binding-of-mut-still-writes-its-target-reborrows-end-before-parent-reuse.rx
-== casts-and-literals
-177 tests/official/semantic/casts-and-literals/acc-operator-precedence-and-left-association.rx
-299 tests/official/semantic/casts-and-literals/acc-literal-boundaries-and-bool-casts.rx
-848 tests/official/semantic/casts-and-literals/acc-every-integer-cast-preserves-all-32-bits.rx
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 17.6s)
-
-_Thinking:_
-
-Let me check the content of a couple more to see if they're good AST demo material (arrays one, blocks-if-and-never). Then produce the answer with commands.
-
-Actually, I have enough. The answer:
-
-1. Why their command shows no AST: `>/dev/null` throws away stdout where AST goes; errors go to stderr (kept in /tmp/e). `--dump-ast` was already correct.
-
-2. How to pick a few and print: shell function or for-loop with explicit list, no stdout redirect.
-
-Give a ready-to-paste block with 5-6 tests covering diverse nodes, with `echo` headers and maybe `cat` source. Also alternative: pick the smallest N automatically:
-
-```sh
-find tests/official/semantic -name 'acc-*.rx' -printf '%s %p\n' | sort -n | cut -d' ' -f2- | head -8
-```
-
-Then loop over explicit list.
-
-Also suggest writing a couple of handcrafted demo files in /tmp if they want a "perfect" showcase (e.g., covering while/loop/if/break/continue/array/method call). Since code review = demonstrate AST coverage of grammar; self-written 10-line file might be clearer than long official tests. But they can also do it.
-
-Let me provide:
-
-```bash
-show() {
-  echo "===================== $1"
-  cat "$1"
-  echo "--------------------- AST:"
-  ./target/build/rxcc --stage semantic --dump-ast "$1" 2>/dev/null
-}
-
-for f in \
-  tests/official/semantic/entry/acc-explicit-unit-result-and-early-completion.rx \
-  tests/official/semantic/constant-errors/acc-forward-constant-reference-and-negation.rx \
-  tests/official/semantic/invalid-impls-and-generics/acc-parenthesized-struct-impl.rx \
-  tests/official/semantic/casts-and-literals/acc-operator-precedence-and-left-association.rx \
-  tests/official/semantic/blocks-if-and-never/acc-both-parser-representations-of-tails-and-return-as-never.rx \
-  tests/official/semantic/names-and-shadowing/acc-shadowing-creates-new-storage-while-prior-references-remain-valid.rx; do
-  show "$f"
-done | less -R
-```
-
-`less` maybe not installed? Probably. Or just run without less.
-
-Note: defining functions in bash works in the shell; in one-liner they can paste. Since user is on WSL, bash. Fine.
-
-Also mention: `2>/dev/null` suppresses the incomplete collect errors for negative tests; since acc tests are positive, maybe keep stderr off. If they demo a negative test's AST, keep stderr but note AST still printed before checking (dump happens before Checker runs). Good detail.
-
-One more: their original loop `>/dev/null 2>/tmp/e` — to only find failures but still dump ASTs to stdout, just `2>/dev/null`. But for the whole suite it's too much output; use `... | head` or per-file.
-
-Keep answer concise with the ready command. Also the file list: 6 files chosen for coverage:
-- entry: fn/return/unit
-- constant: const/neg/path
-- parenthesized impl: struct/impl/method/&self/field
-- casts: binary operators/precedence/left-assoc
-- blocks-if-never: block tails
-- names-and-shadowing: let/shadowing/ref/deref/cast/struct init/call/mut param/compound assign — the showcase.
-
-Maybe also arrays one for array/repeat/len? Optional seventh:
-- arrays/acc-repeat-executes-once... (469B) — might have `[0; N]`, `len()`. Good for showing repeatedArrayExpr. Include it.
-
-Let me quickly verify the arrays file content is suitable (not too weird). Let me cat it... I could, but it's probably fine. Include only if clear. Let me check quickly.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cat tests/official/semantic/arrays/acc-repeat-executes-once-copy-arrays-remain-independent-and-length-one-needs-no-copy.rx; echo =====; cat tests/official/semantic/blocks-if-and-never/acc-both-parser-representations-of-tails-and-return-as-never.rx",
-  "workdir": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler"
-}
-```
-
-**Output:**
-```
-use rx::core::*;
-
-fn element() -> i32 {
-    println_i32(6);
-    4
-}
-fn edit(mut a: [i32; 3]) -> [i32; 3] {
-    a[1] = 20;
-    a
-}
-fn main() {
-    let a = [element(); 3];
-    let mut b = edit(a);
-    b[2] = 9;
-    println_i32(a[1]);
-    println_i32(b[1]);
-    println_i32(b[2]);
-    let mut grid = [[1, 2], [3, 4]];
-    grid[1][0] = 8;
-    println_i32(grid[1][0]);
-    println_i32(grid.len() as i32);
-    let lone = [Box::<i32>::new(5); 1];
-    println_i32(*lone[0]);
-}
-=====
-use rx::core::*;
-
-fn f(x: i32) -> i32 {
-    let v = if x < 0 {
-        return 90;
-    } else if x == 0 {
-        7
-    } else {
-        { x + 1 }
-    };
-    { v * 2 }
-}
-fn main() {
-    let x = get_i32();
-    println_i32(f(x));
-    if true {
-    } else {
-    }
-    -1;
-    if true {
-        10
-    } else {
-        20
-    };
-    let y = if true { 10 } else { 20 } - 1;
-    println_i32(y);
-}
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 16.2s)
-
-_Thinking:_
-
-Both are great demos. Now compose the answer:
-
-1. Explain why no AST: stdout went to /dev/null; AST is on stdout, errors on stderr. `--dump-ast` was right.
-2. Give a `show` function + explicit list of 6-7 testcases (with coverage notes). Note that `acc-*` are positive so no stderr noise; for negative tests AST also dumps (dump happens before checking), but stderr will have errors.
-3. Alternative auto-pick smallest.
-
-Keep it copy-pasteable. Maybe put `| head -200` or use `less`. Because shadowing AST is long; but code review they want to show. Fine.
-
-One caveat: `2>/dev/null` hides errors; if the exit code is 1 due to collect, `set -e` isn't on, fine. Also `echo` headers.
-
-Let me write the final answer with the command block. Keep it tight.
-
-你的原命令问题是 `>/dev/null`：AST 打在 **stdout**（被你扔了），collect 的报错打在 **stderr**（`2>/tmp/e` 留下来），所以只剩错误。`--dump-ast` 本身是对的。
-
-挑几个的写法（推荐定义一个 `show` 函数，源码 + AST 一起打）：
-
-```bash
-show() {
-  echo "===================== $1"
-  cat "$1"
-  echo "--------------------- AST:"
-  ./target/build/rxcc --stage semantic --dump-ast "$1" 2>/dev/null
-}
-
-for f in \
-  tests/official/semantic/entry/acc-explicit-unit-result-and-early-completion.rx \
-  tests/official/semantic/constant-errors/acc-forward-constant-reference-and-negation.rx \
-  tests/official/semantic/invalid-impls-and-generics/acc-parenthesized-struct-impl.rx \
-  tests/official/semantic/casts-and-literals/acc-operator-precedence-and-left-association.rx \
-  tests/official/semantic/blocks-if-and-never/acc-both-parser-representations-of-tails-and-return-as-never.rx \
-  tests/official/semantic/arrays/acc-repeat-executes-once-copy-arrays-remain-independent-and-length-one-needs-no-copy.rx \
-  tests/official/semantic/names-and-shadowing/acc-shadowing-creates-new-storage-while-prior-references-remain-valid.rx; do
-  show "$f"
-done
-```
-
-这 7 个按覆盖挑的，都比较短且是正例（stderr 干净）：
-
-| 文件 | 能演示的节点 |
-|---|---|
-| entry 那个 | `fn`、`return`、UNIT 返回类型 |
-| constant-errors 那个 | `const`、`ConstPath`、`ConstNeg` |
-| parenthesized impl | `struct`、`impl (S)` 括号透明、方法、`&self`、字段 |
-| casts 那个 | 二元运算符优先级/左结合、cast |
-| blocks-if-never 那个 | `if/else if`、块尾、`return` 做值 |
-| arrays 那个 | `[T; N]`、`[v; N]` repeat、索引、嵌套数组、方法调用、`Box::<i32>::new` |
-| names-and-shadowing 那个 | let 遮蔽、`&`/`*`、cast、struct 初始化、函数同名 struct、`mut` 参数、复合赋值 |
-
-小技巧：
-
-- 想自动挑最短的：`find tests/official/semantic -name 'acc-*.rx' -printf '%s %p\n' | sort -n | head -10`。
-- 负例也能 dump（`dumpCrate` 在 `Checker` 之前执行），只是 stderr 会带报错；演示正例最干净。
-- 现场如果输出太长，`done | less` 或每次只跑一个文件。
-- 想演示更全，可以自己在 `/tmp/opencode/demo.rx` 写一个 10 行的综合例子（while/loop/break/continue/引用那类），不用改仓库。
-
----
-
-## User
-
-好的，我们先不考虑 CR 的事情，这里的 const 有全局的也有在 impl 内部的，它们都只有 N,Config::N,Self::N 这三种对吧？尽管没有嵌套，但比如说我在 impl test{ } 里面有一个 const X 用到了另一个 impl Config 里面的 Config::N，这个也是可以的对吧？
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 18.0s)
-
-_Thinking:_
-
-The user asks: constants, whether global or inside impls, only have the three path forms N, Config::N, Self::N, right? And even though there's no nesting, can a const X inside `impl Test` reference `Config::N` from `impl Config`? Is that allowed?
-
-Answer:
-1. Yes, only three forms:
-   - `N` — unqualified top-level const.
-   - `Type::NAME` — associated const of any user struct (including a different struct than the current impl).
-   - `Self::NAME` — associated const of the current impl's target struct.
-   
-2. Yes, `impl Test { const X: i32 = Config::N; }` is allowed. The path form `Config::N` is independent of where the const is declared; it's looked up as `associatedConsts["Config"]["N"]`. There's no restriction based on the "current" impl. `Self::` is just sugar for the current struct name. Evaluate: when evaluating const X (owner Test), set currentStruct_="Test"; the path `Config::N` is resolved by name directly, not via currentStruct_; only bare `Self` uses currentStruct_.
-
-3. Important nuances:
-   - Unqualified `N` inside impl refers to top-level consts only, never a sibling assoc const.
-   - The referenced assoc const can be declared later (forward reference / declaration order irrelevant).
-   - Cross-struct cycles: `impl A { const X = B::Y; }` and `impl B { const Y = A::X; }` → cycle detection must be global across all consts (top-level and assoc). The `state_` machine must be per constSignature regardless of owner. The `rej-associated-constant-cycle` test is Self:: based, but cross-struct cycles could exist too.
-   - `Self::N` where N doesn't exist → error.
-   - Something like `Config::N::M` or `A::B::C` → error; `Config::N` where Config is not a struct (e.g., builtin `Vec`) → error (no assoc consts there).
-   
-4. Also note: the ConstValue base's `text_` for PATH is the whole path text (e.g., "Config::N", "Self::N"). Splitting on "::" gives 1 or 2 parts. Careful: for generic args the text could contain "::" inside `<...>`? e.g. `Cfg::<i32>::LIMIT`... but that's not valid for user structs (no generics) — only Box/Vec which have no consts. Not tested. Simple split is fine.
-
-Keep the answer concise: confirm both points, plus caveats (unqualified doesn't see siblings; cycles must be global; forward refs ok; cross-struct allowed). Maybe mention evaluation context: when evaluating `Config::N` from inside Test, you don't need currentStruct_ changes except for Self.
-
-对，两个判断都对。
-
-**路径只有三种：**
-
-| 写法 | 解析到 |
-|---|---|
-| `N` | 顶层常量 `constSig["N"]` |
-| `Config::N` | `associatedConsts["Config"]["N"]`，**和当前在哪个 impl 无关** |
-| `Self::N` | `associatedConsts["当前 impl 的 struct"]["N"]` |
-
-`Self::N` 只是 `当前struct::N` 的语法糖；其余两种都是按名字直接查表。所以 `impl Test { const X: i32 = Config::N; }` 完全合法——它就是查 `associatedConsts["Config"]["N"]`，没有"能不能从 Test 看见 Config"这种限制。反过来 `Config` 的关联常量也能引用 `Test::X`。
-
-配套注意几点：
-
-1. **裸名 `N` 在 impl 里只查顶层常量**，不会指同 impl 的兄弟关联常量——即使 `impl Test { const A = 1; const B = A; }` 里的 `A` 也是顶层才有的名字，没有就报错，得写 `Self::A`。
-2. **前向引用任意**：`impl Test { const X = Config::N; }` 写在 `struct Config`/`impl Config` 前面也合法，pass 1 已经把 `associatedConsts["Config"]["N"]` 挂好了。
-3. **环检测要全局**：`impl A { const X = B::Y; }` + `impl B { const Y = A::X; }` 是跨 struct 的环；`state_` 是按"每个 constSignature"记的，所以求值时不管 owner 是谁都能抓到，别只查当前 struct。`Self::` 和 `Type::` 指向同一张表，环也一样会被发现。
-4. 指向不存在的 `Config::N`、指向函数/局部、或 `Vec::<i32>::XXX`（内建无关联项）→ 都是编译错误。
-
-求值时的实现细节：只有在解 `Self::` 那段（以及 `Self` 作为 impl 目标类型）时才需要 `currentStruct_`；解 `Config::` 时直接拿 "Config" 当 key，不需要临时切换上下文。
-
----
-
-## User
-
-INT 都可以写什么东西？0x,0b 之类的前缀可以吗？有什么后缀吗？
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 17.5s)
-
-_Thinking:_
-
-The user asks about INT literals: what forms can they take? Hex/binary prefixes allowed? What suffixes?
-
-From the spec (grammar summary + tokens/lexical):
-- INTEGER_LITERAL → (DEC_LITERAL | BIN_LITERAL | OCT_LITERAL | HEX_LITERAL) INTEGER_SUFFIX?
-- DEC_LITERAL → DEC_DIGIT (DEC_DIGIT | _)*
-- BIN_LITERAL → 0b (BIN_DIGIT | _)* BIN_DIGIT (BIN_DIGIT | _)*
-- OCT_LITERAL → 0o ...
-- HEX_LITERAL → 0x ...
-- INTEGER_SUFFIX → i32 | u32 | isize | usize
-
-So:
-- Decimal: `123`, `1_000`
-- Binary: `0b1010`, `0b1010_1010`
-- Octal: `0o777`
-- Hex: `0xFF`, `0xDEAD_BEEF`
-- Underscores allowed between digits (not leading/trailing; grammar requires first digit and last digit to be a real digit; underscores in between). E.g., `1_000` valid; `_1` not a literal; `1_`? DEC_LITERAL: DEC_DIGIT (DEC_DIGIT|_)* — actually this allows trailing underscore! `1_` matches: "1" then "_" zero-or-more... Hmm per this grammar `1_` would be accepted lexically. Wait, DEC_LITERAL → DEC_DIGIT (DEC_DIGIT | _)* means after first digit, any sequence of digits/underscores including trailing underscore. So `1_` is lexable per spec grammar. But in Rust, trailing underscore is invalid. The spec grammar as written permits it. Hmm. But the original ANTLR grammar may differ. The provided parser is authoritative for parsing; semantic only needs to evaluate the text. Let me check the actual grammar file in the repo for the INTEGER_LITERAL lexer rule to be accurate.
-
-- Suffix: i32, u32, isize, usize (no bool). Lowercase only per spec. Uppercase suffix (1I32) invalid.
-- Suffix applies to all radixes: `0xFFu32`, `0b1010usize`, `0o17isize`.
-- BOOL: true/false.
-- Negative: const context only via `-` magnitude.
-- No float literals; no char/string literals in Rx.
-- Range/type selection: suffix → expected type → i32 default. Out-of-range is UB (not CE).
-- The value of literal for const eval: need to parse underscores and prefixes.
-
-Also relevant for `manifestConstInt`: parse text like "0xFFu32" → strip suffix, detect radix, parse. Note that `ConstValue::INT.text_` comes from `ctx->INTEGER_LITERAL()->getText()` — includes suffix and prefixes.
-
-For array length `[i32; 0x10]` — valid (usize expected). The user is writing manifestConstInt, so they need the parsing details:
-- strip suffix: suffix is one of i32/u32/isize/usize at the end — careful: "0x1f" contains 'f' but not suffix; suffix check should be exact string ending: `ends_with("i32")` etc. But "0b1010" doesn't end with those. Hmm "0x2usize" — fine. But a hex literal like "0xFusize"? suffix parse: check ends with "usize"/"isize"/"u32"/"i32". Could a hex number end with digits that look like "i32"? Hex digits are 0-9a-f; "i" is not a hex digit, so "i32"/"isize" can't be part of hex; "u32" can't either (u not hex digit). Binary/octal similarly only 0-1 / 0-7, can't contain u/i. So safe to strip suffix by string suffix matching.
-- underscores: remove all '_' before parsing.
-- prefixes: 0x/0X? Spec says 0x lowercase; ANTLR grammar might allow both? Let me check the repo's lexer grammar. Rust allows 0x/0o/0b lowercase only (uppercase X not allowed). Let me check Lexer.g4.
-
-Let me read the grammar file to be exact. The repo has grammar/Lexer.g4 (original) and compiler/grammar/RxLexer.g4 wrapper importing it. Let me grep INTEGER_LITERAL.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "grep -n \"INTEGER_LITERAL\\|DEC_LITERAL\\|BIN_LITERAL\\|OCT_LITERAL\\|HEX_LITERAL\\|INTEGER_SUFFIX\\|fragment\" /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/grammar/Lexer.g4 | head -40"
-}
-```
-
-**Output:**
-```
-62:INTEGER_LITERAL
-63:    : (DECIMAL | BINARY | OCTAL | HEXADECIMAL) INTEGER_SUFFIX?
-121:fragment ASCII_START: [a-zA-Z_];
-122:fragment ASCII_CONTINUE: [a-zA-Z0-9_];
-123:fragment DECIMAL: [0-9] [0-9_]*;
-124:fragment BINARY: '0b' [01_]* [01] [01_]*;
-125:fragment OCTAL: '0o' [0-7_]* [0-7] [0-7_]*;
-126:fragment HEXADECIMAL: '0x' [0-9a-fA-F_]* [0-9a-fA-F] [0-9a-fA-F_]*;
-127:fragment INTEGER_SUFFIX: 'i32' | 'u32' | 'isize' | 'usize';
-128:fragment SPACE_TEXT: (' ' | '\t' | '\n' | '\r\n')+;
-129:fragment LINE_COMMENT_TEXT: '//' [\u0000-\u0009\u000B-\u007F]*;
-133:fragment COMMENT_PLAIN: [\u0000-\u0029\u002B-\u002E\u0030-\u007F];
-134:fragment COMMENT_PART
-140:fragment BLOCK_COMMENT_TEXT
-143:fragment UNTERMINATED_COMMENT_TEXT
-188:AG_INTEGER_LITERAL: INTEGER_LITERAL -> type(INTEGER_LITERAL), mode(DEFAULT_MODE);
-273:ASG_INTEGER_LITERAL: INTEGER_LITERAL -> type(INTEGER_LITERAL), mode(DEFAULT_MODE);
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 21.6s)
-
-_Thinking:_
-
-The lexer grammar:
-- DECIMAL: [0-9] [0-9_]* — permits `1_` (trailing underscore) lexically per this rule (matches "1_"). Rust proper disallows, but the provided grammar allows. The spec's DEC_LITERAL is the same. So semantically we may see `1_`; parse by stripping underscores anyway.
-- BINARY: '0b' [01_]* [01] [01_]* — requires at least one binary digit after optional leading underscores? Actually `'0b' [01_]* [01] [01_]*` means after 0b, some underscores/digits then a digit then more; so `0b_1` matches ("0b" + "" + "1" + "")? `[01_]*` can match empty, then `[01]` must match a digit, so `0b_1` matches. `0b` alone doesn't (needs a final digit).  
-- hex similar: `0x_F` valid.
-- suffix: exactly one of i32/u32/isize/usize, lowercase.
-- No uppercase 0X/0B/0O. No `0` alone? DECIMAL [0-9][0-9_]* matches "0". Good.
-
-Also note lexer mode rules: AG_INTEGER_LITERAL etc. — token type INTEGER_LITERAL regardless.
-
-So answer:
-- Four radixes: decimal, 0b binary, 0o octal, 0x hex (prefix lowercase only).
-- Underscores allowed anywhere after the first char (even trailing, per grammar), so just strip `_` when parsing.
-- Suffixes: i32, u32, isize, usize (lowercase; must check longest before... actually "usize"/"isize" end with "ize", no conflict with u32/i32; check suffix by matching any of the four at end).
-- No bool suffix; true/false are separate tokens (ConstValue::BOOL; ast_builder stores text "TRUE"/"FALSE" — note! In visitConstValue: `now->text_ = ctx->TRUE() ? "TRUE" : "FALSE";` — uppercase strings. Worth mentioning for manifestConstInt evaluation if handling bool values for consts like `const ENABLED: bool = true;`).
-- Value interpretation for const evaluation: e.g., `0xFF`=255, `0b1010`=10, `0o17`=15, `1_000`=1000; strip suffix then underscores, then `std::stoll` with base 16/8/2/10.
-- Range: literal must fit selected type; out-of-range is UB (not tested), so no need for strict range checking; but const contexts must match declared type (bool vs int) and unsigned negation.
-- Negative: `-` only in const contexts, applies to magnitude.
-- Also unsigned conversion: e.g., `0xFFFFFFFFu32` → 4294967295 (stoll fits in long long). Negative handling: -2147483648i32 valid (signed minima) per spec; `2147483648i32` UB (out of range). For ivalue_ as long long, storing unsigned 32-bit values up to 4294967295 fits.
-
-Practical parse steps for manifestConstInt:
-1. suffix detect: if text ends with "usize" → suffix; else "isize"; else "u32"; else "i32". Or check each.
-2. base: starts with "0b" → 2; "0o" → 8; "0x" → 16; else 10.
-3. strip prefix/suffix, erase '_', parse with std::stoll(s, nullptr, base). Watch out for "0b"/"0o"/"0x" prefix removal.
-
-One subtlety: suffix detection has a trap: hex text like `0x1i32`? "i" not hex digit so lexer wouldn't match... Actually HEXADECIMAL requires last char hex digit, so `0x1i32` would lex as HEX `0x1` then identifier `i32`? In the lexer, INTEGER_LITERAL includes optional suffix; ANTLR will try to match `0x1i32`: HEXADECIMAL can match "0x1", then INTEGER_SUFFIX can match "i32" → yes! Because suffix follows the full hex literal, the lexer matches the longest: `0x1i32` is a valid INTEGER_LITERAL with value 1 and suffix i32. Interesting — so a hex literal can be followed by suffix, and suffix begins with 'i'/'u' not hex digits. My earlier statement "safe" holds: strip suffix by string ending first, then parse prefix. Good.
-- However `0x2usize` ends with "usize"; strip → "0x2". Good.
-- Could a hex literal end with "u32" as hex digits? 'u' not hex; no.
-- Decimal like `12_3` fine.
-
-Also the user might care: does `0b` allow leading underscore `0b_1`? yes per grammar. Just strip underscores.
-
-Mention that `text_` for INT in AST is raw `getText()` including suffix/prefix/underscores.
-
-Also mention integer literal typing: suffix fixes type; else expected; else i32. For array lengths, expected usize; so `[i32; 0x10]` is fine. And the const initializer `const N: usize = 0b101;` fine.
-
-Also note: uppercase suffix not allowed (`1I32` would lex as INTEGER_LITERAL `1` + IDENTIFIER `I32`? Since INTEGER_SUFFIX only lowercase, `1I32` → INTEGER_LITERAL "1" then "I32" identifier → syntax error in most contexts. Not our issue.)
-
-Keep answer concise with a table of forms and a parse recipe. Also mention BOOL text_ is "TRUE"/"FALSE" (uppercase in their AST builder) for the evaluator.
-
-按 `Lexer.g4` / spec，INT 就四种底数 + 四种后缀：
-
-```text
-INTEGER_LITERAL : (DECIMAL | BINARY | OCTAL | HEXADECIMAL) INTEGER_SUFFIX?
-
-DECIMAL     : [0-9] [0-9_]*                    123, 1_000
-BINARY      : '0b' [01_]* [01] [01_]*          0b1010, 0b_1010, 0b1010_1010
-OCTAL       : '0o' [0-7_]* [0-7] [0-7_]*       0o777, 0o_7
-HEXADECIMAL : '0x' [0-9a-fA-F_]* [0-9a-fA-F] [0-9a-fA-F_]*   0xFF, 0x_FF, 0xDEAD_BEEF
-INTEGER_SUFFIX : 'i32' | 'u32' | 'isize' | 'usize'
-```
-
-要点：
-
-- **前缀只有小写** `0b`/`0o`/`0x`，没有 `0B`/`0X`。
-- **下划线**可出现在首字符之后任意位置（这份文法甚至允许 `1_`、`0b_1`），所以求值时无脑 `erase` 掉所有 `_` 再 parse 就行。
-- **后缀正好四个** `i32/u32/isize/usize`，全小写，且可以跟在任何底数后面（`0xFFu32`、`0b1010usize`、`0o17isize` 都合法）。没有 `bool` 后缀；`true`/`false` 是独立 token。
-- 前缀/后缀/下划线都不会和数字内容打架（`u/i` 不是 hex 数字），所以 `manifestConstInt` 的解析可以按顺序做：
-  1. 先剥离结尾后缀（`ends_with` 四个之一）；
-  2. 看前缀决定 `base`（`0b`→2，`0o`→8，`0x`→16，否则 10）；
-  3. 去掉前缀、去掉所有 `_`，`std::stoll(s, nullptr, base)`。
-- 类型规则：后缀决定类型 → 无后缀看 expected → 否则 `i32`。数组长度处的 expected 是 `usize`，所以 `[i32; 0x10]`、`[0; 1_000]` 都合法。值超出所选类型的范围是 UB（不考），不用专门查范围。
-- 负数不是字面量的一部分：只有常量上下文里 `-` + magnitude（`-0x10`、`-(1_000)`），且要求有符号类型；`-2147483648i32` 这种有符号最小值合法。
-
-写 `manifestConstInt` 时如果顺手处理 BOOL，注意你 AST builder 里存的是大写 `"TRUE"`/`"FALSE"`（`visitConstValue` 第 516 行），不是源码的 `true`/`false`。
-
----
-
-## User
-
-也就是说，我 manifestConstInt 的时候啥也不用管，直接剥离后缀，看进制，去掉_，开算？那比如 isize 和 usize，这个是 64 位吗？换句话说，-2^64 需要考虑吗？以及，这个函数应该处理不了带 expected 类型的情况吧，之后可能要专门写个有 expected 的？
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 24.4s)
-
-_Thinking:_
-
-The user asks three things:
-
-1. So in manifestConstInt, do I just strip suffix, check radix, remove underscores, and compute? 
-2. Are isize/usize 64-bit? Do we need to consider -2^64?
-3. This function can't handle expected-type cases; later need a dedicated version with expected type?
-
-Answers:
-
-1. For the *value* computation, mostly yes — but note the function signature currently takes `ConstValue*` and returns long long; it needs to handle INT, NEG, PATH, BOOL (error in int context), and parentheses already transparent in AST. Also it must do table lookups for PATH with cycle detection. The "strip suffix/radix/underscore" is only for INT. Also the type checks (usize for array length, signed negation) can't be fully done here without types — as discussed, those go to pass 3 / check.
-
-2. Spec says: "i32, isize: Distinct signed 32-bit integers; u32, usize: Distinct unsigned 32-bit integers". So all four are 32-bit! isize/usize are 32-bit in Rx (RV32 target). So no -2^64; don't consider 64-bit. `long long` (64-bit) is fine as an internal accumulator; values fit 32 bits. Out-of-range literals are UB (not tested) except the special signed minima allowed: `-2147483648i32`, i.e., magnitude 2147483648 = 2^31 which exceeds i32::MAX but is allowed as a NEG of literal. So parsing "2147483648" into long long works; negative handled with NEG. For unsigned u32 max 4294967295 fits. So no -2^64 concerns.
-
-Actually wait: the spec's integer literal range guarantee: "An unsuffixed integer literal whose value falls outside the i32 range when evaluated without an expected type constitutes undefined behavior. Integer literal overflow exhibits undefined behavior. The literal rules still permit signed minima such as -2147483648i32 and -(2147483648i32)." So no need to handle big values in tests.
-
-3. Expected type: right — `manifestConstInt` is a pure "value evaluator" without expected type; it can't decide whether `-1` is legal (needs signed type), nor check `const N: u32 = 1` vs `-1u32`, nor "array length must be usize". Those checks happen where an expected/declared type exists:
-   - const initializer: when resolving the const's declared type (pass 3), check the initializer against declared type;
-   - array type length and repeat length: after resolving const declared type / for literals use expected usize; check it's usize.
-   
-   So you don't necessarily need a second "manifestConstInt with expected"; rather, the evaluator returns value (and maybe a type tag: INT vs BOOL; signedness comes from suffix/declared type), and a separate check function validates the ConstValue form against an expected type. Options:
-   - `manifestConst` returns a small struct {kind: INT/BOOL; long long ival; bool bval; constSignature* ref;} — then the checker compares to expected type.
-   - Or `manifestConstInt(v, expected)` variant that also checks: if expected is usize → value must be non-negative & int form; if expected is signed → NEG allowed; if expected bool → only BOOL.
-
-   Note the case `const N: isize = -1;` is UB (propagation exclusion) — tests exclude it; so `-1` with declared isize need not be supported? Wait: spec says "The propagation exclusion also applies here: `const N: isize = -1;` is undefined behavior because it needs the expected type to pass through unary minus. Write `-1isize` instead. `const N: i32 = -1;` is valid because the literal `-1` defaults to i32." Interesting! So `const N: i32 = -1` valid (default i32 before declared i32); `const N: isize = -1` UB; `const N: i32 = -1isize`? Suffix isize vs declared i32 → probably compile error (type mismatch). So for NEG of unsuffixed literal: type = i32 (default), and declared must be i32. For NEG with suffix: type = suffix.
-   
-   Similarly `-VALUE` where VALUE has declared type: negative of path — the path's type must be signed; `const N: i32 = -VALUE` where VALUE: i32 works; where VALUE: u32 → error (test rej-unsigned-constant-negation? that test is `-1u32` suffix; also comparable).
-
-   So yes: a separate "check ConstValue against declared/expected type" step is needed, but it's more "type-check the const initializer" than a second evaluator. You can fold it into pass 3: for each const, after resolving its declared type, walk its ConstValue syntax and check form/type compatibility, including referenced consts' types. The value itself comes from the pass-2 evaluator.
-
-Also note: manifestConstInt used for array lengths needs the referenced const's declared type == usize, plus the value. For a direct literal in `[i32; 4]`, expected usize — check literal suffix: none → usize; `4u32` → suffix u32 ≠ usize → error; `4i32` → error. Hmm, is `[i32; 4i32]` a compile error? Spec: array lengths are constant values with expected type usize. Literal with suffix fixes type → i32, and expected usize → mismatch → compile error (not UB, since suffix fixes type, mismatch is CE). Probably a negative test exists somewhere. Let me check `rej-` tests with array length suffix. Not critical.
-
-So answer structure:
-1. 值计算层面：是的，但别只想着 INT —— INT/NEG/PATH/BOOL（bool 在 int 上下文报错）都要处理，PATH 要查表+环检测（那才是主体）。STRIP/进制/underscore 只是 INT 分支 5 行。
-2. isize/usize 是 32 位（Rx 定义：四个整数都是 32 位；目标是 RV32）。不存在 -2^64；long long 内部暂存绰绰有余。唯一要留意的是有符号最小值：mangitude 2147483648（=2^31）允许配合 `-` 出现在 `-2147483648i32`，直接 stoll 能解析，不用报越界（越界本来就是 UB，不用查）。
-3. 对，带 expected/declared type 的检查是另一个函数/另一遍的事。manifestConstInt 只管"是不是个能算的常量、值是多少"。类型检查在 pass 3 解析声明类型时做：const 初始化式 vs 声明类型；数组/repeat 长度 vs usize。可以写 `checkConstAgainst(Type* declared, ConstValue*)`，或者让求值器返回一个小 struct（kind + value）再做匹配。
-
-Also mention the subtlety: `const N: isize = -1;` is UB (not tested), so the checker needn't handle expected-type propagation into NEG; `-1` unsuffixed defaults i32; declared i32 OK.
-
-Keep concise. No need for tools.
-
-分三点：
-
-**1. 值计算：不只是"剥后缀看进制去下划线"。** 那只是 `INT` 分支的 5 行；`manifestConstInt` 的主体其实是：
-
-```text
-INT  → 剥后缀/看进制/去 _/parse
-NEG  → 递归 inner 再取负
-PATH → 查 constSig / associatedConsts，按 state_ 环检测，递归取值
-BOOL → 在 int 上下文（数组长度）里报错
-```
-
-**2. `isize`/`usize` 是 32 位，不是 64 位。** spec 明确：`i32`/`isize` 是两个"不同的 32 位有符号"，`u32`/`usize` 是两个"不同的 32 位无符号"（目标是 RV32）。所以不用考虑 `-2^64`；内部用 `long long` 暂存足够。
-
-唯一要留意的边界是有符号最小值：`-2147483648i32` 合法（`2147483648` 单独当正字面量放 i32 是越界，但 `-` + magnitude 的形式允许）。`stoll` 解析 `"2147483648"` 没问题，你也不需要专门查范围——越界字面量本来就是 UB，测试保证不出现。
-
-**3. 对，expected 那部分要另写，但更准确说是"另一个职责"，不是"另一个求值器"。**
-
-- `manifestConstInt` 只负责：**这是个能求值的常量吗？值是多少？** 它不知道 expected，所以在它眼里 `-1u32` 就是个数字 -1，`[i32; N]` 里的 N 是不是 usize 也无从判断。
-- 带类型的检查放在 pass 3（你已经求好值、解析好声明类型之后）：`const 初始化式 vs 声明类型`、`数组/repeat 长度 vs usize`、`负号操作数必须有符号`。
-- 所以可以有两个选择：
-  - `manifestConstInt` 返回纯值，再写一个 `checkConstValue(const ConstValue*, semType* declared)` 专门对照类型（推荐，职责清晰）；
-  - 或者让求值器返回一个小 struct（`{isInt, ival, isBool, bval, constSignature* ref}`），检查函数拿它和 declared 比。
-
-要特别记住两条 spec 的坑：
-
-- `const N: isize = -1;` 是 **UB**（负数需要 expected 穿过一元负号，被 propagation exclusion 排除），测试不会有；`const N: i32 = -1;` 合法（无后缀先默认 i32，正好匹配）。所以 NEG 的检查不需要"先把 declared 传进去决定 1 的类型"这种复杂逻辑，按"后缀 → 默认 i32"定完再比就行。
-- `-VALUE`（VALUE 是常量路径）的负号合法性看 VALUE 的**声明类型**是否带符号；这个检查也要等 pass 3 知道 VALUE 的 `type_` 之后才能做。
-
----
-
-## User
-
-我看 pathInExpression 并没有拒绝多层 :: 嵌套，这个是语言保证了不会出现还是我自己要判断如果出现多个就直接 fail？
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 21.2s)
-
-_Thinking:_
-
-The user asks about `pathInExpression` not rejecting multi-level `::` nesting — e.g., `A::B::C` or `a::b::c::d`. Is it guaranteed by the language (tests won't have it) or should they check and fail if more than 2 segments appear?
-
-Let me think carefully.
-
-The grammar: `pathInExpression : pathExprSegment (PATHSEP pathExprSegment)*` — arbitrary depth. The spec says Rx subset excludes modules; use declarations accepted only as `use rx::core::*` and discarded. Paths in expressions:
-- path expressions can be: local variable `x`, constant `LIMIT`, associated const `Config::LIMIT`, `Self::LIMIT`, associated function `Point::new`, `Self::method`? etc.
-- Function calls: `helper()` — path `helper`; `Config::new()` — path `Config::new`; `Vec::<i32>::new()` — path `Vec` with generic args + `new` segment? Let's see: `Vec::<i32>::new` is pathExprSegment `Vec` with genericArgs `<i32>` then `::new`. Actually the grammar: `pathExprSegment : pathIdentSegment (PATHSEP genericArgs)?` and `pathInExpression : pathExprSegment (PATHSEP pathExprSegment)*`. So `Vec::<i32>::new`: segment1 = `Vec :: <i32>` (PathIdentSegment PATHSEP GenericArgs), segment2 = `new`. So 2 segments. `Box::<i32>::new` same.
-
-What about deeper paths in valid Rx?
-- `Self::LIMIT` – 2 segments.
-- `Config::LIMIT` – 2.
-- `a::b`? Modules don't exist. Use declarations discarded and "Tests never rely on a use declaration to introduce another type, value, module, or usable alias into Rx." So no module paths.
-- Could there be `Vec::<i32>::new` — 2.
-- Is there any 3-segment valid path? Perhaps `Self::CONST::X`? No nested assoc items. No modules. So valid programs have at most 2 segments (1 for local/top-level fn/const; 2 for Type::item / Self::item / Box/Vec turbofish + method).
-
-So the question: if `A::B::C` appears, is it UB (guaranteed absent) or should the compiler reject?
-
-From the test-guarantee list: the guarantees constrain valid source; the UB list doesn't explicitly mention "deep paths". The language subset says modules/import resolution excluded. The parser accepts `a::b::c` syntactically (Rust-valid syntax). "Unsupported syntax may be rejected at the language-subset boundary even if the supplied parser recognizes it." (from undefined-behavior.html) — that's the key sentence: unsupported syntax may be rejected. So a 3-segment path is "unsupported syntax" (no module system), and the compiler may reject it. But is it required to? If tests never contain it, either behavior is fine. Do negative tests contain deep paths? Let me grep tests for paths with 2+ `::` inside expressions (e.g., `a::b::c`). Let me search.
-
-Cases to check:
-- `Type::NAME` used in expressions (assoc const) → check phase.
-- `Self::NAME`.
-- `Vec::<i32>::new` — 2 segments with generic args.
-- Maybe `Box::<i32>::new`.
-- Any 3+ segments?
-
-Let me grep the semantic tests for `::` patterns with more than 2 segments. Search regex `[A-Za-z_][A-Za-z0-9_]*::[A-Za-z_][A-Za-z0-9_]*::` (excluding `use` lines and turbofish `::<`).
-
-Also check invalid-impls-and-generics suite — maybe it has things like `impl Foo::Bar`? Let me grep.
-
-Then answer: For **expression paths** in check phase: resolve segment by segment; realistically:
-- 1 segment: local → const → function (top-level).
-- 2 segments: Type/Self::member, or container turbofish constructors.
-- 3+ segments: cannot resolve to anything in Rx (no modules/nested types) → treat as unresolved name → compile error (safe). That matches "unresolved value name" semantics and is allowed by "unsupported syntax may be rejected".
-- Important: don't crash, just error.
-
-But careful: what about `Type::method()` as associated function (e.g., `Point::new()`), that's 2 segments. What about `Vec::<i32>::new()`? The AST path_ has segments where segment "Vec" has types_ [i32], then segment "new". So 2 segments. Good.
-
-Also const evaluator's PATH text is the raw string like "A::B::C"; splitting by "::" may be tricky with turbofish, but constants can't be generic container paths (no assoc consts on Box/Vec), and user structs have no generics, so 1 or 2 plain segments. If more → error.
-
-For **type paths** (`typePath`), AST builder only keeps the last segment's name (visitTypePath takes last pathIdentSegment text) — so `a::b::Config` becomes STRUCT("Config"). Hmm, that silently ignores prefixes. Is that OK? For impl target `impl a::b::Config`... modules don't exist; tests won't have it. For type in signatures, `x: foo::Bar` — unsupported; AST loses prefix. Since modules are UB/unsupported, fine. Maybe mention.
-
-So answer:
-- Language: Rx has no modules/use resolution; valid programs' expression paths have at most 2 segments. Tests guarantee don't contain deeper paths relying on modules.
-- But "unsupported syntax may be rejected", so your compiler should **not crash** if it sees `A::B::C`; simplest: when resolving an expression path in check phase, only handle 1 or 2 segments; anything else → error("unresolved name") and continue (never UB/crash). Since no test contains it, you don't need elaborate handling, just don't index out of range / assume.
-- Note the AST builder already collapsed type paths to last segment; expression paths are stored as segments vector, so you can inspect path_.size().
-- Also careful about `Self::` with more segments (`Self::A::B`): invalid, error.
-- Also mention: for **const PATH**, split on "::" — if more than 2 parts (ignoring turbofish which can't legally appear on user structs), error.
-
-Let me verify with a grep of tests for deep paths to be safe, especially negative tests that might expect rejection (e.g., invalid-impls-and-generics). Search for `::` occurrences excluding `use ` and `::<`.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic\"; grep -rn \"[A-Za-z_][A-Za-z0-9_]*::[A-Za-z_][A-Za-z0-9_]*::\" . --include=*.rx | grep -v \"^.*:.*use \" | grep -v \"::<\" | head -30"
-}
-```
-
-**Output:**
-```
-(no output)
-```
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic\"; grep -rn \"::\" . --include=*.rx | grep -v \"use rx\" | grep -v \"::<\" | sed 's/.*:\\([0-9]*\\):/\\1: /' | head -40"
-}
-```
-
-**Output:**
-```
-: leaf(seed);
-: clone(&root);
-: B;
-: A;
-: N;
-: N];
-: NEG;
-: clone(&a);
-: new(&x);
-: START }
-: new();
-: add(&mut c, 2);
-: value(&c));
-: new().changed().value());
-: f(s);
-: Box };
-: clone(&a);
-: clone(&a.inner));
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 14.0s)
-
-_Thinking:_
-
-The sed mangled the output. Let me grep properly for occurrences of `::` in tests, excluding use declarations and turbofish. Let me use rg or grep with context. Actually first grep (deep paths with two ::) returned no output — good: no test has 3-segment paths. Let me check what 2-segment paths appear, to confirm forms (Type::method, Self::CONST, Vec::<i32>::new etc.). Let me run rg for `\w+::` patterns and show unique matches.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic\"; grep -rhoE \"[A-Za-z_][A-Za-z0-9_]*::(<[^>]*>)?[A-Za-z_][A-Za-z0-9_]*\" . --include=*.rx | sort | uniq -c | sort -rn | head -30"
-}
-```
-
-**Output:**
-```
-    237 rx::core
-      2 Counter::new
-      2 Config::N
-      1 View::new
-      1 Self::START
-      1 Self::B
-      1 Self::A
-      1 S::f
-      1 S::Box
-      1 Pair::clone
-      1 Outer::clone
-      1 Node::leaf
-      1 Node::clone
-      1 Inner::clone
-      1 Counter::value
-      1 Counter::add
-      1 Config::NEG
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 16.9s)
-
-_Thinking:_
-
-The tests contain only 1-segment paths (locals, functions, constants, one-segment types) and 2-segment paths (`Type::method`, `Type::CONST`, `Self::CONST`). No 3+ segments. `use rx::core::*` is discarded. Turbofish `Vec::<i32>::new` pattern wouldn't match my regex maybe; let me check separately for `::<`. It was excluded in the earlier grep; but the regex `[A-Za-z_]...::( <...> )?...` should have caught `Vec::<i32>::new` partially — `Vec::<i32>`? The regex requires an identifier after ::; `::<` breaks it. Let me quickly grep `::<`. Not critical.
-
-So the answer:
-- Valid Rx programs have at most 2 segments in expression paths (1 = local/top-level fn/const; 2 = Type::member / Self::member / Box/Vec turbofish + assoc fn like Vec::<i32>::new). The official tests confirm: only `Config::N`, `Self::A`, `Counter::new` etc.
-- Language guarantee? The spec's use compatibility says tests never rely on use declarations to introduce modules; modules/imports excluded. Unsupported syntax may be rejected at the subset boundary. So a 3+ segment path is not something they'll test; you should not crash — just treat it as unresolved/unsupported and `error(...)`.
-- Practical: in check phase, resolve path by `path_.size()`:
-  - 1: lookupValue
-  - 2: [Type::member] or [Self::member]; Type resolves in type namespace unless it's a local? Hmm — wait: could a 2-segment path have a *value* prefix in valid Rx? No: `x.y` is parsed as fieldExpr, not path; `f()` is 1-segment call. `A::B` prefix A must be a type (struct/Self), member B a function/const. Exception: container constructors `Vec::<i32>::new`, `Box::<i32>::new` — prefix is builtin container type with turbofish. So for 2 segments: prefix must be a type name (user struct / Self / Box / Vec), second segment assoc item; for Box/Vec only `new`.
-  - >=3: error (unsupported, no module paths) — don't crash; just report unresolved.
-- For the const evaluator (PATH text), same: split "::"; 1 or 2 parts; more → error. Note turbofish can't appear in valid const paths.
-- Also caution: don't assume `path_.size()` in code without checking; if a 3-segment sneaks in, index [0]/[1] logic should guard.
-
-Also note the AST builder type path: `visitTypePath` silently takes last segment name — so a type like `foo::Bar` would become STRUCT("Bar") and possibly resolve. That's unsupported syntax; tests won't have it. If you want strictness, you could check the source Type path segments... but the AST Type doesn't keep intermediate segments (name only), so can't detect. Fine — mention briefly.
-
-Answer concisely: it's guaranteed by the language subset (no modules; use discarded), tests contain only ≤2 segments. Still don't crash on 3+: return error. Provide resolution overview per segment count.
-
-Let me double check `::<` occurrences in tests for completeness.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic\"; grep -rhoE \"[A-Za-z_][A-Za-z0-9_]*::<[^>]*>::[A-Za-z_][A-Za-z0-9_]*\" . --include=*.rx | sort | uniq -c | head"
-}
-```
-
-**Output:**
-```
-      4 Box::<&mut i32>::new
-      1 Box::<Counter>::new
-      2 Box::<Node>::new
-      2 Box::<Opaque>::new
-      1 Box::<Pair>::new
-      1 Box::<Parts>::new
-      1 Box::<[i32; 3]>::new
-      2 Box::<i32>::clone
-     24 Box::<i32>::new
-      1 Box::<u32>::new
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 16.3s)
-
-_Thinking:_
-
-Confirmed: all paths in tests are 1 or 2 segments (with `::<T>` turbofish counting as part of a segment). `Box::<i32>::new` is 2 segments: `Box::<i32>` and `new`. Also `Vec::<i32>::new` presumably.
-
-Now answer:
-
-- Language guarantees: Rx excludes modules & import resolution; `use` discarded. Valid expression paths have at most 2 segments: 
-  - 1: local / top-level function / top-level const.
-  - 2: `Type::member` (user struct assoc fn/const), `Self::member`, `Box::<T>::new`, `Vec::<T>::new`, `Box::<T>::clone`.
-- Tests only have these (I checked: `Config::N`, `Self::A`, `Counter::new`, `Box::<i32>::new`, etc.). No 3-segment in the official semantic suite.
-- But "unsupported syntax may be rejected at the subset boundary" — so if a 3+ path appears, you may reject. Don't ignore it silently, and don't crash: handle `path_.size() >= 3` as an error (unresolved/unsupported path), keep collecting errors.
-- Implementation advice for check phase: switch on path_.size(): 1 → lookupValue; 2 → prefix must be type namespace (STRUCT with name, or Self, or Box/Vec with types_), second segment member; >=3 → error.
-- For const eval PATH text: split by "::" → 1 or 2; more → error; ensure no out-of-range indexing.
-- Note: type paths in AST lose prefixes (visitTypePath keeps only last segment) — `foo::Bar` becomes "Bar"; unsupported syntax, tests don't have it. Don't worry.
-
-Keep it concise.
-
-语言保证：Rx 没有模块/导入，`use` 被丢弃，所以**合法程序里的表达式 path 最多两段**。我把官方 semantic 测试全 grep 了一遍，确实只有这几种：
-
-- 1 段：局部变量、顶层函数、顶层常量
-- 2 段：`Config::N`（关联常量）、`Self::A`、`Counter::new`（关联函数）、`Box::<i32>::new` / `Vec::<i32>::new`（turbofish 算在第一段里）
-
-没有任何 3 段及以上的路径。所以 `A::B::C` 属于"解析器认识但 Rx 子集不支持"的语法——spec 说这种"unsupported syntax may be rejected at the subset boundary"，**你可以直接拒绝，但不能崩**。
-
-所以 checker 里的写法：
+**3. `expect`（最小版，Phase 2 够用）**
 
 ```cpp
-if (path_.size() == 1)      { /* lookupValue: 局部 -> 顶层常量 -> 顶层函数 */ }
-else if (path_.size() == 2) { /* 前缀必须是类型空间: STRUCT 名 / Self / Box / Vec(带 types_) */ }
-else                        { error("unsupported path"); return makeError(); }
+semType* Checker::expect(Expr* expr, semType* wish) {
+    if (wish == nullptr) return infer(expr);
+    if (auto* lit = dynamic_cast<intLitExpr*>(expr)) {
+        std::string suf = intSuffix(lit->value_);
+        if (suf.empty() && isIntegerType(wish)) return wish;   // 无后缀取 expected
+        semType* t = suf.empty() ? semantic::makeBuiltin("i32") : semantic::makeBuiltin(suf);
+        if (!typeEqual(t, wish)) {
+            error("literal type does not match expected type");
+            return semantic::makeError();
+        }
+        return t;
+    }
+    if (auto* block = dynamic_cast<blockExpr*>(expr)) {
+        return checkBlock(block, wish);
+    }
+    semType* t = infer(expr);
+    if (!typeEqual(t, wish)) {
+        error("type mismatch");
+        return semantic::makeError();
+    }
+    return t;
+}
 ```
 
-不要写 `path_[1]` 这种不判长度的索引；求值器里 split `"::"` 也一样，1~2 段正常处理，更多就报错继续，绝不越界。常量上下文里 turbofish 不会合法出现（Box/Vec 没有关联常量），所以按 `"::"` 简单切分就够。
+**4. `checkCrate` 接上**
 
-顺带说明：**类型**路径 `foo::Bar` 因为 `visitTypePath` 只取最后一段，到了 sema 你会看到 `STRUCT("Bar")`——前缀已经丢了。反正模块路径是 UB/不支持，测试不会有，不用管。
+```cpp
+evaluateTypes(crate);
+if (reject_) return;
+for (Item* item : crate->items_) checkItem(item);
+```
+
+**5. 注册内置函数**（不然 `println_i32` 永远查不到）：
+
+```cpp
+// collect 开头
+table_.funcSig["get_i32"].retType_ = semantic::makeBuiltin("i32");
+table_.funcSig["print_i32"].params_.push_back(semantic::makeBuiltin("i32"));
+table_.funcSig["print_i32"].retType_ = semantic::makeUnit();
+table_.funcSig["println_i32"].params_.push_back(semantic::makeBuiltin("i32"));
+table_.funcSig["println_i32"].retType_ = semantic::makeUnit();
+```
+
+**6. `infer` 的 `callExpr` 分支**（不做这个，`rej-a-local-shadows-a-function-without-callable-fallback` 过不了）：
+
+```cpp
+if (auto* call = dynamic_cast<callExpr*>(expr); call) {
+    auto* p = dynamic_cast<pathExpr*>(call->callee_);
+    if (p == nullptr) { error("callee is not a function"); return semantic::makeError(); }
+    if (p->path_.size() != 1) return semantic::makeError();   // 2 段（Box::new / S::new）Phase 5
+    std::string name = p->path_[0].name_;
+    if (scope_.find(name)) {                                   // 局部遮蔽 → 不回退
+        error("called value is not a function : " + name);
+        return semantic::makeError();
+    }
+    auto it = table_.funcSig.find(name);
+    if (it == table_.funcSig.end()) {
+        error("unresolved function : " + name);
+        return semantic::makeError();
+    }
+    auto& sig = it->second;
+    if (call->args_.size() != sig.params_.size()) {
+        error("wrong number of arguments : " + name);
+        return semantic::makeError();
+    }
+    for (size_t i = 0; i < call->args_.size(); ++i) {
+        expect(call->args_[i], sig.params_[i]);
+    }
+    return sig.retType_;
+}
+```
+
+两个小提醒：
+
+- `infer` 的 2 段 path 分支里，`Self::N` 要加 `if (currentStruct_.empty()) error("Self outside impl")`，否则在顶层函数里会退化成查顶层常量；
+- `lookupValue` 里 `scope_.memory_` 那段虽然现在判了 `empty()`，直接用你 `scopeStack::find` 更省事。
+
+补完跑 `make test FILTER=official:semantic:names-and-shadowing STAGE=semantic`，预期 `rej-unresolved-value-name`、`rej-a-binding-is-invisible-in-its-own-initializer`、`rej-a-block-local-name-cannot-escape`、`rej-a-local-shadows-a-function-without-callable-fallback` 都能过了（另一个 `rej-self-outside-a-method` 要等 `self` 的 path 处理，`rej-named-field-structs-are-not-callable-constructors` 要等 struct 构造，Phase 5）。
 
 ---
 
 ## User
 
-既然可以 Self，那我的参数就要传一个 currentStruct 了吧？以及，Box 和 Vec 有什么特别需要注意的吗？
+我把除了 infer 的 callExpr 都写了，你看看有没有问题。把 callExpr 补上之后，名称解析就差不多了吗？
 
 ---
 
-## Assistant (Build · DeepSeek V4.1 Flash · 23.4s)
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 13.3s)
 
 _Thinking:_
 
-The user asks:
-1. Since `Self` is allowed, the evaluator needs a `currentStruct` parameter (or member)?
-2. What's special about Box and Vec in this context (collect/const eval/type resolution)?
+The user says they wrote everything except infer's callExpr branch. They ask me to review, and whether adding callExpr completes name resolution.
 
-Context: they're implementing collect step 2/3, `manifestConstInt` (const eval), transformType.
-
-1. self/Self context:
-- The `Checker` already has `std::string currentStruct_` member. So no extra parameter needed — just set it appropriately:
-  - When resolving an impl's associated items (signatures and const initializers): currentStruct_ = impl target struct name.
-  - When resolving a struct's own fields and const... wait, structs don't have consts. Struct fields may use `Self` (`struct Node { children: Vec<Self> }`) → currentStruct_ = struct name when resolving its fields.
-  - Top-level functions: currentStruct_ empty; `Self` → error (rej-self-outside-a-struct-impl).
-- Evaluation timing: step 2 evaluates all constants. For assoc consts, set currentStruct_ to the owner struct while evaluating its initializer, then restore. Since the evaluator is called recursively across consts (A::B), the owner context must be switched per const being evaluated — careful: when evaluating `Config::N` from inside `Test::X`, after entering N's initializer, Self should mean Config (N's owner), not Test. So save/restore currentStruct_ around each const's evaluation, setting it to that const's owner. Top-level consts get currentStruct_ = "" (empty).
-- transformType also uses currentStruct_ for Self in types (impl signatures, struct fields) — same member, save/restore when descending into impls/structs.
-
-So answer: use the existing `currentStruct_` member; don't pass as parameter (they already have it). Or if they want pure function purity, pass owner explicitly; but member with save/restore is fine. Provide the discipline: save old, set, work, restore (RAII/scope guard or manual).
-
-2. Box/Vec special notes (for collect/type resolution/eval):
-- They're builtin generic containers, `makeNamedType` maps `Box`/`Vec` with exactly 1 type arg to BOX/VEC kinds in AST; transformType recursively resolves elem.
-- In type resolution: `Box<T>`/`Vec<T>` require exactly one concrete type argument. Missing or multiple args? The AST builder: `makeNamedType(name, types)` only treats as BOX/VEC if `types.size() == 1`; if `Box` with 0 or 2 args → falls into else → STRUCT("Box")! That's a subtle trap: `Box` with wrong arg count becomes STRUCT("Box"), which will fail existence check in transformType (good, error). Also bare `Box` type is unsupported. Tests guarantee explicit concrete type args (omitting them in constructors is UB). For type positions, `Box`/`Vec` without args — probably CE or UB? Constructors require explicit args (UB if omitted: `Box::new(...)` without turbofish). For type annotations, `Box` alone would be unsupported syntax → error via struct existence check. OK.
-- Vec/Box are protected type names: can't `impl Box`/`impl Vec` (kind != STRUCT catches at collect). Can't be struct names (UB for Box/Vec; compiler needn't check).
-- Recursive layout: Box/Vec break by-value cycles (phase 5).
-- Const eval: Box/Vec have **no associated constants**, so `Vec::<i32>::N` in a const path is an error; and `Box::<i32>::new` is a function, not const → error in const context. So in const PATH splitting, if owner is Box/Vec → error.
-- Type equality: BOX/VEC compare by elem recursively; no isMut.
-- Method calls: Vec does not deref; Box derefs (phase 5). Not now.
-- `Self` in container type args: `struct Node { children: Vec<Self> }` — transformType must handle Self inside elem recursion (currentStruct_ needed).
-- In expressions: `Box::<T>::new`/`Vec::<T>::new` are 2-segment paths with the first segment carrying types_; check phase will special-case; `Box::<T>::clone` is a method call (`Box::<T>::clone` as a call with self arg? Actually `Box::<i32>::clone` appears in tests — 2-segment path used as assoc function? Let me check how it's used: probably `Box::<i32>::clone(&x)`? Hmm, in test: `Box::<i32>::clone` count 2. Let me see the context. It might be `let b = Box::<i32>::clone(&a);` — an associated function form of clone with explicit receiver. Interesting: so Box has assoc fn `clone(&self?)`... Actually in Rust, `Clone::clone(&x)`; here `Box::<i32>::clone(&a)` likely. That's phase 5 (methods). For now, note that Box/Vec assoc items are builtin special-cases, not in tables.
-- In collect: don't register Box/Vec impls; don't need entries in structSig for them; lookupType("Box") shouldn't be needed for resolution because AST has BOX kind directly.
-
-Also, manifestConstInt for array length: `[Box<i32>; N]` fine; elem transformType handles BOX recursively.
-
-Keep answer focused:
-1. currentStruct_: yes — but you already have the member; use save/restore. Specify where to set: struct fields (Self allowed), impl (signatures + assoc consts), top-level stays empty. For const eval recursion, per-const owner switching.
-2. Box/Vec:
-   - AST already distinguishes kind BOX/VEC only when exactly 1 type arg; wrong arg count silently becomes STRUCT("Box") → your struct existence check will reject (good). Actually `Box` with 0 args: makeNamedType("Box", {}) → else branch STRUCT name "Box"; transformType STRUCT check: table_.structSig lacks "Box" → error. Good.
-   - No impl allowed (kind != STRUCT catches `impl Box`).
-   - No associated constants → const path `Box::...`/`Vec::...` → error; constructors `new` are functions, invalid in const context.
-   - transformType must recurse elem; Self can appear inside (`Vec<Self>`).
-   - equality by elem; Vec doesn't deref for method lookup; Box derefs.
-   - For check phase later: `Box::<T>::new`/`Vec::<T>::new` are special-cased in 2-segment path resolution; turbofish types_ carried in pathSeg.
-   - Omitting turbofish UB (tests exclude); no need to handle.
-
-Also mention: in `manifestConstInt`, PATH with owner "Box"/"Vec" → error; owner "Self" → currentStruct_.
-
-Keep concise. The user asked two questions; answer both with practical guidance.
-
-**1. `Self` 需要 currentStruct_，但你已经有这个成员了**（checker.h 里的 `std::string currentStruct_`），不用加参数，只要在"进入有 Self 语义的区域"时保存/设置/恢复：
-
-```text
-解析 struct S 自己的字段时      → currentStruct_ = "S"   （struct Node { children: Vec<Self> } 合法！）
-解析 impl X 的签名/常量类型时    → currentStruct_ = "X"
-顶层函数/顶层常量                → currentStruct_ = ""    （遇到 Self 就是 rej-self-outside-a-struct-impl）
-```
-
-求值关联常量时特别容易踩坑：`impl Test { const X = Config::N; }` 求值 `N` 的初始化式时，`Self` 应该指 **Config**（N 的 owner），不是 Test。所以递归进入每个 const 求值前，把 `currentStruct_` 换成"**那个 const 的 owner**"（顶层常量置空），出来再恢复。保存旧值 + 恢复别忘，或者写个 RAII guard。
-
-**2. Box/Vec 的特别之处**（对 collect 和求值而言）：
-
-- **AST 里它们已经是独立 kind**，不用担心名字解析：`makeNamedType` 只有"名字是 Box/Vec **且恰好 1 个类型实参**"才造 BOX/VEC，否则落进 STRUCT 分支。比如裸 `Box`（0 个实参）会变成 `STRUCT("Box")`，你 pass 3 的 struct 存在性检查会自然报错——歪打正着，不用特判。
-- **不能 impl**：`impl Box<i32>`/`impl Vec<i32>` 的 kind 不是 STRUCT，你 collect 已经拒了。
-- **没有关联常量**：所以常量 PATH 里出现 `Box::...` / `Vec::...`（如 `Box::<i32>::new`）一律报错——那是函数/构造器，不是常量。求值器里 owner 是 Box/Vec 直接 error 即可。
-- **transformType 要递归 elem**，而且 elem 里可能出现 `Self`（`Vec<Self>`），所以上面 currentStruct_ 的纪律在 Box/Vec 递归里同样生效。
-- **类型等值**：BOX/VEC 只比 `elem_`，没有 mut；`Box<T>` 与 `Box<U>` 相等当且仅当 T==U。
-- **内建关联项是特判**，不进你的表：`Box::<i32>::new` / `Vec::<i32>::new`（2 段路径，turbofish 在第一段）后面在 check 阶段特殊解析；`Box::<i32>::clone(&x)` 这种也是内建特判，collect 阶段完全不用管。
-- **方法查找差异**（等 Phase 5）：Box 会自动解引用，Vec 不会；turbofish 省略是 UB，测试不会有，不用写检查。
-
-总结给你现在的代码：`transformType` 里 STRUCT 分支补"`Self` → currentStruct_、其他查 structSig"；常量求值器里 PATH 的 owner 是 `Self` 就用 currentStruct_、是 Box/Vec 报错、其他查 `associatedConsts`。
-
----
-
-## User
-
-我们打断一下，刚刚我 Code Review 完了，助教说我写得没什么问题，不过我需要确认我的 AST 写的是对的，请你把我的 AST 部分单独挑出来（你可以在 opencode/tmp 下操作操作），想办法确认我写的是对的，或者哪里写错了。
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 26.5s)
-
-_Thinking:_
-
-The user says: Code Review done, TA said no problems. Now they need to confirm their AST (builder) is correct. They ask me to "把我的 AST 部分单独挑出来（你可以在 opencode/tmp 下操作操作），想办法确认我写的是对的，或者哪里写错了。"
-
-So the task: verify the AST builder (ast_builder.cpp/h, ast.h) is correct. The way to confirm: run the compiler with --dump-ast on a comprehensive set of test programs and check the dumps make sense, plus write targeted test programs to exercise every grammar production, and compare AST output with expected structure. Since we can't compare against a reference AST implementation, we can:
-1. Verify all 236 semantic testcases don't crash when dumping AST (smoke).
-2. Write custom mini-programs covering every grammar feature, dump AST, manually inspect that each node is correct.
-3. Look for known bug patterns: missing children, wrong static_cast (bad_any_cast would crash), not visiting children, etc.
-
-The user says I can work in /tmp/opencode (they wrote "opencode/tmp" but the system says /tmp/opencode). "把我的 AST 部分单独挑出来" — extract the AST part separately? Maybe they mean: isolate the AST components (ast.h, ast_dump.h, ast_builder.cpp/h, main.cpp dump path) into a standalone test harness in /tmp/opencode, compile it, and run tests to verify. Or they mean "pick out the AST portion [of the compiler pipeline] and test it" — i.e., verify AST building alone (parse → AST → dump) on many cases.
-
-Possible approach: Use the existing build; rxcc already has --dump-ast. So "isolate AST" = avoid semantic stage interference; the current main.cpp runs Checker after dump but that doesn't affect dump correctness (dump happens before). But collect errors print to stderr; fine.
-
-"你可以在 opencode/tmp 下操作操作" — they allow me to create files under /tmp/opencode. So plan:
-1. Create a test corpus of small .rx files in /tmp/opencode/ast-check/, each covering specific grammar constructs, with expected AST structures (or at least manually inspectable).
-2. Run ./target/build/rxcc --stage semantic --dump-ast on each, capture output.
-3. Analyze dumps for correctness: check that all constructs appear, children wired correctly, no crashes/bad_any_cast, no missing nodes.
-4. Also run the full official semantic suite dump smoke test to check for crashes (the earlier smoke test in log.md did that; run again).
-5. Report findings: things that are correct, things that are wrong.
-
-But wait: the user asks "确认我写的是对的，或者哪里写错了" — find bugs if any. We should look carefully at ast_builder.cpp for the AST part. It's 2964 lines with many visit functions. Reading all of it is heavy but possible in chunks; better to test empirically with targeted programs and inspect dumps. Since dump uses dynamic_cast on the node types, a wrong child pointer could still dump "Expr?" or missing lines.
-
-Also, we should test the trickier grammar constructs:
-- operator precedence/associativity (binary left/right)
-- assignment/compound assignment
-- unary -/!/&/&&/&mut/deref
-- cast chains (a as T as U)
-- postfix chains: field, index, method call, call
-- if/else if/else, block tails, while, loop, break with/without value, return, continue
-- statements: let with annotation/init, exprStmt with and without semicolon, empty stmt
-- literals: int (suffix/radix/underscore), bool, unit
-- struct init (fields, trailing comma), struct expr with path? `Same { x: ... }`
-- arrays: literal `[1,2]`, repeat `[v; N]`, empty? (empty array is UB)
-- const values: INT/BOOL/PATH/NEG/parens
-- types: builtin, struct, Box, Vec, nested Box<Vec<i32>>, refs `&T`, `&mut T`, `&&T` (ANDAND), `&&mut T`, arrays `[T; N]`, `()`, parenthesized types `(T)`
-- paths: `Self::X`, `Config::N`, generic turbofish `Vec::<i32>::new`, `Box::<i32>::new`
-- impl with methods and consts, `impl (S)`
-- generic params/where/lifetimes (should be discarded; verify they don't end up as weird children or crash)
-- use declarations discarded
-- outer attributes/derives captured
-- selfParam forms: self, mut self, &self, &'a self, &mut self, &'a mut self
-- function without params/return
-- statement boundaries: `if true {} else {} -1;` vs `let value = if true {10} else {20} - 1;`
-
-Additionally, verify the visitor returns exact base-type pointers (log.md lesson #12); test cases that previously crashed.
-
-Approach: build a comprehensive test file set in /tmp/opencode/ast-check/*.rx, each with a header comment describing expected AST, then run and compare. I'll inspect dumps and flag anomalies.
-
-Also, I could write a small Python script that parses the dump output and validates basic structural invariants:
-- No "Expr?" / "Stmt?" / "Item?" / "Type ?" unknown nodes.
-- Every Binary has 2 children; every Unary/Ref/Deref has 1; Call has callee + args; etc.
-But without expected mappings, invariants still help. Better: handcraft expected dump for a few key cases.
-
-Another strong check: compare parse-tree dump (--dump-tree) with AST dump for precedence-sensitive expressions. E.g., `1 + 2 * 3` → Binary + with rhs Binary *. `a - b - c` → left assoc. Can verify.
-
-Also check potential bugs I can spot by reading ast_builder.cpp. 2964 lines is long; I can grep for `throw` stubs and check they're unreachable:
-- `visitUseTree`, `visitUsePath`, `visitUsePathSegment` throw — but use is discarded? Let me check visitUseDeclaration: probably does nothing/returns null. If useDeclaration visitor calls children, it would throw. Let me check.
-- `visitGenericParams`, `visitLifetimeParam`, `visitLifetime`, `visitLifetimeBounds`, `visitWhereClause`, `visitWhereClauseItem` throw — are they called via visitChildren from functions? e.g., visitFunctionDefinition doesn't call visitChildren, it visits specific fields, so those stubs are not reached. But genericParams are ignored. OK.
-- `visitStructField`/`visitOuterAttribute`/`visitDeriveName` throw but are "compressed" (handled inline by parents).
-- `visitTypePathSegment`, `visitPathExprSegment`, `visitPathIdentSegment`, `visitGenericArgs`, `visitGenericArg`, `visitIdentifierBinding`, `visitLiteralExpression` maybe throw stubs; need to check callers don't call visit on them.
-- There might be remaining `throw "visitIdentifier"` etc. Let me grep all throws and verify they're unreachable from the parse flow.
-
-The user has run the smoke test: 236 semantic cases with --dump-ast no crashes (log.md says done). So `throw` stubs aren't hit by those tests. But new constructs might hit them.
-
-Plan of action:
-1. Create /tmp/opencode/ast-check corpus (~15-25 files) covering all grammar features.
-2. Run rxcc --dump-ast on each; save outputs to /tmp/opencode/ast-check/out/.
-3. Write expected ASTs for a few crucial ones and diff manually (as AI, I inspect outputs).
-4. Report: found bugs or confirmation.
-
-Since this is a big task, I should use the todo list? The instructions say use todowrite for multi-step tasks. This is multi-step. Let me create a todo list:
-- Inventory grammar constructs to cover
-- Create corpus
-- Run dumps
-- Verify dumps against expected
-- Report
-
-Also the user said "把我的 AST 部分单独挑出来" — maybe they literally want me to extract AST-related files into /tmp/opencode and build a standalone tool? That'd be more work and unnecessary; the existing rxcc already supports --dump-ast without semantic effects. But "单独挑出来" might mean "isolate the AST portion [for verification]". I'll interpret as verifying the AST stage in isolation (parse→AST→dump), which is exactly --dump-ast. I'll explain that and proceed. I shouldn't modify their repo files (earlier instruction: this session no modifications — though later turns allowed temp writes; they explicitly allow /tmp/opencode). I'll only write under /tmp/opencode.
-
-Let me start.
-
-First, let me check the current build is up to date (it is, built after their latest collect changes). The AST builder changes? git status showed ast.h modified. Let me check git diff for ast.h to see what changed; maybe relevant.
-
-Let me begin with a quick look at remaining `throw` stubs in ast_builder.cpp and which visit functions are stubs, plus check visitUseDeclaration. Then corpus.
-
-Let me grep throw lines with context.
-
-**Tool: todowrite**
-
-**Input:**
-```json
-{
-  "todos": [
-    {
-      "content": "盘点 ast_builder.cpp 里剩余的 throw stub 与可疑 visit 实现",
-      "status": "in_progress",
-      "priority": "high"
-    },
-    {
-      "content": "在 /tmp/opencode/ast-check 构造覆盖全部语法的 .rx 语料",
-      "status": "pending",
-      "priority": "high"
-    },
-    {
-      "content": "跑 --dump-ast 全量抓输出并做结构不变量检查",
-      "status": "pending",
-      "priority": "high"
-    },
-    {
-      "content": "逐例人工核对关键 AST（优先级、结合性、语句边界、类型、常量、路径）",
-      "status": "pending",
-      "priority": "high"
-    },
-    {
-      "content": "报告确认结论/发现的 bug",
-      "status": "pending",
-      "priority": "medium"
-    }
-  ]
-}
-```
-
-**Output:**
-```
-[
-  {
-    "content": "盘点 ast_builder.cpp 里剩余的 throw stub 与可疑 visit 实现",
-    "status": "in_progress",
-    "priority": "high"
-  },
-  {
-    "content": "在 /tmp/opencode/ast-check 构造覆盖全部语法的 .rx 语料",
-    "status": "pending",
-    "priority": "high"
-  },
-  {
-    "content": "跑 --dump-ast 全量抓输出并做结构不变量检查",
-    "status": "pending",
-    "priority": "high"
-  },
-  {
-    "content": "逐例人工核对关键 AST（优先级、结合性、语句边界、类型、常量、路径）",
-    "status": "pending",
-    "priority": "high"
-  },
-  {
-    "content": "报告确认结论/发现的 bug",
-    "status": "pending",
-    "priority": "medium"
-  }
-]
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 13.9s)
-
-_Thinking:_
-
-Let me start by inventorying the throw stubs and suspicious implementations in ast_builder.cpp.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "grep -n \"throw \\|// Compressed\\|// Do nothing\\|// TODO\" /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/frontend/ast_builder.cpp"
-}
-```
-
-**Output:**
-```
-33:    // Do nothing, use is discarded.
-34:    throw "visitUseDeclaration";
-39:    // Do nothing, use is discarded.
-40:    throw "visitUseTree";
-45:    // Do nothing, use is discarded.
-46:    throw "visitUsePath";
-51:    // Do nothing, use is discarded.
-52:    throw "visitUsePathSegment";
-180:    // Compressed
-181:    throw "visitStructField";
-186:    // Compressed
-187:    throw "visitOuterAttribute";
-192:    // Compressed
-193:    throw "visitDeriveName";
-236:    // Do nothing, dont need to consider
-237:    throw "visitGenericParams";
-242:    // Do nothing, dont need to consider
-243:    throw "visitLifetimeParam";
-248:    // Do nothing, dont need to consider
-249:    throw "visitLifetime";
-254:    // Do nothing, dont need to consider
-255:    throw "visitLifetimeBounds";
-262:    // Do nothing, dont need to consider
-263:    throw "visitTypeParamBounds";
-268:    // Do nothing, dont need to consider
-269:    throw "visitWhereClause";
-274:    // Do nothing, dont need to consider
-275:    throw "visitWhereClauseItem";
-298:    throw "visitTypeRef";
-392:    // Compressed
-393:    throw "visitTypePathSegment";
-426:    // Compressed
-427:    throw "visitPathExprSegment";
-432:    // Compressed
-433:    throw "visitPathIdentSegment";
-438:    // Compressed
-439:    throw "visitGenericArgs";
-444:    // Compressed
-445:    throw "visitGenericArg";
-452:    // Do nothing, just to conclude Vec<Box<i32>> which >> would be recognised as >>.
-561:    // Compressed
-562:    throw "visitIdentifierBinding";
-2799:    // Compressed
-2800:    throw "visitStructExprFields";
-2810:    // Compressed
-2811:    throw "visitStructExprField";
-2841:    // Compressed
-2842:    throw "visitPostfixSuffix";
-2854:    // Compressed
-2855:    throw "visitDotSuffix";
-2866:    // Compressed
-2867:    throw "visitCallArguments";
-2877:    // Compressed
-2878:    throw "visitUnaryOperator";
-2888:    // Compressed
-2889:    throw "visitMultiplicativeOperator";
-2899:    // Compressed
-2900:    throw "visitAdditiveOperator";
-2910:    // Compressed
-2911:    throw "visitShiftRight";
-2921:    // Compressed
-2922:    throw "visitComparisonExceptLt";
-2932:    // Compressed
-2933:    throw "visitAssignmentOperator";
-2945:    // Compressed
-2946:    throw "visitEqualsSign";
-2956:    // Compressed
-2957:    throw "visitIdentifier";
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 37.6s)
-
-_Thinking:_
-
-Many throw stubs; need to verify they're unreachable in practice. The smoke test with 236 tests passed, but our new corpus will exercise more paths. Key question: does `visitUseDeclaration` get called from `visitItem`? Let me read `visitItem`, `visitCrate`, and check `visitIdentifier` usage (visitIdentifier is called? maybe not). Also `visitLiteralExpression`? Let me check some areas.
-
-Let me read the beginning of ast_builder.cpp (lines 1-40) and the expression visit functions around tricky parts. Given 2964 lines, I'll read in chunks. But first, let me strategically grep for `visit(ctx->xxx)` calls to stubbed visitors:
-- `visit(.*identifier()` etc.
-
-Actually simpler: our corpus will hit them if reachable. Let's build the corpus and run.
-
-Let me set up /tmp/opencode/ast-check. Create a bunch of .rx files. I'll write them with expected structure comments. Then run dump and check.
-
-Important: syntax must be accepted by the parser. Let me craft carefully.
-
-Corpus list:
-
-01_basic_fn.rx:
-```rust
-use rx::core::*;
-
-fn main() -> () {
-    return;
-}
-```
-
-02_literals.rx:
-```rust
-fn main() {
-    let a = 123;
-    let b = 0xFFu32;
-    let c = 0b1010_1010;
-    let d = 0o17isize;
-    let e = true;
-    let f = ();
-    let g = 1_000usize;
-}
-```
-Hmm `let f = ();` unit expression.
-
-03_operators.rx:
-```rust
-fn f(a: i32, b: i32) -> i32 {
-    let x = a + b * 2 - 3 / 4 % 5;
-    let y = a & b | a ^ b;
-    let z = a << 2 >> 1;
-    let w = a < b;
-    let v = a <= b;
-    let u = a == b;
-    let t = a != b;
-    let s = a > b && b >= a || !true;
-    let n = -a;
-    let m = !a;
-    let c = a as u32 as isize;
-    x + y + z
-}
-```
-
-04_assignment.rx:
-```rust
-fn f() {
-    let mut x = 1;
-    x = 2;
-    x += 1;
-    x -= 1;
-    x *= 2;
-    x /= 2;
-    x %= 2;
-    x &= 1;
-    x |= 1;
-    x ^= 1;
-    x <<= 1;
-    x >>= 1;
-}
-```
-
-05_refs.rx:
-```rust
-fn f(mut x: i32) {
-    let r = &x;
-    let m = &mut x;
-    let d = *r;
-    let e = **&m;  // hmm
-}
-```
-Better:
-```rust
-fn f(mut x: i32) {
-    let r = &x;
-    let m = &mut x;
-    let d = *r;
-    *m = 3;
-    let rr = &&x;
-    let rm = &&mut x;
-}
-```
-Note `&&mut x` grammar: BorrowExpression (&|&&) mut Expression. AST builder handles ANDAND in unaryExpression? Earlier grep showed lines 317, 475, 1121... unary handling. Let me be careful with syntax: `&&mut x` valid per grammar.
-
-06_control.rx:
-```rust
-fn f(c: bool) -> i32 {
-    if c { 1 } else if !c { 2 } else { 3 }
-}
-fn g(c: bool) {
-    while c { break; }
-    loop { break 42; }
-    loop { continue; }
-    if c { } else { }
-}
-```
-Hmm return type mismatch doesn't matter for AST.
-
-07_statements.rx:
-```rust
-fn f() {
-    ;
-    let x = 1;
-    let y: u32 = 2;
-    x;
-    { 1; 2 }
-    if true {} else {} -1;
-    let z = if true { 10 } else { 20 } - 1;
-}
-```
-Note `{ 1; 2 }` is exprStmt with block; then `if true {} else {} -1;` statement boundary test.
-
-Wait `{1;2}` as a statement — block with stmts and tail. Also last `let z = ... - 1;`.
-
-08_struct.rx:
-```rust
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Point {
-    x: i32,
-    y: i32,
-}
-struct Wrap {
-    p: Point,
-    b: Box<i32>,
-    v: Vec<Vec<i32>>,
-    r: &'a i32, // lifetime; hmm struct lifetime param needed? Parser accepts 'a without declaration? lifetime validity guaranteed by tests; parser accepts.
-}
-fn main() {
-    let p = Point { x: 1, y: 2, };
-    let q = Point { x: p.x, y: p.y };
-}
-```
-For lifetime param, use `struct Wrap<'a> { r: &'a i32 }` — generic params discarded, should work.
-
-09_impl.rx:
-```rust
-struct Counter { value: i32 }
-impl Counter {
-    const START: i32 = 0;
-    fn new() -> Counter { Counter { value: 0 } }
-    fn value(&self) -> i32 { self.value }
-    fn add(&mut self, delta: i32) -> () { self.value += delta; }
-    fn consume(self) -> i32 { self.value }
-    fn mutable(mut self) -> i32 { self.value }
-}
-impl (Counter) {
-    fn reset(&mut self) -> i32 { self.value = Self::START; self.value }
-}
-fn main() {}
-```
-Wait `fn mutable(mut self)` — is `mut self` allowed as shorthand? ShorthandSelf: ( & Lifetime? )? mut? self. Yes.
-
-Note `self.value = Self::START;` — assignment expression. Also `Self::START` path with Self.
-
-10_paths.rx:
-```rust
-const N: usize = 4;
-struct Config { x: i32 }
-impl Config { const LIMIT: usize = N; }
-fn leaf() -> i32 { 1 }
-fn main() {
-    let a = leaf();
-    let b = Config::LIMIT;
-    let c = Self::N;  // invalid outside impl, but AST-wise parse OK; semantic errors fine (exit 1 but AST dumped first)
-    let d = Box::<i32>::new(1);
-    let e = Vec::<i32>::new();
-    let f = Box::<i32>::clone(&d);
-    let g = a::b::c; // 3-segment to test AST dump; semantic error later — but current collect may error; dump still prints.
-}
-```
-Hmm, `a::b::c` in main: parser accepts; AST path 3 segments. Good to see dump. But collect errors to stderr; fine. Actually `Self::N` at top level → check phase; no crash.
-
-Wait `Box::<i32>::clone(&d)` — grammar pathExprSegment: `Box` PATHSEP genericArgs then segment `clone`; call args. Good.
-
-11_const.rx:
-```rust
-const A: i32 = 3;
-const B: i32 = -A;
-const C: bool = (true);
-const D: isize = -(1);
-const E: usize = 0b1_0000;
-fn main() {}
-```
-
-12_sep.rx:
-```rust
-use rx::core::*;
-
-struct S { x: i32 }
-fn S(x: i32) -> i32 { x }
-fn main() {
-    let s = S { x: S(3) };
-    println_i32(s.x);
-}
-```
-Struct/function same name positive test.
-
-13_types.rx:
-```rust
-fn f(a: i32, b: u32, c: isize, d: usize, e: bool, g: (), h: &i32, i: &mut u32, j: &&i32, k: &&mut i32, l: (i32), m: [i32; 4], n: [u32; N], o: Box<Vec<i32>>, p: Vec<Box<[i32; 2]>>) {}
-const N: usize = 4;
-```
-Note `(i32)` parenthesized type; visitTypeRef returns inner. Good.
-
-14_blocks_if_never.rx:
-```rust
-fn f(x: i32) -> i32 {
-    let v = if x < 0 {
-        return 90;
-    } else if x == 0 {
-        7
-    } else {
-        { x + 1 }
-    };
-    { v * 2 }
-}
-fn main() {
-    let x = get_i32();
-    println_i32(f(x));
-    if true {
-    } else {
-    }
-    -1;
-    if true {
-        10
-    } else {
-        20
-    };
-    let y = if true { 10 } else { 20 } - 1;
-    println_i32(y);
-}
-```
-(copied from official test)
-
-15_arrays.rx:
-```rust
-fn main() {
-    let a = [1, 2, 3];
-    let b = [0; 4];
-    let c = [[1, 2], [3, 4]];
-    let d = [element(); 3];
-    let e = [];
-    c[1][0] = 8;
-}
-```
-`[]` empty array might be UB but parse fine; let's include to test arrayExpr with 0 args? Could produce weird AST; but fine to observe. Actually empty array is excluded zero-sized; parser accepts.
-
-16_struct_expr_fields_trailing.rx maybe covered.
-
-17_weird_expr.rx:
-```rust
-fn f() {
-    let a = -1;
-    let b = !false;
-    let c = &1u32;
-    let d = &mut 1;
-    let e = *&1;
-    let f = (1 + 2) * 3;
-    let g = 1 + (2 * 3);
-    let h = (());
-}
-```
-Hmm `&mut 1` — borrow of literal; parse fine. `(())` unit in parens: `(())` expression → grouped expression containing unit expr. Good test.
-
-18_precedence.rx:
-```rust
-fn f(a: i32, b: i32, c: i32, flag: bool) {
-    let x = a + b * c;
-    let y = a * b + c;
-    let z = a - b - c;
-    let w = a / b / c;
-    let v = a < b == flag;   // comparison then eq? grammar: comparisonExpression only one op? `a < b == flag` may be parse error; avoid.
-    let u = a << b + c;      // shift lower than additive in Rust; grammar shiftExpression: additive (<< additive)*; so a << (b+c)
-    let t = flag && a < b || flag;  // lazy boolean with comparisons
-}
-```
-This tests precedence. Compare with Rust precedence: `*`/`/`/`%` > `+`/`-` > `<<`/`>>` > `&` > `^` > `|` > comparison > `&&` > `||` > assignment. Grammar likely follows. We'll inspect dump.
-
-19_if_expr_assignment_binding etc. covered.
-
-20_method_fields_chains.rx:
-```rust
-fn main() {
-    let s = S { x: 1 };
-    let a = s.x;
-    let b = s.get().x;
-    let c = s.get().get();
-    let d = S::new().changed().value();
-    let e = f(1, 2)(3);  // call of call — probably not valid Rust/Rx; avoid.
-}
-```
-`f(1,2)(3)` not valid in Rx (no function values); avoid.
-
-21_parenthesized_impl.rx (official acc):
-```rust
-struct S { x: i32 }
-impl (S) {
-    fn f(&self) -> i32 { self.x }
-}
-fn main() {}
-```
-
-22_keywords_lifetimes_where.rx:
-```rust
-struct View<'a> {
-    value: &'a i32,
-}
-impl<'b> View<'b> {
-    fn get<'c>(&'c self) -> &'b i32
-    where 'b: 'c
-    {
-        self.value
-    }
-}
-fn f<'a>(x: &'a i32) -> &'a i32 where 'a: 'static {
-    x
-}
-fn main() {}
-```
-This tests lifetime/generic/where discarding: impl target `View<'b>` — hmm! `impl<'b> View<'b>`: visitInherentImpl visits ctx->typeRef() which is typePath View with genericArgs lifetime? `genericArg: lifetime | typeRef`; lifetime args are skipped (visitTypePath only pushes if elem->typeRef() non-null). So type_ = named type "View" with no types_ → makeNamedType("View", {}) → STRUCT "View" (since not Box/Vec). Good.
-
-But `fn get<'c>(&'c self)` — selfParam with lifetime. Should work.
-
-23_shifts.rx separate? covered in operators.
-
-24_struct_expr_path.rx? `Same { ... }` covered.
-
-Also test statement boundary `{ make() }.value;`:
-```rust
-struct R { value: i32 }
-fn make() -> R { R { value: 1 } }
-fn main() {
-    { make() }.value;
-}
-```
-Hmm `{ make() }.value;` — block expr followed by dot: grammar `expressionWithBlock dotSuffix postfixSuffix*` in statementPostfixExpression. This is a good edge case.
-
-25_empty_main.rx: `fn main() {}`.
-
-I also want to verify:
-- `return expr`, `break expr`, `continue`
-- unit expression `()` and unit type `()`
-- cast precedence: `a as u32 as isize` should be Cast(Cast(a,u32),isize)
-- unary `-a as i32`? grammar castExpression: unaryExpression (AS typeRef)*; so `-a as i32` = Cast(Unary(-,a), i32)? In Rust, `-x as i32` = -(x as i32)?? Actually Rust: unary minus binds tighter than `as`? In Rust, `as` has higher precedence than unary minus? Rust reference: unary `-` has higher precedence than `as`. Hmm: `-1 as u8` parses as `(-1) as u8`. Yes, unary first. The grammar: castExpression : unaryExpression (AS typeRef)* — so operand of as is a unaryExpression → -a as i32 = (-a) as i32. Good.
-
-Also `!a as bool`? bool cast invalid semantically.
-
-Let me also test `&x as *const`? no raw pointers in Rx.
-
-Let me create the corpus now. I'll write files via the write tool to /tmp/opencode/ast-check/. Wait, the write tool requires absolute path; /tmp/opencode exists. Good. But maybe faster to use a single bash heredoc? The instructions prefer Write tool over heredocs. I'll use write for each file — that's ~20 tool calls; I can batch multiple write calls in one message (parallel). But each write is a separate tool call; I can do a few messages with several writes each.
-
-Actually, maybe more efficient: a single bash script creating all files. The guidance says use Write tool instead of echo/cat heredoc for file creation. But for ~20 small files, using Write is cleaner? That's 20 calls. Hmm. Alternatively, write one Python script? Overkill.
-
-I'll batch write calls: 6-8 per message in parallel. Let's do it.
-
-Before that, note: the user asked "把我的 AST 部分单独挑出来" — maybe they want me to copy ast.h/ast_dump.h/ast_builder.*/main.cpp into /tmp/opencode and compile a standalone AST dumper. But the existing binary already does exactly this (dump before semantics). I'll mention that I used the existing binary's --dump-ast path, which is precisely the AST stage in isolation (dump happens before Checker). That satisfies the request without duplicating the build.
-
-One more consideration: parser must accept these. Some of my corpus entries may be invalid Rust/Rx (e.g., `let e = [];`, `let c = Self::N;` top-level) but the parser (g4) accepts. Semantic errors may print to stderr and exit 1, but AST is dumped. Good. But careful: main.cpp returns 1 if parser/listener errors (syntax). So keep syntax valid per g4.
-
-Potential g4 pitfalls:
-- `where` clauses: `fn f<'a>(x: &'a i32) -> &'a i32 where 'a: 'static { x }` — grammar: FunctionReturnType? WhereClause? BlockExpression. where after return type. OK.
-- method `fn get<'c>(&'c self) -> &'b i32 where 'b: 'c { ... }` — genericParams on function, selfParam with lifetime. OK.
-- struct lifetime `struct View<'a> { value: &'a i32, }`.
-- `impl<'b> View<'b> { ... }` — inherentImpl: IMPL genericParams? typeRef whereClause? LBRACE ...; `View<'b>` typeRef with generic lifetime arg. OK.
-- `let e = [];` arrayExpression: LBRACKET RBRACKET? grammar `arrayExpression: LBRACKET arrayElements? RBRACKET` or similar; `[]` should parse. The g4: earlier `ArrayExpression → [ ArrayElements ]?`... From spec: ArrayExpression → [ ArrayElements? ]. OK.
-- `let t = flag && a < b || flag;` — condition vs statement expression grammar: bitOr etc. Should parse: `flag && a < b` — comparison inside `&&` operand. In Rust, `a < b && c` parses because comparison has higher precedence than `&&`. Grammar: logicalAnd over comparison? Need care but likely fine.
-- `let c = Self::N;` at top-level function — pathInExpression accepts SELF_TYPE. OK.
-- `a::b::c` — pathExprSegment chain; but `a::b::c` with lowercase; parser accepts; AST 3 segments. However, is there a chance the *parser* rejects because `a` unknown? No, parser doesn't do names.
-- `let g = (());` — primary `( expression? )` grouped; inner `()` unit. fine.
-- `let d = &mut 1;` — BorrowExpression `& mut Expression`; literal primary without block; fine.
-- `let r = &&x;` and `&&mut x` in 05 — unary expression ANDAND.
-- `*m = 3;` statement assignment: statementAssignmentExpression handles `*m = 3`? Grammar statement variants exist (statementAssignmentExpression etc.). Yes.
-- `x <<= 1;` compound assignment in statement grammar? compoundAssignmentExpression covered by statement kinds. The g4 seems to have statement* families. OK.
-- `s.get().x` field after method call.
-- `{ make() }.value;` statementPostfixExpression handles expressionWithBlock dotSuffix. OK.
-- `S { x: S(3) }` struct expr with call value.
-- 08 struct with `#[derive(Clone, Copy, PartialEq, Eq)]` — derive names tokens. OK.
-- `let v = -(1);` const value NEG with parens.
-- `const D: isize = -(1);` OK.
-- 13 types: `(i32)` parenthesized type; `&&mut i32` referenceType ANDAND mut. `[u32; N]` array with const path. `Box<Vec<i32>>`. `Vec<Box<[i32; 2]>>`. Function has no self but is at top level. OK.
-- 11 const `const C: bool = (true);` paren const. And AST builder stores BOOL text as "TRUE". We'll see "ConstBool TRUE".
-
-Also test `#[derive(...)]` on struct with derives.
-
-Let me also add a test for bool literal `false` → "ConstBool FALSE"? In expressions boolLitExpr dumps false. In const value, text "FALSE".
-
-Also test int with suffix in expression: `let b = 0xFFu32;` — intLitExpr value_ stores raw text? Let me check visitLiteralExpression. Need to look. Dump shows `IntLit 0xFFu32`.
-
-OK. Let me create corpus. I'll do parallel writes. Use /tmp/opencode/ast-check/.
-
-Let me write files 01-08 first.
-
-Now let me build a comprehensive AST test corpus under `/tmp/opencode` (no repo changes). First batch:
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "filePath": "/tmp/opencode/ast-check/01_basic_fn.rx",
-  "content": "use rx::core::*;\n\nfn main() -> () {\n    return;\n}\n"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "filePath": "/tmp/opencode/ast-check/02_literals.rx",
-  "content": "fn main() {\n    let a = 123;\n    let b = 0xFFu32;\n    let c = 0b1010_1010;\n    let d = 0o17isize;\n    let e = true;\n    let f = ();\n    let g = 1_000usize;\n    let h = false;\n}\n"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "filePath": "/tmp/opencode/ast-check/03_operators.rx",
-  "content": "fn f(a: i32, b: i32) -> i32 {\n    let x = a + b * 2 - 3 / 4 % 5;\n    let y = a & b | a ^ b;\n    let z = a << 2 >> 1;\n    let w = a < b;\n    let v = a <= b;\n    let u = a == b;\n    let t = a != b;\n    let s = a > b && b >= a || !true;\n    let n = -a;\n    let m = !a;\n    let c = a as u32 as isize;\n    x + y + z\n}\n"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "filePath": "/tmp/opencode/ast-check/04_assignment.rx",
-  "content": "fn f() {\n    let mut x = 1;\n    x = 2;\n    x += 1;\n    x -= 1;\n    x *= 2;\n    x /= 2;\n    x %= 2;\n    x &= 1;\n    x |= 1;\n    x ^= 1;\n    x <<= 1;\n    x >>= 1;\n}\n"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "filePath": "/tmp/opencode/ast-check/05_refs.rx",
-  "content": "fn f(mut x: i32) {\n    let r = &x;\n    let m = &mut x;\n    let d = *r;\n    *m = 3;\n    let rr = &&x;\n    let rm = &&mut x;\n}\n"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "filePath": "/tmp/opencode/ast-check/06_control.rx",
-  "content": "fn f(c: bool) -> i32 {\n    if c { 1 } else if !c { 2 } else { 3 }\n}\nfn g(c: bool) {\n    while c { break; }\n    loop { break 42; }\n    loop { continue; }\n    if c { } else { }\n}\n"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "filePath": "/tmp/opencode/ast-check/07_statements.rx",
-  "content": "fn f() {\n    ;\n    let x = 1;\n    let y: u32 = 2;\n    x;\n    { 1; 2 }\n    if true {} else {} -1;\n    let z = if true { 10 } else { 20 } - 1;\n}\n"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "filePath": "/tmp/opencode/ast-check/08_struct.rx",
-  "content": "#[derive(Clone, Copy, PartialEq, Eq)]\nstruct Point {\n    x: i32,\n    y: i32,\n}\nstruct Wrap<'a> {\n    p: Point,\n    b: Box<i32>,\n    v: Vec<Vec<i32>>,\n    r: &'a i32,\n}\nfn main() {\n    let p = Point { x: 1, y: 2, };\n    let q = Point { x: p.x, y: p.y };\n}\n"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 16.2s)
-
-_Thinking:_
-
-Continue with the second batch of corpus files: 09_impl, 10_paths, 11_const, 12_sep, 13_types, 14_blocks_if_never, 15_arrays, 16_weird_expr, 17_precedence, 18_chains, 19_lifetimes_where, 20_stmt_boundary.
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "content": "struct Counter { value: i32 }\nimpl Counter {\n    const START: i32 = 0;\n    fn new() -> Counter { Counter { value: 0 } }\n    fn value(&self) -> i32 { self.value }\n    fn add(&mut self, delta: i32) -> () { self.value += delta; }\n    fn consume(self) -> i32 { self.value }\n    fn withMut(mut self) -> i32 { self.value }\n}\nimpl (Counter) {\n    fn reset(&mut self) -> i32 { self.value = Self::START; self.value }\n}\nfn main() {}\n",
-  "filePath": "/tmp/opencode/ast-check/09_impl.rx"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "content": "const N: usize = 4;\nstruct Config { x: i32 }\nimpl Config { const LIMIT: usize = N; }\nfn leaf() -> i32 { 1 }\nfn main() {\n    let a = leaf();\n    let b = Config::LIMIT;\n    let c = Self::N;\n    let d = Box::<i32>::new(1);\n    let e = Vec::<i32>::new();\n    let f = Box::<i32>::clone(&d);\n    let g = a::b::c;\n}\n",
-  "filePath": "/tmp/opencode/ast-check/10_paths.rx"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "content": "const A: i32 = 3;\nconst B: i32 = -A;\nconst C: bool = (true);\nconst D: isize = -(1);\nconst E: usize = 0b1_0000;\nfn main() {}\n",
-  "filePath": "/tmp/opencode/ast-check/11_const.rx"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "content": "use rx::core::*;\n\nstruct S { x: i32 }\nfn S(x: i32) -> i32 { x }\nfn main() {\n    let s = S { x: S(3) };\n    println_i32(s.x);\n}\n",
-  "filePath": "/tmp/opencode/ast-check/12_sep.rx"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "content": "const N: usize = 4;\nfn f(a: i32, b: u32, c: isize, d: usize, e: bool, g: (), h: &i32, i: &mut u32, j: &&i32, k: &&mut i32, l: (i32), m: [i32; 4], n: [u32; N], o: Box<Vec<i32>>, p: Vec<Box<[i32; 2]>>) {}\n",
-  "filePath": "/tmp/opencode/ast-check/13_types.rx"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "content": "fn f(x: i32) -> i32 {\n    let v = if x < 0 {\n        return 90;\n    } else if x == 0 {\n        7\n    } else {\n        { x + 1 }\n    };\n    { v * 2 }\n}\nfn main() {\n    let x = get_i32();\n    println_i32(f(x));\n    if true {\n    } else {\n    }\n    -1;\n    if true {\n        10\n    } else {\n        20\n    };\n    let y = if true { 10 } else { 20 } - 1;\n    println_i32(y);\n}\n",
-  "filePath": "/tmp/opencode/ast-check/14_blocks_if_never.rx"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "content": "fn element() -> i32 { 4 }\nfn main() {\n    let a = [1, 2, 3];\n    let b = [0; 4];\n    let c = [[1, 2], [3, 4]];\n    let d = [element(); 3];\n    c[1][0] = 8;\n    let lone = [Box::<i32>::new(5); 1];\n}\n",
-  "filePath": "/tmp/opencode/ast-check/15_arrays.rx"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "content": "fn f() {\n    let a = -1;\n    let b = !false;\n    let c = &1u32;\n    let d = &mut 1;\n    let e = *&1;\n    let f = (1 + 2) * 3;\n    let g = 1 + (2 * 3);\n    let h = (());\n}\n",
-  "filePath": "/tmp/opencode/ast-check/16_weird_expr.rx"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 15.9s)
-
-_Thinking:_
-
-Now the third batch: 17_precedence, 18_chains, 19_lifetimes_where, 20_stmt_boundary, 21_casts_unary, 22_break_return_values, 23_nested_blocks, 24_derefs.
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "content": "fn f(a: i32, b: i32, c: i32, flag: bool) {\n    let x = a + b * c;\n    let y = a * b + c;\n    let z = a - b - c;\n    let w = a / b / c;\n    let u = a << b + c;\n    let t = flag && a < b || flag;\n    let r = a & b ^ c | a;\n    let q = a < b;\n}\n",
-  "filePath": "/tmp/opencode/ast-check/17_precedence.rx"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "content": "struct S { x: i32 }\nimpl S {\n    fn new() -> S { S { x: 0 } }\n    fn get(&self) -> S { S { x: self.x } }\n    fn changed(&mut self) -> &mut S { self }\n    fn value(&self) -> i32 { self.x }\n}\nfn main() {\n    let s = S { x: 1 };\n    let a = s.x;\n    let b = s.get().x;\n    let c = S::new().changed().value();\n}\n",
-  "filePath": "/tmp/opencode/ast-check/18_chains.rx"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "content": "struct View<'a> {\n    value: &'a i32,\n}\nimpl<'b> View<'b> {\n    fn get<'c>(&'c self) -> &'b i32\n    where 'b: 'c\n    {\n        self.value\n    }\n}\nfn f<'a>(x: &'a i32) -> &'a i32 where 'a: 'static {\n    x\n}\nfn main() {}\n",
-  "filePath": "/tmp/opencode/ast-check/19_lifetimes_where.rx"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "content": "struct R { value: i32 }\nfn make() -> R { R { value: 1 } }\nfn main() {\n    { make() }.value;\n    if true { 1 } else { 2 } - 3;\n    while false { 1 } - 2;\n}\n",
-  "filePath": "/tmp/opencode/ast-check/20_stmt_boundary.rx"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "content": "fn f(a: i32, b: bool) {\n    let x = (a + 1) * (a - 1);\n    let y = a + 1 as u32;\n    let z = -a as isize as usize;\n    let w = !b && !(a == 1);\n    let v = a % 2 == 1 && b;\n}\n",
-  "filePath": "/tmp/opencode/ast-check/21_casts_unary.rx"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "content": "fn f() -> i32 {\n    loop {\n        if true {\n            break 1;\n        } else {\n            continue;\n        }\n    }\n    return 2;\n}\nfn g() {\n    loop { break; }\n    loop { break (); }\n    return;\n}\n",
-  "filePath": "/tmp/opencode/ast-check/22_break_return.rx"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "content": "fn f() {\n    {\n        let x = 1;\n        {\n            let y = x;\n        }\n    }\n}\n",
-  "filePath": "/tmp/opencode/ast-check/23_nested_blocks.rx"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "content": "fn f(p: &i32, q: &mut i32, b: Box<i32>) {\n    let a = *p;\n    *q = a;\n    let c = *b;\n    let d = **&p;\n}\n",
-  "filePath": "/tmp/opencode/ast-check/24_derefs.rx"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 16.0s)
-
-_Thinking:_
-
-Now run all files through rxcc --dump-ast, save outputs, and check for crashes/syntax errors. Let me run a loop capturing stdout to .ast files and stderr to .err, with exit code. Note: parser errors → exit 1 with "syntax error" in stderr; AST may not print (if listener.hasError, return before dump). We need to distinguish syntax errors from semantic errors. Semantic errors still dump AST.
-
-Let me write a small script in /tmp/opencode/ast-check/run.sh or just run inline. I'll run inline with a for loop and report status. Since outputs may be long, save to files and then inspect.
-
-Command:
-```bash
-cd /tmp/opencode/ast-check
-for f in *.rx; do
-  /mnt/c/.../target/build/rxcc --stage semantic --dump-ast "$f" >"${f%.rx}.ast" 2>"${f%.rx}.err"
-  echo "$? $f"
-done
-```
-Then check which have syntax errors (stderr containing "syntax error" or empty .ast).
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cd /tmp/opencode/ast-check && CPU=./placeholder; RXCC=\"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/target/build/rxcc\"; for f in *.rx; do \"$RXCC\" --stage semantic --dump-ast \"$f\" >\"${f%.rx}.ast\" 2>\"${f%.rx}.err\"; echo \"$? $f $(grep -c 'syntax error' \"${f%.rx}.err\")\"; done",
-  "timeout": 120000
-}
-```
-
-**Output:**
-```
-0 01_basic_fn.rx 0
-0 02_literals.rx 0
-0 03_operators.rx 0
-0 04_assignment.rx 0
-0 05_refs.rx 0
-0 06_control.rx 0
-0 07_statements.rx 0
-0 08_struct.rx 0
-0 09_impl.rx 0
-0 10_paths.rx 0
-0 11_const.rx 0
-0 12_sep.rx 0
-0 13_types.rx 0
-0 14_blocks_if_never.rx 0
-0 15_arrays.rx 0
-0 16_weird_expr.rx 0
-0 17_precedence.rx 0
-0 18_chains.rx 0
-0 19_lifetimes_where.rx 0
-0 20_stmt_boundary.rx 0
-0 21_casts_unary.rx 0
-0 22_break_return.rx 0
-0 23_nested_blocks.rx 0
-0 24_derefs.rx 0
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 13.7s)
-
-_Thinking:_
-
-All parse successfully and exit 0 (semantic checks pass trivially since check phase unimplemented; collect doesn't reject these). Wait — exit 0 for 10_paths with `Self::N` and 3-segment path: collect doesn't check paths yet, so exit 0. Fine.
-
-Now inspect the AST dumps. Let me check for unknown/`?` nodes first across all files, then examine each individually. Also check stderr for any errors.
-
-Let me grep for "Expr?" / "Stmt?" / "Item?" / "Type ?" patterns, and check the .err files.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cd /tmp/opencode/ast-check && grep -l \"Expr?\\|Stmt?\\|Item?\" *.ast; echo \"--- unknown nodes above (if any)\"; cat *.err | sort | uniq -c | sort -rn | head; echo \"--- err summary\"; wc -l *.ast | tail -1"
-}
-```
-
-**Output:**
-```
---- unknown nodes above (if any)
---- err summary
-  873 total
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 13.7s)
-
-_Thinking:_
-
-No unknown nodes, no stderr output at all (all err files empty). Now let me inspect the ASTs one by one, checking correctness. I'll read several .ast files. Start with the smaller/critical ones: 02, 03, 07, 08, 09, 10, 11, 13, 22, 20. The total is 873 lines; manageable to read all. Let me cat them in batches with headers. Actually the read tool is preferred, but for many files, a bash `head -200` style display is efficient. The instructions discourage cat for reading; but for reviewing 24 generated files in /tmp, I think reading them via bash with headers is practical. Alternatively read tool each. Let me use bash to print all with headers (873 lines total, fine) — but the bash tool warns to use Read instead. Hmm. The guidance says avoid cat unless necessary; here it's a multi-file inspection; the Read tool would be 24 calls. I'll do a couple of bash calls with awk/head to show files with headers. Actually, simplest: `for f in *.ast; do echo "===== $f"; cat "$f"; done` — that's a legitimate use for bulk generated output. Let me do it in 2-3 chunks to keep outputs digestible.
-
-First chunk: 01-08.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cd /tmp/opencode/ast-check && for f in 0{1,2,3,4,5,6,7,8}_*.ast; do echo \"================ $f\"; cat \"$f\"; done"
-}
-```
-
-**Output:**
-```
-================ 01_basic_fn.ast
-Fn main()
-  Type ()
-  Block
-    ExprStmt
-      Return
-================ 02_literals.ast
-Fn main()
-  Type ()
-  Block
-    Let a
-      IntLit 123
-    Let b
-      IntLit 0xFFu32
-    Let c
-      IntLit 0b1010_1010
-    Let d
-      IntLit 0o17isize
-    Let e
-      BoolLit true
-    Let f
-      Unit
-    Let g
-      IntLit 1_000usize
-    Let h
-      BoolLit false
-================ 03_operators.ast
-Fn f(a, b)
-  Type i32
-  Block
-    Let x
-      Binary -
-        Binary +
-          Path a
-          Binary *
-            Path b
-            IntLit 2
-        Binary %
-          Binary /
-            IntLit 3
-            IntLit 4
-          IntLit 5
-    Let y
-      Binary |
-        Binary &
-          Path a
-          Path b
-        Binary ^
-          Path a
-          Path b
-    Let z
-      Binary <<
-        Path a
-        IntLit 2
-    Let w
-      Binary <
-        Path a
-        Path b
-    Let v
-      Binary <=
-        Path a
-        Path b
-    Let u
-      Binary ==
-        Path a
-        Path b
-    Let t
-      Binary !=
-        Path a
-        Path b
-    Let s
-      Binary ||
-        Binary &&
-          Binary >
-            Path a
-            Path b
-          Binary >=
-            Path b
-            Path a
-        Unary !
-          BoolLit true
-    Let n
-      Unary -
-        Path a
-    Let m
-      Unary !
-        Path a
-    Let c
-      Cast
-        Cast
-          Path a
-          Type u32
-        Type isize
-    Tail
-      Binary +
-        Binary +
-          Path x
-          Path y
-        Path z
-================ 04_assignment.ast
-Fn f()
-  Type ()
-  Block
-    Let mut x
-      IntLit 1
-    ExprStmt
-      Binary =
-        Path x
-        IntLit 2
-    ExprStmt
-      Binary +=
-        Path x
-        IntLit 1
-    ExprStmt
-      Binary -=
-        Path x
-        IntLit 1
-    ExprStmt
-      Binary *=
-        Path x
-        IntLit 2
-    ExprStmt
-      Binary /=
-        Path x
-        IntLit 2
-    ExprStmt
-      Binary %=
-        Path x
-        IntLit 2
-    ExprStmt
-      Binary &=
-        Path x
-        IntLit 1
-    ExprStmt
-      Binary |=
-        Path x
-        IntLit 1
-    ExprStmt
-      Binary ^=
-        Path x
-        IntLit 1
-    ExprStmt
-      Binary <<=
-        Path x
-        IntLit 1
-    ExprStmt
-      Binary >>=
-        Path x
-        IntLit 1
-================ 05_refs.ast
-Fn f(mut x)
-  Type ()
-  Block
-    Let r
-      Ref  n=0
-        Path x
-    Let m
-      Ref mut n=0
-        Path x
-    Let d
-      Deref
-        Path r
-    ExprStmt
-      Binary =
-        Deref
-          Path m
-        IntLit 3
-    Let rr
-      Ref  n=0
-        Ref  n=0
-          Path x
-    Let rm
-      Ref  n=0
-        Ref mut n=0
-          Path x
-================ 06_control.ast
-Fn f(c)
-  Type i32
-  Block
-    Tail
-      If
-        Path c
-        Block
-          Tail
-            IntLit 1
-        Else
-          If
-            Unary !
-              Path c
-            Block
-              Tail
-                IntLit 2
-            Else
-              Block
-                Tail
-                  IntLit 3
-Fn g(c)
-  Type ()
-  Block
-    ExprStmt
-      While
-        Path c
-        Block
-          ExprStmt
-            Break
-    ExprStmt
-      Loop
-        Block
-          ExprStmt
-            Break
-              IntLit 42
-    ExprStmt
-      Loop
-        Block
-          ExprStmt
-            Continue
-    Tail
-      If
-        Path c
-        Block
-        Else
-          Block
-================ 07_statements.ast
-Fn f()
-  Type ()
-  Block
-    Let x
-      IntLit 1
-    Let y
-      Type u32
-      IntLit 2
-    ExprStmt
-      Path x
-    ExprStmt
-      Block
-        ExprStmt
-          IntLit 1
-        Tail
-          IntLit 2
-    ExprStmt
-      If
-        BoolLit true
-        Block
-        Else
-          Block
-    ExprStmt
-      Unary -
-        IntLit 1
-    Let z
-      Binary -
-        If
-          BoolLit true
-          Block
-            Tail
-              IntLit 10
-          Else
-            Block
-              Tail
-                IntLit 20
-        IntLit 1
-================ 08_struct.ast
-Struct Point
-  derive Clone
-  derive Copy
-  derive PartialEq
-  derive Eq
-  field x
-    Type i32
-  field y
-    Type i32
-Struct Wrap
-  field p
-    Type Point
-  field b
-    Type Box
-      Type i32
-  field v
-    Type Vec
-      Type Vec
-        Type i32
-  field r
-    Type &
-      Type i32
-Fn main()
-  Type ()
-  Block
-    Let p
-      StructInit
-        Path Point
-        field x
-          IntLit 1
-        field y
-          IntLit 2
-    Let q
-      StructInit
-        Path Point
-        field x
-          Field x
-            Path p
-        field y
-          Field y
-            Path p
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 22.5s)
-
-_Thinking:_
-
-Let me review these against expectations:
-
-**01**: Fn main, Type (), Block with ExprStmt(Return) — `return;` is a returnExpr with no tail, wrapped in exprStmt. Correct.
-
-Wait, `return;` — in Rust, `return;` is an expression statement; AST has ExprStmt → Return. Fine.
-
-**02**: literals correct; IntLit stores raw text. `()` Unit. Good.
-
-**03**: 
-- `a + b * 2 - 3 / 4 % 5` → `-(+(a, *(b,2)), %(/(3,4),5))`. Correct precedence and left-assoc for `%`: `3 / 4 % 5` = (3/4)%5 ✓.
-- `a & b | a ^ b` → `|(&(a,b), ^(a,b))` ✓ (Rust precedence: & > ^ > |).
-- `a << 2 >> 1` → `>>(<<(a,2),1)`; dump shows only "Binary << (a,2)"? Wait the dump shows:
-```
-    Let z
-      Binary <<
-        Path a
-        IntLit 2
-```
-That's wrong! It should be `>>` on top with `<<` inside. Expected:
-```
-Binary >>
-  Binary <<
-    Path a
-    IntLit 2
-  IntLit 1
-```
-But dump shows only `Binary <<` with a, 2 — the `>> 1` is missing! This is a bug. Let me double check the shift handling. Similarly check other binary chains: `a & b | a ^ b` shows `Binary |` with children `Binary &` and `Binary ^` ✓. `x + y + z` shows `Binary +` top with `Binary +` left and `z` right ✓ (in tail).
-
-So shifts are broken! `a << 2 >> 1` lost the `>> 1`. Let me verify by testing simpler: `a << 1 << 2` and `a >> 1 >> 2`, `a << 1 >> 2`. The bug might be in visitShiftExpression: grammar `shiftExpression : additiveExpression (shiftOp additiveExpression)*` or the g4 has special shift rules. Let me look at the parser grammar for shiftExpression and the builder code.
-
-Also check `s = a > b && b >= a || !true`: dump shows `||(&&(>(a,b), >=(b,a)), !true)` ✓.
-
-- `a as u32 as isize` → Cast(Cast(a,u32),isize) ✓.
-- Unary `-a`, `!a` ✓.
-
-**04**: all compound assignments as Binary ops ✓. Assignment parse as Binary "=" etc. ✓.
-
-**05**: `&&x` → Ref(Ref(x)) with n=0; `&&mut x` → Ref(Ref mut x) — is that right? Rust: `&&mut x` = `&(&mut x)`: outer shared ref to inner mutable ref. Dump: Ref (outer) → Ref mut (inner) → x. The dump shows:
-```
-    Let rm
-      Ref  n=0
-        Ref mut n=0
-          Path x
-```
-Correct per grammar comment (ANDAND constructs two references; MUT belongs to inner one). ✓
-
-Hmm, what's `refExpr.num_`? Probably number of `&` (1 or 2). It's 0 in dumps! `Ref  n=0` and `Ref mut n=0`. Wait, the dump prints `x->num_`. For `&x`, num_ should probably be 1; for `&&x`, 1 or 2? Let me check ast_builder's refMake: earlier grep lines ~300-320 and others. The dump shows n=0 for both `&x` and `&&x`? Look:
-```
-    Let r
-      Ref  n=0
-        Path x
-...
-    Let rr
-      Ref  n=0
-        Ref  n=0
-          Path x
-```
-If num_ should indicate the count of &, outer might be 2 for `&&x` and inner 0? Hmm. Let me check how num_ is set in ast_builder.cpp. The grammar comment says ANDAND constructs TWO references. Maybe num_ is used as "number of additional refs"? Let me grep `num_`.
-
-Also for `&mut x`: Ref mut n=0. Hmm.
-
-Let me check the AST builder code for refExpr creation. There are multiple families (condition/statement/conditionBreak) around lines 317, 1121, 1592, etc. Need to read.
-
-**06**: if/else-if/else ✓; while with break; loop with break 42; loop continue; `if c {} else {}` ✓; `break;` no tail ✓.
-
-**07**:
-- `;` empty statement: dump shows NO node for the empty `;`! Block starts with `Let x`. Is that correct? AST Stmt has only letStmt and exprStmt; empty statement presumably dropped. That's a design decision; fine (dump can't show it). But is dropping empty statements correct? Semantically no effect. Fine.
-- `x;` ExprStmt(Path x) ✓.
-- `{ 1; 2 }` → ExprStmt(Block with ExprStmt(IntLit 1) and Tail IntLit 2) ✓.
-- Statement boundary: `if true {} else {} -1;` → dump shows **two** statements: ExprStmt(If...) then ExprStmt(Unary -(1)). Wait, the expected per spec: "if true {} else {} -1;" is an if statement, then `-1` expression statement. The dump shows:
-```
-    ExprStmt
-      If
-        ...
-    ExprStmt
-      Unary -
-        IntLit 1
-```
-Yes! Two statements. ✓
-- `let z = if true { 10 } else { 20 } - 1;` → initializer is whole subtraction: Binary -(If(...), 1) ✓.
-
-**08**:
-- derives captured in order ✓
-- fields ✓; Wrap fields: p Point, b Box<i32>, v Vec<Vec<i32>>, r `&'a i32` → Type & → i32 ✓ (lifetime discarded).
-- StructInit with trailing comma and field order ✓; `p.x` field ✓.
-
-So far one real bug candidate: shift chaining (`a << 2 >> 1` lost). Let me investigate more before concluding: maybe `>>` tokenization? `a << 2 >> 1` — `>>` might be lexed as GT GT or GT_SECOND? The grammar has GT_SECOND for generics. In shift context, `>>` is an operator. The AST shows `Binary <<` with children a and 2 — the rest `>> 1` disappeared entirely. Maybe the parser parsed `a << 2` then `>> 1` as something else? If it were parsed as two statements, we'd see another ExprStmt — but we don't. Actually wait, maybe `>>` got attached... let me look at the raw dump for 03 again: `Let z` → Binary << (a,2). Nothing else for z. So `>> 1` vanished. Could the parser have errored? No syntax errors (exit 0, no stderr). Hmm, interesting. Let me test simpler cases.
-
-Let me write a test file:
-```
-fn f(a: i32) {
-    let a1 = a << 1;
-    let a2 = a >> 1;
-    let a3 = a << 1 >> 2;
-    let a4 = a >> 1 << 2;
-    let a5 = a << 1 << 2;
-    let a6 = a >> 1 >> 2;
-}
-```
-and dump. Also `let x = a << 2 >> 1;` exactly.
-
-Also check the grammar's shiftExpression rules in Parser.g4 to understand. Let me read the parser grammar around shift/additive and the builder's visitShiftExpression.
-
-Also check `visitBitOrExpression` etc. Maybe the same chaining bug affects others but our `a & b | a ^ b` had 2 ops and worked (shown | with & and ^ children). Wait, that expression had exactly 2 operators. The dump shows proper nesting. `x + y + z` in tail also 2 ops, nested. `a + b * 2 - 3/4%5` had 4 ops and nested fine (the outermost `-` with `+` and `%`). So binary chaining works generally. The shift case is special because `<<`/`>>` tokens might be lexed as `<` `<`/`>` `>` (two tokens) or the grammar has a quirk.
-
-Let me check the lexer: does PUNCTUATION include `<<` `>>`? The spec says yes (<<, >>). But grammar may have special rules for shift. The AST builder has `visitShiftRight` and `visitShiftExpression` and `visitClosedShiftExpression`. The comment at 2911 `throw "visitShiftRight"` — a stub! Maybe the shift chain handling relies on visitShiftRight being called, and it throws... but no crash occurred. Hmm, maybe it's never called.
-
-Let me read the parser grammar shift rules and visitShiftExpression implementation.
-
-Found a suspicious case in `03` (`a << 2 >> 1` lost the `>> 1`). Let me dig into shift handling.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "grep -n \"shiftExpression\\|ShiftRight\\|shiftRight\\|GT_SECOND\\|LT\" /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/grammar/Parser.g4 | head -30"
-}
-```
-
-**Output:**
-```
-85:    : LT (lifetimeParam (COMMA lifetimeParam)* COMMA?)? genericClose
-151:    : LT (genericArg (COMMA genericArg)* COMMA?)? genericClose
-159:    : GT | GT_SECOND
-236:    | closedBitOrExpression LT bitOrExpression
-256:    : shiftExpression (AMP shiftExpression)*
-260:    : (shiftExpression AMP)* closedShiftExpression
-263:shiftExpression
-264:    : (closedAdditiveExpression SHL | additiveExpression shiftRight)* additiveExpression
-268:    : (closedAdditiveExpression SHL | additiveExpression shiftRight)* closedAdditiveExpression
-324:    | conditionClosedBitOrExpression LT conditionBitOrExpression
-352:    : (conditionClosedAdditiveExpression SHL | conditionAdditiveExpression shiftRight)* conditionAdditiveExpression
-356:    : (conditionClosedAdditiveExpression SHL | conditionAdditiveExpression shiftRight)* conditionClosedAdditiveExpression
-413:    | conditionBreakClosedBitOrExpression LT conditionBitOrExpression
-445:    | (conditionBreakClosedAdditiveExpression SHL | conditionBreakAdditiveExpression shiftRight)
-446:      (conditionClosedAdditiveExpression SHL | conditionAdditiveExpression shiftRight)* conditionAdditiveExpression
-451:    | (conditionBreakClosedAdditiveExpression SHL | conditionBreakAdditiveExpression shiftRight)
-452:      (conditionClosedAdditiveExpression SHL | conditionAdditiveExpression shiftRight)* conditionClosedAdditiveExpression
-512:    | statementClosedBitOrExpression LT bitOrExpression
-534:    : statementShiftExpression (AMP shiftExpression)*
-539:    | statementShiftExpression AMP (shiftExpression AMP)* closedShiftExpression
-544:    | (statementClosedAdditiveExpression SHL | statementAdditiveExpression shiftRight)
-545:      (closedAdditiveExpression SHL | additiveExpression shiftRight)* additiveExpression
-550:    | (statementClosedAdditiveExpression SHL | statementAdditiveExpression shiftRight)
-551:      (closedAdditiveExpression SHL | additiveExpression shiftRight)* closedAdditiveExpression
-676:shiftRight
-677:    : GT GT_SECOND
-681:    : EQEQ | NE | LE | GT GE_EQ | GT_SECOND SHR_EQ | genericClose
-687:    | SHL_ASSIGN | GT GT_SECOND SHR_EQ
-
-```
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "grep -n \"visitShiftExpression\\|visitClosedShiftExpression\\|visitAdditiveExpression\\|visitClosedAdditiveExpression\" /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/frontend/ast_builder.cpp"
-}
-```
-
-**Output:**
-```
-914:std::any ASTVisitor::visitShiftExpression(RxParser::ShiftExpressionContext *ctx) {
-952:std::any ASTVisitor::visitClosedShiftExpression(RxParser::ClosedShiftExpressionContext *ctx) {
-990:std::any ASTVisitor::visitAdditiveExpression(RxParser::AdditiveExpressionContext *ctx) {
-1009:std::any ASTVisitor::visitClosedAdditiveExpression(RxParser::ClosedAdditiveExpressionContext *ctx) {
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 16.2s)
-
-_Thinking:_
-
-Interesting! The grammar has weird shift rules:
-
-```
-shiftExpression
-    : (closedAdditiveExpression SHL | additiveExpression shiftRight)* additiveExpression
-    ;
-shiftRight
-    : GT GT_SECOND
-    ;
-```
-
-So in this grammar, a shift expression is a sequence of `(closedAdditive SHL | additive shiftRight)* additive`. Note the alternation captured in a `( ... )*` means it matches sequences of tokens like `< <`? Wait, SHL is the `<<` token; shiftRight is `GT GT_SECOND`, i.e., the text `>>` gets lexed as GT + GT_SECOND! The lexer presumably defines `>` as GT and `>>` as GT GT_SECOND? Or the contextual lexer returns GT_SECOND for the second `>` to handle generics. The parser rule shiftExpression uses this unusual formulation to parse `a << b >> c` as a flat list where each occurrence is either "closedAdditive SHL" or "additive shiftRight" followed by a final additive.
-
-So `a << 2 >> 1` parses as: additiveExpression `a`, then `shiftRight`?? Wait order: `(closedAdditiveExpression SHL | additiveExpression shiftRight)* additiveExpression`. For `a << 2 >> 1`: first iteration can be `closedAdditive SHL` = `a <<`, then final additiveExpression must match `2 >> 1`? No, additive can't contain `>>`. Hmm. Actually maybe ANTLR parses `a << 2 >> 1` as: iteration1: `additiveExpression shiftRight`? That requires additive `a` then shiftRight `<<`? No, shiftRight is GT GT_SECOND (i.e., `>>`), not `<<`.
-
-Hmm wait: `additiveExpression shiftRight` with additive = `a << 2`? No, additiveExpression doesn't include shifts.
-
-Let me think about how ANTLR parses `a << 2 >> 1` with rule:
-```
-shiftExpression : (closedAdditiveExpression SHL | additiveExpression shiftRight)* additiveExpression
-```
-tokens: ID(a) SHL ID? no: `a` `<` `<`? Wait, how is `<<` tokenized? Lexer has SHL token? Check lexer. There's SHL and SHR? The parser grammar references SHL, and shiftRight uses GT GT_SECOND. Let me check the lexer for `SHL`, `SHR`, `GT_SECOND`, `SHR_EQ`.
-
-Actually the layout suggests: the lexer lexes `<<` as SHL and `>>` as ... maybe not a token; instead `>>` = GT GT_SECOND? Let me grep Lexer.g4 for SHL/GT_SECOND.
-
-Also the shiftExpression rule: `(closedAdditiveExpression SHL | additiveExpression shiftRight)* additiveExpression`. For `a << b >> c`:
-- iteration: `closedAdditiveExpression SHL` matches `a <<`, then next iteration: `additiveExpression shiftRight` matches `b >>`, then final additive `c`. So the flat sequence encodes left-assoc shift chain. Nice context tricking.
-
-For `a << 2 >> 1`: iteration1 `a <<`, iteration2 `2 >>`, final `1`. So the parse tree has 2 iterations. The builder visitShiftExpression must walk these and build left-assoc Binary. Let me read visitShiftExpression lines 914-990.
+Let me read the current checker.cpp relevant sections (checkBlock, checkStatement, expect, checkCrate, infer, lookupValue, collect builtin registration) to review.
 
 **Tool: read**
 
 **Input:**
 ```json
 {
-  "filePath": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/frontend/ast_builder.cpp",
-  "limit": 100,
-  "offset": 910
+  "filePath": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp",
+  "offset": 515
 }
 ```
 
 **Output:**
 ```
-<path>/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/frontend/ast_builder.cpp</path>
+<path>/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp</path>
 <type>file</type>
 <content>
-910:     : (shiftExpression AMP)* closedShiftExpression
-911:     ;
-912: */
-913: 
-914: std::any ASTVisitor::visitShiftExpression(RxParser::ShiftExpressionContext *ctx) {
-915:     if (ctx->SHL().size() != 0u) {
-916:         auto operands = ctx->closedAdditiveExpression();
-917:         auto ops = ctx->SHL();
-918:         Expr* left = anyExpr(visit(operands[0]));
-919:         for (int i = 0; i < ops.size() - 1; i++) {
-920:             auto now = make<binaryExpr>();
-921:             now->op_ = ops[i]->getText();
-922:             now->lhs_ = left;
-923:             now->rhs_ = anyExpr(visit(operands[i + 1]));
-924:             left = now;
-925:         }
-926:         auto now = make<binaryExpr>();
-927:         now->op_ = ops[ops.size() - 1]->getText();
-928:         now->lhs_ = left;
-929:         now->rhs_ = anyExpr(visit(ctx->additiveExpression(0)));
-930:         return static_cast<Expr*>(now);
-931:     }
-932:     else {
-933:         auto operands = ctx->additiveExpression();
-934:         auto ops = ctx->shiftRight();
-935:         Expr* left = anyExpr(visit(operands[0]));
-936:         for (int i = 0; i < ops.size(); i++) {
-937:             auto now = make<binaryExpr>();
-938:             now->op_ = ops[i]->getText();
-939:             now->lhs_ = left;
-940:             now->rhs_ = anyExpr(visit(operands[i + 1]));
-941:             left = now;
-942:         }
-943:         return static_cast<Expr*>(left);
-944:     }
-945: }
-946: /*
-947: shiftExpression
-948:     : (closedAdditiveExpression SHL | additiveExpression shiftRight)* additiveExpression
-949:     ;
-950: */
-951: 
-952: std::any ASTVisitor::visitClosedShiftExpression(RxParser::ClosedShiftExpressionContext *ctx) {
-953:     if (ctx->shiftRight().size() != 0u) {
-954:         auto operands = ctx->additiveExpression();
-955:         auto ops = ctx->shiftRight();
-956:         Expr* left = anyExpr(visit(operands[0]));
-957:         for (int i = 0; i < ops.size() - 1; i++) {
-958:             auto now = make<binaryExpr>();
-959:             now->op_ = ops[i]->getText();
-960:             now->lhs_ = left;
-961:             now->rhs_ = anyExpr(visit(operands[i + 1]));
-962:             left = now;
-963:         }
-964:         auto now = make<binaryExpr>();
-965:         now->op_ = ops[ops.size() - 1]->getText();
-966:         now->lhs_ = left;
-967:         now->rhs_ = anyExpr(visit(ctx->closedAdditiveExpression(0)));
-968:         return static_cast<Expr*>(now);
-969:     }
-970:     else {
-971:         auto operands = ctx->closedAdditiveExpression();
-972:         auto ops = ctx->SHL();
-973:         Expr* left = anyExpr(visit(operands[0]));
-974:         for (int i = 0; i < ops.size(); i++) {
-975:             auto now = make<binaryExpr>();
-976:             now->op_ = ops[i]->getText();
-977:             now->lhs_ = left;
-978:             now->rhs_ = anyExpr(visit(operands[i + 1]));
-979:             left = now;
-980:         }
-981:         return static_cast<Expr*>(left);
-982:     }
-983: }
-984: /*
-985: closedShiftExpression
-986:     : (closedAdditiveExpression SHL | additiveExpression shiftRight)* closedAdditiveExpression
-987:     ;
-988: */
-989: 
-990: std::any ASTVisitor::visitAdditiveExpression(RxParser::AdditiveExpressionContext *ctx) {
-991:     auto operands = ctx->multiplicativeExpression();
-992:     auto ops = ctx->additiveOperator();
-993:     Expr* left = anyExpr(visit(operands[0]));
-994:     for (int i = 0; i < ops.size(); i++) {
-995:         auto now = make<binaryExpr>();
-996:         now->op_ = ops[i]->getText();
-997:         now->lhs_ = left;
-998:         now->rhs_ = anyExpr(visit(operands[i + 1]));
-999:         left = now;
-1000:     }
-1001:     return static_cast<Expr*>(left);
-1002: }
-1003: /*
-1004: additiveExpression
-1005:     : multiplicativeExpression (additiveOperator multiplicativeExpression)*
-1006:     ;
-1007: */
-1008: 
-1009: std::any ASTVisitor::visitClosedAdditiveExpression(RxParser::ClosedAdditiveExpressionContext *ctx) {
-
-(Showing lines 910-1009 of 2964. Use offset=1010 to continue.)
-</content>
-```
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "grep -n \"SHL\\|SHR\\|GT_SECOND\\|GT\\b\" /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/grammar/Lexer.g4 | head -20"
-}
-```
-
-**Output:**
-```
-74:GT: '>' -> mode(AFTER_GT);
-90:SHL: '<<';
-100:SHL_ASSIGN: '<<=';
-150:mode AFTER_GT;
-152:GT_SECOND: '>' -> mode(AFTER_SECOND_GT);
-204:AG_SHL: SHL -> type(SHL), mode(DEFAULT_MODE);
-213:AG_SHL_ASSIGN: SHL_ASSIGN -> type(SHL_ASSIGN), mode(DEFAULT_MODE);
-235:mode AFTER_SECOND_GT;
-237:ASG_GT: '>' -> type(GT), mode(AFTER_GT);
-238:SHR_EQ: '=' -> mode(DEFAULT_MODE);
-289:ASG_SHL: SHL -> type(SHL), mode(DEFAULT_MODE);
-298:ASG_SHL_ASSIGN: SHL_ASSIGN -> type(SHL_ASSIGN), mode(DEFAULT_MODE);
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 21.8s)
-
-_Thinking:_
-
-Now I see the shift lexing: `>` is GT (mode AFTER_GT), then `>` in AFTER_GT is GT_SECOND. So `>>` is lexed as GT GT_SECOND. And `<<` is SHL. The parser rule:
-
-```
-shiftExpression
-    : (closedAdditiveExpression SHL | additiveExpression shiftRight)* additiveExpression
-    ;
-shiftRight: GT GT_SECOND ;
-```
-
-For `a << 2 >> 1`, ANTLR parse: iteration1 = closedAdditive(a) SHL; iteration2 = additive(2) shiftRight(GT GT_SECOND); final additive(1).
-
-So ctx->SHL() has 1 element, ctx->shiftRight() has 1 element, ctx->closedAdditiveExpression() has 1 (a), ctx->additiveExpression() has 2 (2, 1).
-
-The builder's visitShiftExpression:
-```cpp
-if (ctx->SHL().size() != 0u) {
-    auto operands = ctx->closedAdditiveExpression();   // [a]
-    auto ops = ctx->SHL();                             // [SHL]
-    Expr* left = visit(operands[0]);                   // a
-    // loop i < ops.size()-1 = 0 → skipped
-    // now: op = SHL, lhs = a, rhs = visit(ctx->additiveExpression(0)) = 2
-    return a << 2;
-}
-```
-
-It **ignores the shiftRight occurrences entirely**! Hence `>> 1` is lost. Bug confirmed.
-
-The builder's shift handling is wrong in both branches:
-- Branch with SHL present: it handles only SHL ops, using closedAdditive operands, and ignores shiftRight entirely. It also assumes the number of SHL ops and operands align, which is only true for pure `<<` chains.
-- Branch without SHL (pure `>>`): `(additive shiftRight)* additive`: operands = additiveExpression() — for `a >> 1 >> 2`, additiveExpression has [a, 1, 2] and shiftRight has 2. Loop builds left-assoc a>>1, then >>2. Wait: loop for i in 0..ops.size()-1?? In the else branch: `for (int i = 0; i < ops.size(); i++) { lhs=left; rhs=operands[i+1]; }` then return left. With operands [a,1,2], ops [>>,>>]: i=0: left=a>>1; i=1: left=(a>>1)>>2. Correct! So pure `>>` chain works.
-- And pure `<<` chain: visitShiftExpression branch SHL: operands = closedAdditive; for `a << 1 << 2`: ops = [SHL,SHL], operands = [a,1]? Wait closedAdditiveExpression() for pattern `closedAdditive SHL closedAdditive SHL additive`: iterations: (closedAdditive SHL) ×2 then final additive. So closedAdditive = [a, 1], additive = [2]. The code: left=a; loop i<ops.size()-1=1: i=0: now= a<<operands[1]= a<<1; then final now = (a<<1) << additive(0)=2. Correct.
-- Mixed `a << 2 >> 1`: SHL branch: ops=[SHL], operands(closedAdditive)=[a], loop skipped; final a << additive(0)=2; returns. shiftRight [>>] ignored, additive(1)=1 ignored. Lost.
-- Also `a >> 1 << 2`: parse: iteration1: (additive `a` shiftRight `>>`), iteration2: (closedAdditive `1` SHL), final additive `2`. So SHL present: ops=[SHL], closedAdditive=[1]; left = visit(closedAdditive[0]) = 1; final: 1 << additive(0)=2 → returns `1 << 2`, ignoring `a >> 1`! Even worse.
-
-So mixed shift expressions are broken. The fix: the builder should handle the flat token sequence in order: sequence of segments where each segment is (operand, op) with op in {SHL, >>}, then final operand. The parse tree stores: `closedAdditiveExpression*` interleaved with SHL, and `additiveExpression*` interleaved with shiftRight, and final additive. Reconstructing order from these separate accessor lists is tricky because ANTLR separates by rule type, losing interleaving order... Actually rule contexts have token indices; one can sort by `getStart()->getTokenIndex()`. Simpler: use `ctx->getText()`? No.
-
-Proper approach: collect events:
-- for each closedAdditiveExpression child: (pos, operand)
-- for each additiveExpression child: (pos, operand) — note final additive is also an additiveExpression; and for classification, we need to know whether each additive is an operand of shiftRight or the final operand.
-- for each SHL: (pos, "<<")
-- for each shiftRight: (pos, ">>")
-
-Then merge by token position: iterate children of ctx (ParseTree children) in order. The children of shiftExpression are exactly the sequence: closedAdditive/SHL/additive/shiftRight/.../additive. So the correct implementation is to iterate `ctx->children` and process:
-- `closedAdditiveExpression` or `additiveExpression` → operand
-- `SHL` or `shiftRight` → op (getText for shiftRight is ">>", SHL "<<")
-Then fold left-assoc.
-
-So the current code is wrong for mixed shifts, and the fix is to iterate children in source order.
-
-Wait, but is there also a similar pattern issue in **closedShiftExpression**? Yes, same structure, same bug.
-
-Also check the other "closed" families (condition/statement variants) — they likely copy the same buggy code. There were many duplicated families (conditionShiftExpression, conditionClosedShiftExpression, conditionBreakShiftExpression, etc., statementShiftExpression...). So the same bug repeats in ~8 places.
-
-Now, is this bug actually hit by official tests? The shifts suite passed AST smoke (no crash) but correctness of AST wasn't checked. The user asked to verify AST correctness. This is a genuine bug: `a << b >> c` or `a >> b << c` loses part of expression. Official tests like `acc-masked-dynamic-counts...` might contain mixed shifts? Let me grep tests for mixed shift expressions.
-
-Let me also check `a << 2 >> 1` behavior more precisely by writing a focused test and dumping. Also test parser tree to see structure. Let me create focused tests:
-- pure <<
-- pure >>
-- mixed << then >>
-- mixed >> then <<
-- mixed multiple
-
-Then check dump.
-
-Also, note `shiftExpression` special: `closedAdditiveExpression SHL` — because `a < <b`? The `closed` variant prevents some parse ambiguity with generics. Whatever.
-
-Additional potential issues to check later in the corpus: 09-24. Let me continue reviewing those before fixing/reporting. But first let me confirm the shift bug with focused dumps and also check other binary families for similar "separate accessor lists lose interleaving" bugs. Which rules have interleaved alternatives with two different op token types? 
-- shiftExpression/closedShiftExpression (mixed SHL and >>)
-- condition/statement variants of shifts similarly.
-- comparisonExpression: `bitOrExpression (comparisonExceptLt bitOrExpression)? | closedBitOrExpression LT bitOrExpression` — at most one comparison op, so no chain. But `a < b < c`? Grammar only allows one comparison (Rust semantics: chained comparison not allowed). Actually `comparisonExpression` allows optional single op; `a < b` uses the second alternative (closedBitOr LT bitOr); `a <= b` uses first. No chain. Fine.
-- The comparisonExceptLt rule includes GT etc. OK.
-- Also `shiftRight: GT GT_SECOND` — getText() returns ">>"? GT_SECOND token text is ">" so shiftRight getText() = ">> ". Good.
-
-But wait, in the SHL branch, the code uses `ops[i]->getText()` where ops are SHL tokens (fine). In else branch, `ops[i]->getText()` where ops are shiftRight contexts → ">>". Fine.
-
-So the primary bug: mixed shifts.
-
-Let me look for other potential bugs in the corpus files 09-24 now, then compile the report. Also I want to check the `n=0` num_ in refExpr: is that expected? Let me grep ast_builder for `num_` assignments to understand semantics.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "grep -n \"num_\" /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/frontend/ast_builder.cpp | head; echo ===; grep -rn \"shift\\|<<\\|>>\" /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/shifts/*.rx | head -40"
-}
-```
-
-**Output:**
-```
-2824:        now->num_ = anyConstValue(visit(ctx->constValue()));
-===
-/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/shifts/acc-constant-folded-shifts-also-mask-the-count.rx:4:    println_i32(3i32 << 33u32);
-/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/shifts/acc-constant-folded-shifts-also-mask-the-count.rx:5:    println_i32(-8i32 >> 34usize);
-/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/shifts/acc-constant-folded-shifts-also-mask-the-count.rx:6:    println_i32((0x8000_0000u32 >> 33isize) as i32);
-/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/shifts/acc-masked-dynamic-counts-and-signedness-of-i32-shifts.rx:6:    println_i32((a << b) as i32);
-/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/shifts/acc-masked-dynamic-counts-and-signedness-of-i32-shifts.rx:7:    println_i32((a >> b) as i32);
-/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/shifts/acc-masked-dynamic-counts-and-signedness-of-isize-shifts.rx:6:    println_i32((a << b) as i32);
-/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/shifts/acc-masked-dynamic-counts-and-signedness-of-isize-shifts.rx:7:    println_i32((a >> b) as i32);
-/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/shifts/acc-masked-dynamic-counts-and-signedness-of-u32-shifts.rx:6:    println_i32((a << b) as i32);
-/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/shifts/acc-masked-dynamic-counts-and-signedness-of-u32-shifts.rx:7:    println_i32((a >> b) as i32);
-/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/shifts/acc-masked-dynamic-counts-and-signedness-of-usize-shifts.rx:6:    println_i32((a << b) as i32);
-/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/shifts/acc-masked-dynamic-counts-and-signedness-of-usize-shifts.rx:7:    println_i32((a >> b) as i32);
-/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/shifts/rej-shift-count-must-be-integer.rx:4:    let x = 1i32 << true;
-/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/shifts/rej-shift-left-operand-must-be-integer.rx:4:    let x = false >> 1i32;
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 13.7s)
-
-_Thinking:_
-
-Interesting: `num_` in ast_builder is at line 2824: `now->num_ = anyConstValue(visit(ctx->constValue()));` — that's likely repeatedArrayExpr, not refExpr! Let me check: earlier ast.h had `refExpr { bool isMut_; int num_; Expr* operand_; }`. Hmm, line 2824 may be in the repeated array builder (num_ field). Let me grep for `refExpr` creation and `isMut_` assignments in ast_builder. Also the dumpr prints `x->num_` for refExpr. If num_ is never set, it stays uninitialized (int with no default) — the dump printing 0 could be UB/uninitialized. Let me check: ast.h `refExpr { bool isMut_; int num_; Expr* operand_; }` — num_ has no default initializer! In ast_builder, maybe refExpr.num_ is set somewhere. Let me grep.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "grep -n \"refExpr\\|refMake\\|->num_\\|isMut_ = isMut\" /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/frontend/ast_builder.cpp | head -30; echo ===; grep -n \"struct refExpr\" -A 5 /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/ast/ast.h"
-}
-```
-
-**Output:**
-```
-314:    auto refMake = [&](bool isMut, Type* elem) {
-317:        ref->isMut_ = isMut;
-322:        return static_cast<Type*>(refMake(false, refMake(isMut, inner)));
-324:    return static_cast<Type*>(refMake(isMut, inner));
-472:        auto refMake = [&](bool isMut, Type* elem) {
-475:            ref->isMut_ = isMut;
-480:            return static_cast<Type*>(refMake(false, refMake(isMut, inner)));
-482:        return static_cast<Type*>(refMake(isMut, inner));
-1112:            auto now = make<derefExpr>();
-1119:            auto refMake = [&](bool isMut, Expr* value) {
-1120:                auto ref = make<refExpr>();
-1121:                ref->isMut_ = isMut;
-1126:                return static_cast<Expr*>(refMake(isMut, operand));
-1129:                return static_cast<Expr*>(refMake(false, static_cast<Expr*>(refMake(isMut, operand))));
-1583:            auto now = make<derefExpr>();
-1590:            auto refMake = [&](bool isMut, Expr* value) {
-1591:                auto ref = make<refExpr>();
-1592:                ref->isMut_ = isMut;
-1597:                return static_cast<Expr*>(refMake(isMut, operand));
-1600:                return static_cast<Expr*>(refMake(false, static_cast<Expr*>(refMake(isMut, operand))));
-2075:            auto now = make<derefExpr>();
-2082:            auto refMake = [&](bool isMut, Expr* value) {
-2083:                auto ref = make<refExpr>();
-2084:                ref->isMut_ = isMut;
-2089:                return static_cast<Expr*>(refMake(isMut, operand));
-2092:                return static_cast<Expr*>(refMake(false, static_cast<Expr*>(refMake(isMut, operand))));
-2569:            auto now = make<derefExpr>();
-2576:            auto refMake = [&](bool isMut, Expr* value) {
-2577:                auto ref = make<refExpr>();
-2578:                ref->isMut_ = isMut;
-===
-71:struct refExpr : Expr {
-72-    bool isMut_;
-73-    int num_;
-74-    Expr* operand_;
-75-};
-76-
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 14.4s)
-
-_Thinking:_
-
-So `refExpr::num_` is never assigned in ast_builder (the only `->num_` assignment was for repeatedArrayExpr at 2824, a different struct field). Let me verify ast.h for repeatedArrayExpr: `ConstValue* num_;` — yes different type. So `refExpr::num_` is uninitialized garbage. The dump prints `n=0` — that's reading uninitialized memory. In this run it happened to be 0 (fresh allocations?). It's UB; also semantically who cares about num_? What was num_ supposed to mean? In ast.h it's `int num_` — perhaps originally intended for `&&` count (1 or 2)? Looking at builder's refMake handling ANDAND: it builds two nested refExpr nodes rather than setting num_=2, so num_ is unused. But the field remains uninitialized and the dump reads it → UB. Not a correctness bug in semantics (unused field), but it is a latent issue: uninitialized member + dump reads it. Also, any `make<refExpr>()` leaves isMut_/operand_ set, num_ uninit. Should be initialized to 0 in ast.h or set in builder. This is a real (if minor) bug worth reporting: uninitialized read.
-
-Let me check the refExpr creation code around 1119-1129 to see if num_ set. From grep, only isMut_ and operand_. So yes num_ uninitialized. Dump prints it. The value printed 0 in our run, but it's UB.
-
-Now let me continue reviewing corpus 09-24. Let me view them.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cd /tmp/opencode/ast-check && for f in 09_*.ast 10_*.ast 11_*.ast 12_*.ast 13_*.ast; do echo \"================ $f\"; cat \"$f\"; done"
-}
-```
-
-**Output:**
-```
-================ 09_impl.ast
-Struct Counter
-  field value
-    Type i32
-Impl
-  Type Counter
-  Const START
-    Type i32
-    ConstInt 0
-  Fn new()
-    Type Counter
-    Block
-      Tail
-        StructInit
-          Path Counter
-          field value
-            IntLit 0
-  Fn value(self)
-    Type i32
-    Block
-      Tail
-        Field value
-          Path self
-  Fn add(mut self, delta)
-    Type ()
-    Block
-      ExprStmt
-        Binary +=
-          Field value
-            Path self
-          Path delta
-  Fn consume(self)
-    Type i32
-    Block
-      Tail
-        Field value
-          Path self
-  Fn withMut(mut self)
-    Type i32
-    Block
-      Tail
-        Field value
-          Path self
-Impl
-  Type Counter
-  Fn reset(mut self)
-    Type i32
-    Block
-      ExprStmt
-        Binary =
-          Field value
-            Path self
-          Path Self::START
-      Tail
-        Field value
-          Path self
-Fn main()
-  Type ()
-  Block
-================ 10_paths.ast
-Const N
-  Type usize
-  ConstInt 4
-Struct Config
-  field x
-    Type i32
-Impl
-  Type Config
-  Const LIMIT
-    Type usize
-    ConstPath N
-Fn leaf()
-  Type i32
-  Block
-    Tail
-      IntLit 1
-Fn main()
-  Type ()
-  Block
-    Let a
-      Call
-        Path leaf
-    Let b
-      Path Config::LIMIT
-    Let c
-      Path Self::N
-    Let d
-      Call
-        Path Box<i32>::new
-        IntLit 1
-    Let e
-      Call
-        Path Vec<i32>::new
-    Let f
-      Call
-        Path Box<i32>::clone
-        Ref  n=0
-          Path d
-    Let g
-      Path a::b::c
-================ 11_const.ast
-Const A
-  Type i32
-  ConstInt 3
-Const B
-  Type i32
-  ConstNeg
-    ConstPath A
-Const C
-  Type bool
-  ConstBool TRUE
-Const D
-  Type isize
-  ConstNeg
-    ConstInt 1
-Const E
-  Type usize
-  ConstInt 0b1_0000
-Fn main()
-  Type ()
-  Block
-================ 12_sep.ast
-Struct S
-  field x
-    Type i32
-Fn S(x)
-  Type i32
-  Block
-    Tail
-      Path x
-Fn main()
-  Type ()
-  Block
-    Let s
-      StructInit
-        Path S
-        field x
-          Call
-            Path S
-            IntLit 3
-    ExprStmt
-      Call
-        Path println_i32
-        Field x
-          Path s
-================ 13_types.ast
-Const N
-  Type usize
-  ConstInt 4
-Fn f(a, b, c, d, e, g, h, i, j, k, l, m, n, o, p)
-  Type ()
-  Block
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 20.2s)
-
-_Thinking:_
-
-Review:
-
-**09_impl**:
-- Struct Counter field ✓
-- Impl Type Counter, Const START ✓
-- Methods: `fn value(self)` — dump shows `value(self)` — Param displayed with name; for self param, isMut false. For `fn add(&mut self, delta)` the dump shows `add(mut self, delta)`: the dump prints `(isMut ? "mut " : "") name`, so `&mut self` displays as "mut self" — misleading but only cosmetic in dump (isSelf_ true, type_ = &mut Self). Fine.
-- `consume(self)` by-value self ✓.
-- `withMut(mut self)` — `mut self` shorthand ✓ (isMut true).
-- Impl (Counter) → Type Counter ✓.
-- `self.value` Field value → Path self ✓.
-- `Self::START` Path ✓.
-
-**10_paths**:
-- `Box::<i32>::new` dumps as `Path Box<i32>::new` ✓ (types_ printed).
-- 3-segment `a::b::c` path stores all 3 segments ✓ (dump prints full path).
-- Const in impl ✓.
-- `let c = Self::N;` at top-level parses ✓ (semantic error later).
-
-**11_const**: `ConstBool TRUE` — matches builder (uppercase text). `ConstNeg` for `-(1)` and `-A` ✓. Note `const D: isize = -(1);` — AST fine.
-
-**12_sep**: Struct S + Fn S same name ✓; struct init Path S with field x = Call Path S.
-
-**13_types**: dump only shows Fn f with params list by name; types not dumped in Fn header! `dumpItem` for funcItem prints only param names, and only dumps retType via `if (x->retType_) dumpType(...)`. Wait, looking at dumpItem: for funcItem it prints "Fn name(" params ")" then `if (x->retType_) dumpType(x->retType_, d+1);` — but not param types! In earlier dumps, `Fn f(a, b)  Type i32` shows the return type only. Param types aren't dumped at all. So I can't verify param types via dump for this test! That's a dump limitation, not necessarily an AST bug. Hmm, but for verification, we need another way: maybe use --dump-tree? Or add a temporary standalone harness? The user said don't necessarily modify; but we can build a small tool in /tmp that includes their AST builder? That requires linking ANTLR etc. Alternatively, we can infer param types from behavior later. Or we can temporarily enhance dump? No repo modifications.
-
-Wait — the dump's Type for function is the return type. Param types aren't printed. To verify param types, options:
-1. Use a context where the param type affects something? Not in AST dump.
-2. Write a tiny C++ program that reuses the generated parser and AST builder to print param types... but that duplicates main. Could compile a custom dumper against their sources? That requires building generated ANTLR sources — target/build/generated has them. I could write /tmp/opencode/ast-check/param_dump.cpp that includes ast_builder.h, links against the same objects? Compiling requires include paths and linking antlr4_static. Doable but heavy.
-3. Or modify ast_dump.h temporarily? Not allowed in repo? The user allowed me to operate in /tmp/opencode; I could copy the source tree to /tmp, patch dump there, build a separate binary. That's a "isolate AST part" approach and matches "把我的 AST 部分单独挑出来". But building ANTLR generated code requires the antlr jar & runtime — available. Could take a few minutes. Hmm.
-
-Alternatively, simpler: since dump doesn't show param types, write tests where a param type is exercised implicitly? Not possible in AST-only.
-
-But wait — maybe funcItem dump in ast_dump.h intentionally only prints names; the param types are still in the AST. For the purpose of "confirm AST correctness", param types matter. Option: temporarily patch ast_dump.h in a copied tree under /tmp and rebuild. Copying the whole compiler dir to /tmp and configuring CMake with the same flags is feasible: `cmake -S compiler -B /tmp/opencode/ast-build -DCMAKE_PREFIX_PATH=$HOME/antlr4-4.13.1 -DCMAKE_BUILD_TYPE=Release` — but CMakeLists references /usr/local/lib/antlr jar and $ENV{HOME}/antlr4-4.13.1; should work. But the copy needs the grammar dir (../grammar relative to compiler). So copy both `compiler/` and `grammar/` preserving relative layout, e.g., /tmp/opencode/ast-src/{compiler,grammar}. Build there.
-
-Is this worth it? The user asked to "想办法确认我写的是对的" — a thorough verification. Param types are a significant part of the AST (function signatures). The earlier official XML? Hmm.
-
-Actually, maybe there's an easier way to see param types: the `--dump-tree` shows parse tree with tokens including types, but not the AST mapping. To verify param types mapping, we can reason from the code: visitFunctionParam sets ret.type_ = anyType(visit(ctx->typeRef())) and visitSelfParam sets Ref(Self)/Self. The code is straightforward. But "confirm" ideally by output.
-
-Alternative trick: **use the ConstValue/Type dump via other constructs**: e.g., define a function whose parameter type is an array with a bad length... no.
-
-Another trick: use **struct fields and consts** to validate transformType later, not AST.
-
-Hmm, but note: dumpType for function prints only return type; also for methods. Let me check whether param types could be surfaced via struct definitions with the same types — 13_types covers type forms in struct fields too? No, it uses a function. I can duplicate the type zoo into a struct's fields, which dump prints types for. That validates the Type node construction pipeline (visitReferenceType/visitArrayType/visitTypePath/makeNamedType) which is shared between params and fields (both call visit(typeRef)). If field types dump correctly, param types (same code path) are almost certainly correct. The only param-specific code is visitFunctionParam itself (which field of Param). That's simple.
-
-So: modify 13_types to also have a struct with the same type zoo fields, then dump. Fields printed with types. That covers type building. For param mapping, direct code read suffices + the earlier tests show params names.
-
-Let me create 13b_types_fields.rx with struct fields covering the same types. Also check `()` field type? Zero-sized excluded (UB) but parser fine; dump "Type ()". Include anyway? It might confuse; but it's just AST verification. Include.
-
-Also verify function return types: dump shows them (Type ...). Good.
-
-Now continue reviewing 14-24 dumps. Let me print those.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cd /tmp/opencode/ast-check && for f in 14_*.ast 15_*.ast 16_*.ast 17_*.ast; do echo \"================ $f\"; cat \"$f\"; done"
-}
-```
-
-**Output:**
-```
-================ 14_blocks_if_never.ast
-Fn f(x)
-  Type i32
-  Block
-    Let v
-      If
-        Binary <
-          Path x
-          IntLit 0
-        Block
-          ExprStmt
-            Return
-              IntLit 90
-        Else
-          If
-            Binary ==
-              Path x
-              IntLit 0
-            Block
-              Tail
-                IntLit 7
-            Else
-              Block
-                Tail
-                  Block
-                    Tail
-                      Binary +
-                        Path x
-                        IntLit 1
-    Tail
-      Block
-        Tail
-          Binary *
-            Path v
-            IntLit 2
-Fn main()
-  Type ()
-  Block
-    Let x
-      Call
-        Path get_i32
-    ExprStmt
-      Call
-        Path println_i32
-        Call
-          Path f
-          Path x
-    ExprStmt
-      If
-        BoolLit true
-        Block
-        Else
-          Block
-    ExprStmt
-      Unary -
-        IntLit 1
-    ExprStmt
-      If
-        BoolLit true
-        Block
-          Tail
-            IntLit 10
-        Else
-          Block
-            Tail
-              IntLit 20
-    Let y
-      Binary -
-        If
-          BoolLit true
-          Block
-            Tail
-              IntLit 10
-          Else
-            Block
-              Tail
-                IntLit 20
-        IntLit 1
-    ExprStmt
-      Call
-        Path println_i32
-        Path y
-================ 15_arrays.ast
-Fn element()
-  Type i32
-  Block
-    Tail
-      IntLit 4
-Fn main()
-  Type ()
-  Block
-    Let a
-      Array
-        IntLit 1
-        IntLit 2
-        IntLit 3
-    Let b
-      RepeatArray len=4
-        IntLit 0
-    Let c
-      Array
-        Array
-          IntLit 1
-          IntLit 2
-        Array
-          IntLit 3
-          IntLit 4
-    Let d
-      RepeatArray len=3
-        Call
-          Path element
-    ExprStmt
-      Binary =
-        Index
-          Index
-            Path c
-            IntLit 1
-          IntLit 0
-        IntLit 8
-    Let lone
-      RepeatArray len=1
-        Call
-          Path Box<i32>::new
-          IntLit 5
-================ 16_weird_expr.ast
-Fn f()
-  Type ()
-  Block
-    Let a
-      Unary -
-        IntLit 1
-    Let b
-      Unary !
-        BoolLit false
-    Let c
-      Ref  n=0
-        IntLit 1u32
-    Let d
-      Ref mut n=0
-        IntLit 1
-    Let e
-      Deref
-        Ref  n=0
-          IntLit 1
-    Let f
-      Binary *
-        Binary +
-          IntLit 1
-          IntLit 2
-        IntLit 3
-    Let g
-      Binary +
-        IntLit 1
-        Binary *
-          IntLit 2
-          IntLit 3
-    Let h
-      Unit
-================ 17_precedence.ast
-Fn f(a, b, c, flag)
-  Type ()
-  Block
-    Let x
-      Binary +
-        Path a
-        Binary *
-          Path b
-          Path c
-    Let y
-      Binary +
-        Binary *
-          Path a
-          Path b
-        Path c
-    Let z
-      Binary -
-        Binary -
-          Path a
-          Path b
-        Path c
-    Let w
-      Binary /
-        Binary /
-          Path a
-          Path b
-        Path c
-    Let u
-      Binary <<
-        Path a
-        Binary +
-          Path b
-          Path c
-    Let t
-      Binary ||
-        Binary &&
-          Path flag
-          Binary <
-            Path a
-            Path b
-        Path flag
-    Let r
-      Binary |
-        Binary ^
-          Binary &
-            Path a
-            Path b
-          Path c
-        Path a
-    Let q
-      Binary <
-        Path a
-        Path b
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 14.8s)
-
-_Thinking:_
-
-Review:
-
-**14**: all correct:
-- `if x < 0 { return 90; } else if ...` nested If in Else ✓.
-- `{ { x + 1 } }` inner block tail block ✓ (dump shows Block → Tail Block).
-- statement boundary correctly split as before ✓.
-- `return 90;` ExprStmt Return(90) ✓.
-
-**15**: arrays ✓:
-- `[1,2,3]` Array with 3 elems ✓
-- `[0; 4]` RepeatArray len=4 ✓
-- nested arrays ✓
-- `c[1][0] = 8` Binary = with lhs Index(Index(c,1),0) ✓
-- `[Box::<i32>::new(5); 1]` RepeatArray len=1 with call ✓.
-
-**16**: 
-- unary/ref/deref ✓. `(1+2)*3` grouping ✓. `(())` → Unit ✓ (parens transparent).
-- Ref n=0 again uninitialized num_.
-
-**17**: precedence:
-- `a + b*c` ✓, `a*b + c` ✓, left assoc -, / ✓
-- `a << b + c` → `a << (b+c)` ✓ (additive binds tighter than shift) — wait, grammar shiftExpression: additive is the operand; the dump shows Binary << with rhs Binary + — correct.
-- `flag && a < b || flag` → `(flag && (a<b)) || flag` ✓
-- `a & b ^ c | a` → `|( ^( &(a,b), c), a)` ✓ (Rust: & > ^ > |).
-
-Interesting: in 17 we have `let u = a << b + c;` — a mixed... no, only one shift op; works. The bug only appears with multiple shift ops mixing << and >>.
-
-Wait, `03_operators` also had `let z = a << 2 >> 1;` — the bug. Also `let y = a & b | a ^ b` works because bitOr etc. use single op-rule lists? Let me check bitOrExpression builder: `a & b | a ^ b` parsed as bitOrExpression with PIPE ops; fine.
-
-Now let me review remaining 18-24. Then I'll create focused shift tests and 13b types-in-struct test, plus maybe check uninitialized num_ via valgrind? Valgrind may not be installed; could use MSan? Not easily. The dump read of num_ is enough evidence.
-
-Also check `20_stmt_boundary` output.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cd /tmp/opencode/ast-check && for f in 18_*.ast 19_*.ast 20_*.ast 21_*.ast 22_*.ast 23_*.ast 24_*.ast; do echo \"================ $f\"; cat \"$f\"; done"
-}
-```
-
-**Output:**
-```
-================ 18_chains.ast
-Struct S
-  field x
-    Type i32
-Impl
-  Type S
-  Fn new()
-    Type S
-    Block
-      Tail
-        StructInit
-          Path S
-          field x
-            IntLit 0
-  Fn get(self)
-    Type S
-    Block
-      Tail
-        StructInit
-          Path S
-          field x
-            Field x
-              Path self
-  Fn changed(mut self)
-    Type &mut
-      Type S
-    Block
-      Tail
-        Path self
-  Fn value(self)
-    Type i32
-    Block
-      Tail
-        Field x
-          Path self
-Fn main()
-  Type ()
-  Block
-    Let s
-      StructInit
-        Path S
-        field x
-          IntLit 1
-    Let a
-      Field x
-        Path s
-    Let b
-      Field x
-        MethodCall get
-          Path s
-    Let c
-      MethodCall value
-        MethodCall changed
-          Call
-            Path S::new
-================ 19_lifetimes_where.ast
-Struct View
-  field value
-    Type &
-      Type i32
-Impl
-  Type View
-  Fn get(self)
-    Type &
-      Type i32
-    Block
-      Tail
-        Field value
-          Path self
-Fn f(x)
-  Type &
-    Type i32
-  Block
-    Tail
-      Path x
-Fn main()
-  Type ()
-  Block
-================ 20_stmt_boundary.ast
-Struct R
-  field value
-    Type i32
-Fn make()
-  Type R
-  Block
-    Tail
-      StructInit
-        Path R
-        field value
-          IntLit 1
-Fn main()
-  Type ()
-  Block
-    ExprStmt
-      Field value
-        Block
-          Tail
-            Call
-              Path make
-    ExprStmt
-      If
-        BoolLit true
-        Block
-          Tail
-            IntLit 1
-        Else
-          Block
-            Tail
-              IntLit 2
-    ExprStmt
-      Unary -
-        IntLit 3
-    ExprStmt
-      While
-        BoolLit false
-        Block
-          Tail
-            IntLit 1
-    ExprStmt
-      Unary -
-        IntLit 2
-================ 21_casts_unary.ast
-Fn f(a, b)
-  Type ()
-  Block
-    Let x
-      Binary *
-        Binary +
-          Path a
-          IntLit 1
-        Binary -
-          Path a
-          IntLit 1
-    Let y
-      Binary +
-        Path a
-        Cast
-          IntLit 1
-          Type u32
-    Let z
-      Cast
-        Cast
-          Unary -
-            Path a
-          Type isize
-        Type usize
-    Let w
-      Binary &&
-        Unary !
-          Path b
-        Unary !
-          Binary ==
-            Path a
-            IntLit 1
-    Let v
-      Binary &&
-        Binary ==
-          Binary %
-            Path a
-            IntLit 2
-          IntLit 1
-        Path b
-================ 22_break_return.ast
-Fn f()
-  Type i32
-  Block
-    ExprStmt
-      Loop
-        Block
-          Tail
-            If
-              BoolLit true
-              Block
-                ExprStmt
-                  Break
-                    IntLit 1
-              Else
-                Block
-                  ExprStmt
-                    Continue
-    ExprStmt
-      Return
-        IntLit 2
-Fn g()
-  Type ()
-  Block
-    ExprStmt
-      Loop
-        Block
-          ExprStmt
-            Break
-    ExprStmt
-      Loop
-        Block
-          ExprStmt
-            Break
-              Unit
-    ExprStmt
-      Return
-================ 23_nested_blocks.ast
-Fn f()
-  Type ()
-  Block
-    Tail
-      Block
-        Let x
-          IntLit 1
-        Tail
-          Block
-            Let y
-              Path x
-================ 24_derefs.ast
-Fn f(p, q, b)
-  Type ()
-  Block
-    Let a
-      Deref
-        Path p
-    ExprStmt
-      Binary =
-        Deref
-          Path q
-        Path a
-    Let c
-      Deref
-        Path b
-    Let d
-      Deref
-        Deref
-          Ref  n=0
-            Path p
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 24.0s)
-
-_Thinking:_
-
-Reviewing 18-24:
-
-**18**: method chains ✓. `S::new().changed().value()` → MethodCall value → MethodCall changed → Call Path S::new ✓. `changed` returns `&mut` Type &mut S ✓.
-
-**19**: lifetimes/where discarded ✓; `View<'b>` impl target → Type View ✓; return `&'b i32` → Type & i32 ✓. Struct View field `&'a i32` → Type & i32 ✓.
-
-**20**: statement boundary:
-- `{ make() }.value;` → ExprStmt(Field value → Block(Tail Call make)) ✓
-- `if true {1} else {2} - 3;` → two stmts: ExprStmt(If) and ExprStmt(Unary - 3) ✓ (matches spec example)
-- `while false { 1 } - 2;` → ExprStmt(While) and ExprStmt(Unary - 2) ✓.
-
-**21**:
-- `a + 1 as u32` → Binary +(a, Cast(1,u32)) ✓ (as binds tighter than +)
-- `-a as isize as usize` → Cast(Cast(Unary(-,a),isize),usize) ✓
-- `!b && !(a == 1)` → &&( !b, !(==(a,1)) ) ✓
-- `a % 2 == 1 && b` → &&( ==( %(a,2), 1 ), b) ✓.
-
-**22**: loop/break/continue/return ✓. `break ();` → Break(Unit) ✓.
-
-**23**: nested blocks ✓. Note outer Block has Tail (inner block) and inner Block has Tail (inner-inner block)... wait:
-```
-Block
-  Tail
-    Block
-      Let x
-      Tail
-        Block
-          Let y
-```
-Outer function body: `{ let x; { let y; } }` → outer body Block with Let x and Tail Block; inner block has Let y and Tail Block (the innermost `{ let y = x; }` is a block with a Let and no tail? Hmm: source:
-```
-{
-    let x = 1;
-    {
-        let y = x;
-    }
-}
-```
-Outer body: stmts=[let x], tail = inner block. Inner block: stmts=[let y], no tail. But dump shows inner block with `Tail` → Block → Let y. Hmm, let me re-read the dump:
-
-```
-Block                    <- outer function body
-  Tail
-    Block                <- the inner block { let y = x; }
-      Let x
-      Tail
-        Block            <- ??? 
-          Let y
-```
-Wait it shows Block(outer) → Tail → Block A → Let x → Tail → Block B → Let y. That means the source parsed as outer body = block containing just a tail block; Block A = `{ let x; { let y; } }`, whose stmts=[let x], tail=Block B; Block B = `{ let y = x; }` stmts=[let y] no tail. But my source was:
-```
-fn f() {
-    {
-        let x = 1;
-        {
-            let y = x;
-        }
-    }
-}
-```
-Function body is a block containing a single expression statement `{ let x; { let y; } }`? Wait: the function body block contains one statement: the inner block `{ ... }` as an expression statement without semicolon. Since it's the last thing and no semicolon... Actually source: outer fn body brace contains `{ let x...; { let y...; } }`. The inner block `{let x...}` is an ExpressionWithBlock statement (no semicolon), and since it's the last expression in the body block, it becomes the body's tail expression (not a statement). So body = Block(stmts=[], tail=BlockA); BlockA = stmts=[let x], tail=BlockB; BlockB = stmts=[let y], tail=none. The dump matches exactly. ✓ (The AST is right; my source was nested one level deeper than I mentally modeled.)
-
-**24**: derefs ✓. `**&p` → Deref(Deref(Ref p)) ✓.
-
-Now, the known issues so far:
-1. **Mixed shift chains lose operators** (confirmed for 03 `a << 2 >> 1`). Need focused tests to characterize and confirm same bug in closed/condition/statement families.
-2. **`refExpr::num_` never initialized** — uninitialized read in dump (`n=0` is luck). Check ast.h: `int num_;` no default. Even if unused semantically, it's UB and dump prints garbage. Actually it assigned at line 2824 for repeatedArray? Let me double check which struct line 2824 belongs to. It was in a builder function; let me check around line 2800-2830 to see the context. If it's repeatedArrayExpr, then yes refExpr num_ never set.
-
-Let me also check whether `&&` refExpr creation sets num_? From the grep, refMake only sets isMut_ and operand_. So no.
-
-3. Dump doesn't print parameter types — not a bug, just a verification gap. I'll cover with struct-field type zoo.
-
-Other potential issues to check:
-- `visitUnaryExpression` handling of `&&` and `&mut`: verified via 05.
-- Compare/condition families: tested via normal expressions. The statement families (statementExpression etc.) may have bugs in specific contexts, e.g., inside while conditions; our 06 covers while c; 20 covers while false {1} - 2 (two statements). Also `if` conditions with struct init? Grammar excludes unparenthesized StructExpression at condition boundary. Test: `if S { x:1 }.x == 1`? Hmm, complicated. Not needed for AST correctness maybe. Could test `if (S { x: 1 }).x > 0 {}` — parenthesized.
-- Cast in condition context? e.g., `while (x as u32) > 0 { }`. Could test context-specific families. The builder has duplicated families for condition/conditionBreak/statement. Bugs there might only show in specific syntactic contexts. Let me design tests that force each family:
-  - condition family: expressions in if/while conditions. E.g. `if a + b * c > 0 {}`, `while x < y && z {}`.
-  - conditionBreak family: `loop { break a + b * c; }`? or `break x < y;`.
-  - statement family: `a + b * c;` as statement (without let). Our 04/07 used paths/literals; 17 used lets. Let me add a statement expression with complex precedence: `a + b * c;`, `a << b >> c;` as statement to expose statement-family shift bug.
-  - condition with shifts: `if a << b >> c == 0 {}`? precedence: shift > comparison, so `(a << b >> c) == 0`. Good test.
-  - break shift: `loop { break a << b >> c; }`.
-
-Let me create focused tests:
-
-25_shift_mix.rx:
-```rust
-fn f(a: i32, b: i32, c: i32) {
-    let s1 = a << b;
-    let s2 = a >> b;
-    let s3 = a << b << c;
-    let s4 = a >> b >> c;
-    let s5 = a << b >> c;
-    let s6 = a >> b << c;
-    let s7 = a << b >> c << a;
-    a << b >> c;
-    if a << b >> c > 0 { }
-    loop { break a << b >> c; }
-}
-```
-This will show the bug in multiple families.
-
-26_types_in_struct.rx:
-```rust
-struct T {
-    a: i32,
-    b: u32,
-    c: isize,
-    d: usize,
-    e: bool,
-    g: (),
-    h: &i32,
-    i: &mut u32,
-    j: &&i32,
-    k: &&mut i32,
-    l: (i32),
-    m: [i32; 4],
-    n: [u32; N],
-    o: Box<Vec<i32>>,
-    p: Vec<Box<[i32; 2]>>,
-}
-const N: usize = 4;
-```
-Dump fields show types. This verifies type building (shared with params).
-
-27_conditions.rx:
-```rust
-struct S { x: i32 }
-fn f(a: i32, b: i32, s: S) {
-    if (s.x) > 0 { }
-    while (s { }.x) > 0 { }  // invalid? struct expr in condition must be parenthesized: (S { x: 1 }).x > 0
-    if a + b * 2 > 0 && a < b { }
-    while a % 2 == 0 { }
-}
-```
-Hmm, careful valid syntax. Let me keep:
-```rust
-fn f(a: i32, b: i32) {
-    if a + b * 2 > 0 && a < b { }
-    while a % 2 == 0 && b != 0 { }
-    if (a as u32) > 0u32 { }
-}
-```
-Wait `if (a as u32) > 0u32 {}` — comparison with cast. fine.
-
-Also condition with struct expr: `if (Point { x: 1 }).x > 0 {}` — grouped struct expr; parser's conditionPrimaryWithoutBareBlock has `LPAREN expression RPAREN` etc. Should work.
-
-Let me also test `&&`/`||` short circuit in condition; covered.
-
-28_misc_expr_stmt:
-```rust
-fn f(a: i32, b: i32) {
-    a + b * 2;
-    a = b;
-    *&a = 3;
-    -a;
-    a as u32;
-}
-```
-Statement families.
-
-Let me create these and run. Then analyze.
-
-Also, I should verify the claimed bug more precisely by checking the parse tree for `a << b >> c` to see the rule structure, and then explain the fix. Let me run --dump-tree on a small file too.
-
-Let me create 25-28 with write.
-
-Two issues confirmed so far (mixed `<<`/`>>` chains, uninitialized `refExpr::num_`). Let me build focused tests to characterize them across all grammar families.
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "content": "fn f(a: i32, b: i32, c: i32) {\n    let s1 = a << b;\n    let s2 = a >> b;\n    let s3 = a << b << c;\n    let s4 = a >> b >> c;\n    let s5 = a << b >> c;\n    let s6 = a >> b << c;\n    let s7 = a << b >> c << a;\n    a << b >> c;\n    if a << b >> c > 0 { }\n    loop { break a << b >> c; }\n}\n",
-  "filePath": "/tmp/opencode/ast-check/25_shift_mix.rx"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "content": "const N: usize = 4;\nstruct T {\n    a: i32,\n    b: u32,\n    c: isize,\n    d: usize,\n    e: bool,\n    g: (),\n    h: &i32,\n    i: &mut u32,\n    j: &&i32,\n    k: &&mut i32,\n    l: (i32),\n    m: [i32; 4],\n    n: [u32; N],\n    o: Box<Vec<i32>>,\n    p: Vec<Box<[i32; 2]>>,\n    q: &mut Vec<Box<i32>>,\n    r: [[u32; 2]; 3],\n}\n",
-  "filePath": "/tmp/opencode/ast-check/26_types_in_struct.rx"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "content": "struct P { x: i32 }\nfn f(a: i32, b: i32) {\n    if a + b * 2 > 0 && a < b { }\n    while a % 2 == 0 && b != 0 { }\n    if (a as u32) > 0u32 { }\n    if (P { x: 1 }).x > 0 { }\n    let c = if a < b { a } else { b };\n}\n",
-  "filePath": "/tmp/opencode/ast-check/27_conditions.rx"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "content": "fn f(mut a: i32, b: i32) {\n    a + b * 2;\n    a = b;\n    *&mut a = 3;\n    -a;\n    a as u32;\n    !(a == b);\n}\n",
-  "filePath": "/tmp/opencode/ast-check/28_misc_expr_stmt.rx"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 13.1s)
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cd /tmp/opencode/ast-check && RXCC=\"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/target/build/rxcc\"; for f in 25_shift_mix.rx 26_types_in_struct.rx 27_conditions.rx 28_misc_expr_stmt.rx; do \"$RXCC\" --stage semantic --dump-ast \"$f\" >\"${f%.rx}.ast\" 2>\"${f%.rx}.err\"; echo \"exit=$? $f syntax_err=$(grep -c 'syntax error' ${f%.rx}.err)\"; done; echo ================; cat 25_shift_mix.ast",
-  "timeout": 60000
-}
-```
-
-**Output:**
-```
-exit=0 25_shift_mix.rx syntax_err=0
-exit=0 26_types_in_struct.rx syntax_err=0
-exit=0 27_conditions.rx syntax_err=0
-exit=0 28_misc_expr_stmt.rx syntax_err=0
-================
-Fn f(a, b, c)
-  Type ()
-  Block
-    Let s1
-      Binary <<
-        Path a
-        Path b
-    Let s2
-      Binary >>
-        Path a
-        Path b
-    Let s3
-      Binary <<
-        Binary <<
-          Path a
-          Path b
-        Path c
-    Let s4
-      Binary >>
-        Binary >>
-          Path a
-          Path b
-        Path c
-    Let s5
-      Binary <<
-        Path a
-        Path b
-    Let s6
-      Binary <<
-        Path b
-        Path a
-    Let s7
-      Binary <<
-        Binary <<
-          Path a
-          Path c
-        Path b
-    ExprStmt
-      Binary <<
-        Path a
-        Path b
-    ExprStmt
-      If
-        Binary >
-          Binary <<
-            Path a
-            Path b
-          IntLit 0
-        Block
-    Tail
-      Loop
-        Block
-          ExprStmt
-            Break
-              Binary <<
-                Path a
-                Path b
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 18.9s)
-
-_Thinking:_
-
-The shift bug is confirmed and characterized:
-
-- `a << b` ✓
-- `a >> b` ✓
-- `a << b << c` ✓
-- `a >> b >> c` ✓
-- `a << b >> c` → `a << b` (loses `>> c`) ✗
-- `a >> b << c` → `b << c` (loses `a >>`) ✗
-- `a << b >> c << a` → `(a << c) << b` ✗ (totally jumbled: dump shows Binary << (Binary << (a, c), b)) — let me parse that: outer `<<( <<(a,c), b)`. Original `((a<<b)>>c)<<a`. Wrong.
-- statement `a << b >> c;` → `a << b` ✗
-- condition `a << b >> c > 0` → `(a<<b) > 0` ✗
-- break `break a << b >> c;` → `a << b` ✗
-
-All grammar families (expression, condition, conditionBreak, statement) inherit the same bug because the builder has duplicated implementations with the same flawed assumption.
-
-Root cause: the grammar represents a shift chain as a flat sequence `(closedAdditive SHL | additive shiftRight)* additive`, and the builder tries to handle the two operator kinds separately via `ctx->SHL()` and `ctx->shiftRight()`, assuming they don't interleave, and uses the wrong accessor lists. Correct approach: walk the parse-tree children in order (they alternate operand/operator/operand/...), folding left-assoc with the op text from SHL ("<<") or shiftRight (">>").
-
-Parse tree structure: children are e.g. for `a << b >> c`: closedAdditiveExpression(a), SHL, additiveExpression(b), shiftRight, additiveExpression(c). For `a >> b << c`: additiveExpression(a), shiftRight, closedAdditiveExpression(b), SHL, additiveExpression(c). For `a << b << c`: closedAdditive(a), SHL, closedAdditive(b), SHL, additive(c). So children order works universally.
-
-So the fix is to iterate ctx->children with dynamic_cast / getText. Something like:
-
-```cpp
-std::any ASTVisitor::visitShiftExpression(RxParser::ShiftExpressionContext *ctx) {
-    Expr* left = nullptr;
-    std::string pendingOp;
-    for (auto* child : ctx->children) {
-        if (auto* ca = dynamic_cast<RxParser::ClosedAdditiveExpressionContext*>(child)) {
-            Expr* operand = anyExpr(visit(ca));
-            left = left ? makeBinary(pendingOp, left, operand) : operand;
-        } else if (auto* ad = dynamic_cast<RxParser::AdditiveExpressionContext*>(child)) {
-            ... same
-        } else if (auto* shl = dynamic_cast<antlr4::tree::TerminalNode*>(child)) {
-            pendingOp = shl->getText();   // "<<"
-        } else if (auto* sr = dynamic_cast<RxParser::ShiftRightContext*>(child)) {
-            pendingOp = sr->getText();    // ">>"
-        }
-    }
-    return static_cast<Expr*>(left);
-}
-```
-
-Note: `ctx->children` includes terminals and rule contexts. dynamic_cast TerminalNode works since antlr4::tree::TerminalNode is polymorphic? `getText()` via `child->getText()` could be simpler: for rule contexts getText returns full text though. Distinguish by dynamic_cast to context types.
-
-Alternatively the user can reconstruct using token indices: merge SHL/shiftRight and operand lists sorted by `->getStart()->getTokenIndex()`. But iterating children is simplest.
-
-However! I must not fix their code in this session (user asked me to verify, and earlier no-modification; also they'll want to write fixes themselves per course rules — AI usage restrictions). So I should report the bug precisely, maybe sketch the fix approach, but not edit repo files. The user said "想办法确认我写的是对的，或者哪里写错了" — report is the deliverable.
-
-The same pattern repeats for:
-- visitShiftExpression / visitClosedShiftExpression (expression + closed variants)
-- conditionShiftExpression / conditionClosedShiftExpression
-- conditionBreakShiftExpression / conditionBreakClosedShiftExpression
-- statementShiftExpression / statementClosedShiftExpression
-That's 8 functions. Let me locate them all and verify they have the same structure. Earlier grep showed line 914/952 (expression), and parser grammar lines 352/356 (condition), 445/452 (conditionBreak), 544/551 (statement). Let me find their builder implementations and check. Also there might be plus/minus "additive" versions which are fine (single operator kind).
-
-Also, I noticed in `a >> b << c` the result `b << c` suggests: SHL branch executed: operands=ctx->closedAdditiveExpression() = [b], ops=[SHL], left=b; final = b << additive(0)=c; ignoring additive(a) and shiftRight. Yes.
-
-For `a << b >> c << a`: parse: iter1 closedAdditive(a) SHL; iter2 additive(b) shiftRight; iter3 closedAdditive(c) SHL; final additive(a). SHL branch: closedAdditive=[a,c], ops=[SHL,SHL]; left=a; loop i<ops.size()-1=1: i=0: now = a << visit(closedAdditive[1]=c); left = a<<c. Then final: now = (a<<c) << additive(0)=a?? Wait the dump showed `<<( <<(a,c), b)`:
-```
-Binary <<
-  Binary <<
-    Path a
-    Path c
-  Path b
-```
-Hmm final rhs is `b`? The builder final uses `ctx->additiveExpression(0)` which for this parse = [b, a]? The additiveExpressions are b (iter2 operand) and a (final). So additiveExpression(0)=b. Hence (a<<c)<<b. Yes. Consistent.
-
-Now let me check 26/27/28 dumps, and locate the 8 shift functions. Also check `refExpr::num_` in ast.h and whether dump reads it. We know.
-
-Let me view 26/27/28.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cd /tmp/opencode/ast-check && for f in 26_types_in_struct.ast 27_conditions.ast 28_misc_expr_stmt.ast; do echo \"================ $f\"; cat \"$f\"; done"
-}
-```
-
-**Output:**
-```
-================ 26_types_in_struct.ast
-Const N
-  Type usize
-  ConstInt 4
-Struct T
-  field a
-    Type i32
-  field b
-    Type u32
-  field c
-    Type isize
-  field d
-    Type usize
-  field e
-    Type bool
-  field g
-    Type ()
-  field h
-    Type &
-      Type i32
-  field i
-    Type &mut
-      Type u32
-  field j
-    Type &
-      Type &
-        Type i32
-  field k
-    Type &
-      Type &mut
-        Type i32
-  field l
-    Type i32
-  field m
-    Type array len=4
-      Type i32
-  field n
-    Type array len=N
-      Type u32
-  field o
-    Type Box
-      Type Vec
-        Type i32
-  field p
-    Type Vec
-      Type Box
-        Type array len=2
-          Type i32
-  field q
-    Type &mut
-      Type Vec
-        Type Box
-          Type i32
-  field r
-    Type array len=3
-      Type array len=2
-        Type u32
-================ 27_conditions.ast
-Struct P
-  field x
-    Type i32
-Fn f(a, b)
-  Type ()
-  Block
-    ExprStmt
-      If
-        Binary &&
-          Binary >
-            Binary +
-              Path a
-              Binary *
-                Path b
-                IntLit 2
-            IntLit 0
-          Binary <
-            Path a
-            Path b
-        Block
-    ExprStmt
-      While
-        Binary &&
-          Binary ==
-            Binary %
-              Path a
-              IntLit 2
-            IntLit 0
-          Binary !=
-            Path b
-            IntLit 0
-        Block
-    ExprStmt
-      If
-        Binary >
-          Cast
-            Path a
-            Type u32
-          IntLit 0u32
-        Block
-    ExprStmt
-      If
-        Binary >
-          Field x
-            StructInit
-              Path P
-              field x
-                IntLit 1
-          IntLit 0
-        Block
-    Let c
-      If
-        Binary <
-          Path a
-          Path b
-        Block
-          Tail
-            Path a
-        Else
-          Block
-            Tail
-              Path b
-================ 28_misc_expr_stmt.ast
-Fn f(mut a, b)
-  Type ()
-  Block
-    ExprStmt
-      Binary +
-        Path a
-        Binary *
-          Path b
-          IntLit 2
-    ExprStmt
-      Binary =
-        Path a
-        Path b
-    ExprStmt
-      Binary =
-        Deref
-          Ref mut n=0
-            Path a
-        IntLit 3
-    ExprStmt
-      Unary -
-        Path a
-    ExprStmt
-      Cast
-        Path a
-        Type u32
-    ExprStmt
-      Unary !
-        Binary ==
-          Path a
-          Path b
-
-```
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "grep -n \"visitConditionShiftExpression\\|visitConditionClosedShiftExpression\\|visitConditionBreakShiftExpression\\|visitConditionBreakClosedShiftExpression\\|visitStatementShiftExpression\\|visitStatementClosedShiftExpression\" /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/frontend/ast_builder.cpp"
-}
-```
-
-**Output:**
-```
-1380:std::any ASTVisitor::visitConditionShiftExpression(RxParser::ConditionShiftExpressionContext *ctx) {
-1418:std::any ASTVisitor::visitConditionClosedShiftExpression(RxParser::ConditionClosedShiftExpressionContext *ctx) {
-1858:std::any ASTVisitor::visitConditionBreakShiftExpression(RxParser::ConditionBreakShiftExpressionContext *ctx) {
-1901:std::any ASTVisitor::visitConditionBreakClosedShiftExpression(RxParser::ConditionBreakClosedShiftExpressionContext *ctx) {
-2352:std::any ASTVisitor::visitStatementShiftExpression(RxParser::StatementShiftExpressionContext *ctx) {
-2395:std::any ASTVisitor::visitStatementClosedShiftExpression(RxParser::StatementClosedShiftExpressionContext *ctx) {
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 13.2s)
-
-_Thinking:_
-
-The type zoo in struct fields is all correct, including `&mut u32`, `&&i32`, `&&mut i32`, parenthesized `(i32)` → i32, arrays, nested Box/Vec, `&mut Vec<Box<i32>>`, `[[u32;2];3]`. Good — this validates the shared type-building path used by function params too.
-
-27/28 correct, except the ref num_ uninitialized.
-
-Now verify the other 6 shift functions have the same bug pattern. Let me read them briefly (or diff structure). Let me read lines 1380-1460, 1858-1950, 2352-2440. Given file is big, use read with offsets. Actually I can grep for "shiftRight" in those regions to see if they use the same accessor-splitting logic. Let me print those functions.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "sed -n '1380,1456p;1858,1940p;2352,2434p' /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/frontend/ast_builder.cpp"
-}
-```
-
-**Output:**
-```
-std::any ASTVisitor::visitConditionShiftExpression(RxParser::ConditionShiftExpressionContext *ctx) {
-    if (ctx->SHL().size() != 0u) {
-        auto operands = ctx->conditionClosedAdditiveExpression();
-        auto ops = ctx->SHL();
-        Expr* left = anyExpr(visit(operands[0]));
-        for (int i = 0; i < ops.size() - 1; i++) {
-            auto now = make<binaryExpr>();
-            now->op_ = ops[i]->getText();
-            now->lhs_ = left;
-            now->rhs_ = anyExpr(visit(operands[i + 1]));
-            left = now;
-        }
-        auto now = make<binaryExpr>();
-        now->op_ = ops[ops.size() - 1]->getText();
-        now->lhs_ = left;
-        now->rhs_ = anyExpr(visit(ctx->conditionAdditiveExpression(0)));
-        return static_cast<Expr*>(now);
-    }
-    else {
-        auto operands = ctx->conditionAdditiveExpression();
-        auto ops = ctx->shiftRight();
-        Expr* left = anyExpr(visit(operands[0]));
-        for (int i = 0; i < ops.size(); i++) {
-            auto now = make<binaryExpr>();
-            now->op_ = ops[i]->getText();
-            now->lhs_ = left;
-            now->rhs_ = anyExpr(visit(operands[i + 1]));
-            left = now;
-        }
-        return static_cast<Expr*>(left);
-    }
-}
-/*
-conditionShiftExpression
-    : (conditionClosedAdditiveExpression SHL | conditionAdditiveExpression shiftRight)* conditionAdditiveExpression
-    ;
-*/
-
-std::any ASTVisitor::visitConditionClosedShiftExpression(RxParser::ConditionClosedShiftExpressionContext *ctx) {
-    if (ctx->shiftRight().size() != 0u) {
-        auto operands = ctx->conditionAdditiveExpression();
-        auto ops = ctx->shiftRight();
-        Expr* left = anyExpr(visit(operands[0]));
-        for (int i = 0; i < ops.size() - 1; i++) {
-            auto now = make<binaryExpr>();
-            now->op_ = ops[i]->getText();
-            now->lhs_ = left;
-            now->rhs_ = anyExpr(visit(operands[i + 1]));
-            left = now;
-        }
-        auto now = make<binaryExpr>();
-        now->op_ = ops[ops.size() - 1]->getText();
-        now->lhs_ = left;
-        now->rhs_ = anyExpr(visit(ctx->conditionClosedAdditiveExpression(0)));
-        return static_cast<Expr*>(now);
-    }
-    else {
-        auto operands = ctx->conditionClosedAdditiveExpression();
-        auto ops = ctx->SHL();
-        Expr* left = anyExpr(visit(operands[0]));
-        for (int i = 0; i < ops.size(); i++) {
-            auto now = make<binaryExpr>();
-            now->op_ = ops[i]->getText();
-            now->lhs_ = left;
-            now->rhs_ = anyExpr(visit(operands[i + 1]));
-            left = now;
-        }
-        return static_cast<Expr*>(left);
-    }
-}
-/*
-conditionClosedShiftExpression
-    : (conditionClosedAdditiveExpression SHL | conditionAdditiveExpression shiftRight)* conditionClosedAdditiveExpression
-    ;
-*/
-
-std::any ASTVisitor::visitConditionAdditiveExpression(RxParser::ConditionAdditiveExpressionContext *ctx) {
-std::any ASTVisitor::visitConditionBreakShiftExpression(RxParser::ConditionBreakShiftExpressionContext *ctx) {
-    if (ctx->conditionAdditiveExpression().size() == 0u) {
-        return anyExpr(visit(ctx->conditionBreakAdditiveExpression()));
-    }
-    if (ctx->SHL().size() != 0u) {
-        auto operands = ctx->conditionClosedAdditiveExpression();
-        auto ops = ctx->SHL();
-        Expr* left = anyExpr(visit(ctx->conditionBreakClosedAdditiveExpression()));
-        for (int i = 0; i < ops.size() - 1; i++) {
-            auto now = make<binaryExpr>();
-            now->op_ = ops[i]->getText();
-            now->lhs_ = left;
-            now->rhs_ = anyExpr(visit(operands[i]));
-            left = now;
-        }
-        auto now = make<binaryExpr>();
-        now->op_ = ops[ops.size() - 1]->getText();
-        now->lhs_ = left;
-        now->rhs_ = anyExpr(visit(ctx->conditionAdditiveExpression(0)));
-        return static_cast<Expr*>(now);
-    }
-    else {
-        auto operands = ctx->conditionAdditiveExpression();
-        auto ops = ctx->shiftRight();
-        Expr* left = anyExpr(visit(ctx->conditionBreakAdditiveExpression()));
-        for (int i = 0; i < ops.size(); i++) {
-            auto now = make<binaryExpr>();
-            now->op_ = ops[i]->getText();
-            now->lhs_ = left;
-            now->rhs_ = anyExpr(visit(operands[i]));
-            left = now;
-        }
-        return static_cast<Expr*>(left);
-    }
-}
-/*
-conditionBreakShiftExpression
-    : conditionBreakAdditiveExpression
-    | (conditionBreakClosedAdditiveExpression SHL | conditionBreakAdditiveExpression shiftRight)
-      (conditionClosedAdditiveExpression SHL | conditionAdditiveExpression shiftRight)* conditionAdditiveExpression
-    ;
-*/
-
-std::any ASTVisitor::visitConditionBreakClosedShiftExpression(RxParser::ConditionBreakClosedShiftExpressionContext *ctx) {
-    if (ctx->conditionClosedAdditiveExpression().size() == 0u) {
-        return anyExpr(visit(ctx->conditionBreakAdditiveExpression()));
-    }
-    if (ctx->shiftRight().size() != 0u) {
-        auto operands = ctx->conditionAdditiveExpression();
-        auto ops = ctx->shiftRight();
-        Expr* left = anyExpr(visit(ctx->conditionBreakAdditiveExpression()));
-        for (int i = 0; i < ops.size() - 1; i++) {
-            auto now = make<binaryExpr>();
-            now->op_ = ops[i]->getText();
-            now->lhs_ = left;
-            now->rhs_ = anyExpr(visit(operands[i]));
-            left = now;
-        }
-        auto now = make<binaryExpr>();
-        now->op_ = ops[ops.size() - 1]->getText();
-        now->lhs_ = left;
-        now->rhs_ = anyExpr(visit(ctx->conditionClosedAdditiveExpression(0)));
-        return static_cast<Expr*>(now);
-    }
-    else {
-        auto operands = ctx->conditionClosedAdditiveExpression();
-        auto ops = ctx->SHL();
-        Expr* left = anyExpr(visit(ctx->conditionBreakClosedAdditiveExpression()));
-        for (int i = 0; i < ops.size(); i++) {
-            auto now = make<binaryExpr>();
-            now->op_ = ops[i]->getText();
-            now->lhs_ = left;
-            now->rhs_ = anyExpr(visit(operands[i]));
-            left = now;
-        }
-        return static_cast<Expr*>(left);
-    }
-}
-/*
-conditionBreakClosedShiftExpression
-    : conditionBreakClosedAdditiveExpression
-    | (conditionBreakClosedAdditiveExpression SHL | conditionBreakAdditiveExpression shiftRight)
-      (conditionClosedAdditiveExpression SHL | conditionAdditiveExpression shiftRight)* conditionClosedAdditiveExpression
-std::any ASTVisitor::visitStatementShiftExpression(RxParser::StatementShiftExpressionContext *ctx) {
-    if (ctx->additiveExpression().size() == 0u) {
-        return anyExpr(visit(ctx->statementAdditiveExpression()));
-    }
-    if (ctx->SHL().size() != 0u) {
-        auto operands = ctx->closedAdditiveExpression();
-        auto ops = ctx->SHL();
-        Expr* left = anyExpr(visit(ctx->statementClosedAdditiveExpression()));
-        for (int i = 0; i < ops.size() - 1; i++) {
-            auto now = make<binaryExpr>();
-            now->op_ = ops[i]->getText();
-            now->lhs_ = left;
-            now->rhs_ = anyExpr(visit(operands[i]));
-            left = now;
-        }
-        auto now = make<binaryExpr>();
-        now->op_ = ops[ops.size() - 1]->getText();
-        now->lhs_ = left;
-        now->rhs_ = anyExpr(visit(ctx->additiveExpression(0)));
-        return static_cast<Expr*>(now);
-    }
-    else {
-        auto operands = ctx->additiveExpression();
-        auto ops = ctx->shiftRight();
-        Expr* left = anyExpr(visit(ctx->statementAdditiveExpression()));
-        for (int i = 0; i < ops.size(); i++) {
-            auto now = make<binaryExpr>();
-            now->op_ = ops[i]->getText();
-            now->lhs_ = left;
-            now->rhs_ = anyExpr(visit(operands[i]));
-            left = now;
-        }
-        return static_cast<Expr*>(left);
-    }
-}
-/*
-statementShiftExpression
-    : statementAdditiveExpression
-    | (statementClosedAdditiveExpression SHL | statementAdditiveExpression shiftRight)
-      (closedAdditiveExpression SHL | additiveExpression shiftRight)* additiveExpression
-    ;
-*/
-
-std::any ASTVisitor::visitStatementClosedShiftExpression(RxParser::StatementClosedShiftExpressionContext *ctx) {
-    if (ctx->closedAdditiveExpression().size() == 0u) {
-        return anyExpr(visit(ctx->statementClosedAdditiveExpression()));
-    }
-    if (ctx->shiftRight().size() != 0u) {
-        auto operands = ctx->additiveExpression();
-        auto ops = ctx->shiftRight();
-        Expr* left = anyExpr(visit(ctx->statementAdditiveExpression()));
-        for (int i = 0; i < ops.size() - 1; i++) {
-            auto now = make<binaryExpr>();
-            now->op_ = ops[i]->getText();
-            now->lhs_ = left;
-            now->rhs_ = anyExpr(visit(operands[i]));
-            left = now;
-        }
-        auto now = make<binaryExpr>();
-        now->op_ = ops[ops.size() - 1]->getText();
-        now->lhs_ = left;
-        now->rhs_ = anyExpr(visit(ctx->closedAdditiveExpression(0)));
-        return static_cast<Expr*>(now);
-    }
-    else {
-        auto operands = ctx->closedAdditiveExpression();
-        auto ops = ctx->SHL();
-        Expr* left = anyExpr(visit(ctx->statementClosedAdditiveExpression()));
-        for (int i = 0; i < ops.size(); i++) {
-            auto now = make<binaryExpr>();
-            now->op_ = ops[i]->getText();
-            now->lhs_ = left;
-            now->rhs_ = anyExpr(visit(operands[i]));
-            left = now;
-        }
-        return static_cast<Expr*>(left);
-    }
-}
-/*
-statementClosedShiftExpression
-    : statementClosedAdditiveExpression
-    | (statementClosedAdditiveExpression SHL | statementAdditiveExpression shiftRight)
-      (closedAdditiveExpression SHL | additiveExpression shiftRight)* closedAdditiveExpression
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 21.4s)
-
-_Thinking:_
-
-All 8 shift functions share the same "SHL branch ignores shiftRight" flaw. The conditionBreak/statement families add an initial operand before the loop, but the fundamental issue remains: the SHL-present branch only processes SHL operators and drops all `>>` parts; and the accessor lists don't preserve interleaving order.
-
-Our empirical test (25) exercised expression family, statement family, condition family (if), conditionBreak? The `break a << b >> c;` — which function handles that? break's operand probably uses conditionBreak family? The dump showed `a << b` for break too. So conditionBreak family broken too. Good coverage.
-
-Now, are there any other grammar rules with the same "interleaved alternatives with two op kinds" issue? Let me scan Parser.g4 rules using the pattern `( X OP1 | Y OP2 )*`. From the earlier grep, only the shift rules seem to use that pattern. Let me grep Parser.g4 for `)*` lines containing `|` and two ops... The bitOr/bitXor/bitAnd rules: 
-
-```
-bitOrExpression: bitXorExpression (PIPE bitXorExpression)*  — single op kind
-closedBitOrExpression: (bitXorExpression PIPE)* closedBitXorExpression — single kind
-```
-Fine.
-
-What about assignment: `assignmentExpression : ...`? Probably single op. And `comparisonExpression` special LT handling: 
-```
-comparisonExpression
-    : bitOrExpression (comparisonExceptLt bitOrExpression)?
-    | closedBitOrExpression LT bitOrExpression
-```
-At most one comparison operator (Rust doesn't allow chaining). But wait — `a < b < c` would be a parse error or parse as? Rust forbids chained comparison syntax? Actually Rust parses `a < b < c` as an error? It parses as `(a < b) < c` type error at semantic level? In Rust, comparison operators are non-associative: `a < b < c` is a parse error ("chained comparison operators"). The grammar here allows only one optional op, so `a < b < c` should be a syntax error. Not a concern.
-
-What about `closedBitOrExpression LT bitOrExpression` where LT is `<` and generic close ambiguity: e.g., `a < b` at top; `Vec<Vec<i32>>` type parsing uses genericClose. Fine.
-
-Now, potential related bug: the `visitClosedShiftExpression` etc. also use `ops.size()-1` with `size_t`? `ops` is `auto` from ctx->SHL() which returns `std::vector<...>`; `ops.size() - 1` with int i — if ops.size()==0 in the branch... The branch is entered only when size != 0, so fine.
-
-Now let me also check whether the shift bug affects official tests. Official shift tests use single shifts only (from grep). Signed shifts `-8i32 >> 34usize` is NEG then shift, single op. So official semantic suite likely never hits mixed shifts — meaning the bug wouldn't fail tests, but AST correctness demo (and later IR) would be wrong. Since the user asked to verify AST correctness, it's a genuine finding.
-
-Wait — but the AST stage was already accepted in the previous course milestone (week 4), so presumably accepted. Still, this is a real bug.
-
-Are there other expr chains with similar interleaving that our corpus didn't cover? Let me think about `unary`/`cast`: `(AS typeRef)*` handled by loop? Let me check visitCastExpression/ClosedCast. Our test `a as u32 as isize` worked (nested). Condition/statement cast families? Test 21 was in let (expression family). Let me test casts in statement/condition contexts: `a as u32 as isize;` as statement; possibly handled by statementCastExpression with own logic. Could have bugs. Also unary in conditions.
-
-Other duplicated families: comparisonExceptLt? `a >= b`, `a > b` in condition/statement contexts; our 27 used `>` in if and `!=` in while, `> 0u32` in if — those hit condition family and worked. Break with comparison `break a < b;` — conditionBreak family; not tested. Let me add tests to cover conditionBreak family more: `loop { break a < b; }`, `loop { break a as u32; }`, `loop { break a + b; }`, `loop { break -a; }` and statement versions. Also `return a << b >> c;` (in expression-family? return uses conditionBreak? In grammar, return expression uses `expression` maybe but inside statement context?). Let me check which rule `break` uses: maybe conditionBreak*. And `return` — grammar likely `RETURN expression?` using full expression. Hmm, break's operand uses conditionBreak families to handle statement boundaries.
-
-Also need to test `&&`/`||`/comparison/cast/additive in conditionBreak contexts.
-
-Let me create 29_break_family.rx:
-```rust
-fn f(a: i32, b: i32, c: bool) {
-    loop { break a + b * 2; }
-    loop { break -a; }
-    loop { break !c; }
-    loop { break a as u32; }
-    loop { break a < b; }
-    loop { break &a; }
-    loop { break a & b | a; }
-    loop { break &&a; }
-}
-```
-But `break` inside loop with value; fine. Note multiple loops okay.
-
-Also `return a + b * 2;` in a function (return uses expression or statement family?).
-
-30_return_family.rx:
-```rust
-fn f(a: i32, b: i32, c: bool) -> i32 {
-    if c { return a + b * 2; }
-    while c { return -a; }
-    return a as u32 as isize as i32;
-}
-```
-Hmm as i32 etc. Let me keep simpler but cover cast chain in return: `return a as u32 as isize as i32;` semantic invalid maybe but AST fine.
-
-Also statement cast chain: `a as u32 as isize;` in 28 already has single cast as statement. Add chained cast statement.
-
-Also `&&` in condition already. Unary in condition: `if !c {}` — 06 partially; `while !c {}` not yet; add.
-
-Also shift in cast: `(a << b) as i32` — tested shape `(a << b)` in let? Test: `let x = (a << b) as i32;` — closedAdditive? The `(a << b)` uses closedShiftExpression family (because parenthesized expression uses primary ( expression ) — which uses full expression? Hmm, inside parens, `expression` rule is used, not closed. Whatever, it parsed.
-
-Let me add 29/30 and check for new bugs. Also test `return` with mixed shift: `return a << b >> c;`.
-
-Also, I realize I should test the `condition` family cast chain: `if a as u32 as isize > 0 {}` — conditionCastExpression with (AS closedCastType)*. Let me add.
-
-Let me write 29, 30.
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "content": "fn f(a: i32, b: i32, c: bool) {\n    loop { break a + b * 2; }\n    loop { break -a; }\n    loop { break !c; }\n    loop { break a as u32; }\n    loop { break a as u32 as isize; }\n    loop { break a < b; }\n    loop { break &a; }\n    loop { break a & b | a; }\n    loop { break &&a; }\n    loop { break a << b >> a; }\n}\n",
-  "filePath": "/tmp/opencode/ast-check/29_break_family.rx"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "content": "fn f(a: i32, b: i32, c: bool) -> i32 {\n    if c { return a + b * 2; }\n    while c { return -a; }\n    if a as u32 as isize > 0 { }\n    a as u32 as isize;\n    while !c { }\n    if c && !c { }\n    return a << b >> a;\n}\n",
-  "filePath": "/tmp/opencode/ast-check/30_return_stmt_family.rx"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 12.8s)
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cd /tmp/opencode/ast-check && RXCC=\"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/target/build/rxcc\"; for f in 29_break_family.rx 30_return_stmt_family.rx; do \"$RXCC\" --stage semantic --dump-ast \"$f\" >\"${f%.rx}.ast\" 2>\"${f%.rx}.err\"; echo \"exit=$? $f syntax_err=$(grep -c 'syntax error' ${f%.rx}.err)\"; done; echo ==============; cat 29_break_family.ast; echo ==============; cat 30_return_stmt_family.ast",
-  "timeout": 60000
-}
-```
-
-**Output:**
-```
-exit=0 29_break_family.rx syntax_err=0
-exit=0 30_return_stmt_family.rx syntax_err=0
-==============
-Fn f(a, b, c)
-  Type ()
-  Block
-    ExprStmt
-      Loop
-        Block
-          ExprStmt
-            Break
-              Binary +
-                Path a
-                Binary *
-                  Path b
-                  IntLit 2
-    ExprStmt
-      Loop
-        Block
-          ExprStmt
-            Break
-              Unary -
-                Path a
-    ExprStmt
-      Loop
-        Block
-          ExprStmt
-            Break
-              Unary !
-                Path c
-    ExprStmt
-      Loop
-        Block
-          ExprStmt
-            Break
-              Cast
-                Path a
-                Type u32
-    ExprStmt
-      Loop
-        Block
-          ExprStmt
-            Break
-              Cast
-                Cast
-                  Path a
-                  Type u32
-                Type isize
-    ExprStmt
-      Loop
-        Block
-          ExprStmt
-            Break
-              Binary <
-                Path a
-                Path b
-    ExprStmt
-      Loop
-        Block
-          ExprStmt
-            Break
-              Ref  n=0
-                Path a
-    ExprStmt
-      Loop
-        Block
-          ExprStmt
-            Break
-              Binary |
-                Binary &
-                  Path a
-                  Path b
-                Path a
-    ExprStmt
-      Loop
-        Block
-          ExprStmt
-            Break
-              Ref  n=0
-                Ref  n=0
-                  Path a
-    Tail
-      Loop
-        Block
-          ExprStmt
-            Break
-              Binary <<
-                Path a
-                Path b
-==============
-Fn f(a, b, c)
-  Type i32
-  Block
-    ExprStmt
-      If
-        Path c
-        Block
-          ExprStmt
-            Return
-              Binary +
-                Path a
-                Binary *
-                  Path b
-                  IntLit 2
-    ExprStmt
-      While
-        Path c
-        Block
-          ExprStmt
-            Return
-              Unary -
-                Path a
-    ExprStmt
-      If
-        Binary >
-          Cast
-            Cast
-              Path a
-              Type u32
-            Type isize
-          IntLit 0
-        Block
-    ExprStmt
-      Cast
-        Cast
-          Path a
-          Type u32
-        Type isize
-    ExprStmt
-      While
-        Unary !
-          Path c
-        Block
-    ExprStmt
-      If
-        Binary &&
-          Path c
-          Unary !
-            Path c
-        Block
-    ExprStmt
-      Return
-        Binary <<
-          Path a
-          Path b
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 20.6s)
-
-_Thinking:_
-
-29: all families correct except the shift bug at the end (`a << b >> a` → `a << b`). Note the `break a << b >> a;` hits conditionBreak family — bug confirmed there.
-
-30: all correct except `return a << b >> a;` → `a << b` (bug; return probably uses expression family? The last statement is Tail: last expr in block without semicolon is `return ...`? Actually source `return a << b >> a;` with semicolon; dump shows ExprStmt Return(Binary <<) — wait, the dump shows:
-```
-    ExprStmt
-      Return
-        Binary <<
-          Path a
-          Path b
-```
-Yes bug.
-
-So all 8 shift functions are affected; any mixed `<<`/`>>` chain anywhere loses/rewrites operators.
-
-Now other things to verify:
-1. `refExpr::num_` uninitialized — check ast.h line 73: `int num_;` no initializer; builder never sets it. The dump reads `x->num_` → UB. Let me double check by looking at ast.h current content (it may have been updated). Earlier read showed no default. Let me confirm quickly with grep.
-
-2. Also check `repeatedArrayExpr.num_` dump: prints `x->num_ ? x->num_->text_ : "?"` — that's fine (set by builder).
-
-3. Any other uninitialized fields in AST structs? Let's audit ast.h:
-- ConstValue: `kConstKind kind_; std::string text_; ConstValue* inner_;` — inner_ uninitialized for INT/BOOL/PATH; dumpConst for those kinds doesn't read inner_. But semantic might later: manifestConstInt should only read inner_ for NEG. Not UB unless read. dumpConst NEG reads inner_; builder sets it. OK-ish. But `inner_` should ideally be nullptr-initialized.
-- pathSeg: name_, types_ fine.
-- blockExpr: stmts_, tail_ — tail_ uninitialized? `Expr* tail_;` with no default! In ast_builder visitBlockExpression, is tail_ always set? Let me check. If a block has no tail, builder must set tail_=nullptr explicitly; otherwise dumpBlock checks `if (b->tail_)` — reading uninitialized pointer → UB. Let me check the builder's visitBlockExpression.
-- whileExpr/loopExpr/ifExpr etc. all set.
-- binaryExpr: op_, lhs_, rhs_ set.
-- castExpr: from_, to_ set.
-- unaryExpr: op_, operand_ set.
-- refExpr: isMut_, num_ (unset!), operand_ set. → bug.
-- callExpr: callee_, args_ set.
-- methodCallExpr set.
-- fieldExpr set.
-- indexExpr set.
-- structInitExpr: path_, fields_ set.
-- breakExpr/returnExpr: tail_ may be nullptr; set explicitly? Builder likely sets only if expression present; if not, tail_ uninitialized → dump checks `if (x->tail_)`. Need to check builder code! For `return;` and `break;` our dumps show no child, no crash — but tail_ could be garbage pointing anywhere; `if (x->tail_)` would then dereference garbage Expr → likely crash. Since it didn't crash across many tests, maybe builder initializes. Let me check visitNonBlockPrimary or wherever break/return are built.
-- continueExpr fine.
-- intLitExpr/boolLitExpr set.
-- arrayExpr args set.
-- repeatedArrayExpr value_, num_ set.
-- Type: elem_ default nullptr; isMut_ default false; arrayLength_ default nullptr. kind_, name_ set by builder.
-- letStmt: type_ may be nullptr (no annotation); builder sets type_ only if present? If not set and uninitialized → check `if (x->type_)` in dump. Need default nullptr in ast.h? ast.h shows `Type* type_; Expr* init_;` — no default. Builder visitLetStatement must set type_ = nullptr when absent. Let me check.
-- Param: `bool isMut_, isSelf_;` — builder sets both in selfParam/functionParam; but in visitSelfParam, isMut_ set only if MUT(); else uninitialized! Look:
-```cpp
-std::any ASTVisitor::visitSelfParam(...)
-    Param ret;
-    ret.name_ = "self";
-    ret.isSelf_ = true;
-    if(ctx->MUT()){ ret.isMut_ = true; }   // else ret.isMut_ uninitialized!
-```
-And dumpItem reads `x->parameter_[i].isMut_` → UB for `&self`/`self` without mut! Our dumps printed `value(self)` (no "mut") — could be unlucky zero. This is another uninitialized read. Also `Param.type_` set always. `isSelf_` set. So `Param::isMut_` uninitialized in selfParam when no MUT.
-  - Also in visitFunctionParam: `ret.isMut_ = (ctx->identifierBinding()->MUT() != nullptr);` fine.
-- structField: name_, type_ set.
-- funcItem: parameter_, retType_ set (unit default), body_ set.
-- structItem: derives_, name_, fields_ set.
-- constItem: set.
-- ImplItem: set.
-- Crate: set.
-
-So potential uninitialized reads:
-a. `refExpr::num_` (dump reads it).
-b. `Param::isMut_` for `self`, `&self`, `&mut self`? Wait: `if(ctx->MUT()){ ret.isMut_ = true; }` — for `&mut self`, MUT() is present → true. For `&self` and `self`: uninitialized. Dump prints "mut " if true — could spuriously print "mut self" for plain `self`! In our dumps 09 showed `value(self)` and `consume(self)` — got lucky (or allocator zeroed). This is a real bug (UB) and might also affect semantics later (e.g., place mutability? Actually self param mut means `mut self` binding; isMut_ used later for what? For parameters: `fn f(mut x: i32)` binding mutability. For self: `&mut self` → selfMut_ derived from type; `mut self` → isMut_ true. Semantic will use isMut_ for by-value receiver mutability maybe).
-c. `returnExpr::tail_` / `breakExpr::tail_`: check builder.
-d. `letStmt::type_`: check builder.
-
-Let me inspect the builder for blockExpr tail, return/break, letStmt.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "grep -n \"make<blockExpr>\\|make<returnExpr>\\|make<breakExpr>\\|make<letStmt>\\|make<continueExpr>\\|make<unitExpr>\" /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/frontend/ast_builder.cpp"
-}
-```
-
-**Output:**
-```
-567:    auto now = make<letStmt>();
-583:    auto now = make<blockExpr>();
-2663:        auto now = make<unitExpr>();
-2670:        auto now = make<breakExpr>();
-2677:        auto now = make<returnExpr>();
-2684:        auto now = make<continueExpr>();
-2727:        auto now = make<unitExpr>();
-2748:        auto now = make<breakExpr>();
-2755:        auto now = make<returnExpr>();
-2762:        auto now = make<continueExpr>();
-
-```
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "grep -n \"struct refExpr\" -A 5 /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/ast/ast.h; grep -n \"struct Param\" -A 5 /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/ast/ast.h; grep -n \"struct letStmt\" -A 6 /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/ast/ast.h; grep -n \"struct returnExpr\" -A 3 /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/ast/ast.h"
-}
-```
-
-**Output:**
-```
-71:struct refExpr : Expr {
-72-    bool isMut_;
-73-    int num_;
-74-    Expr* operand_;
-75-};
-76-
-182:struct Param {
-183-    std::string name_;
-184-    Type* type_;
-185-    bool isMut_, isSelf_;
-186-};
-187-
-158:struct letStmt : Stmt {
-159-    std::string name_;
-160-    bool isMut_;
-161-    Type* type_;
-162-    Expr* init_;
-163-};
-164-
-120:struct returnExpr : Expr {
-121-    Expr* tail_;
-122-};
-123-
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 12.5s)
-
-_Thinking:_
-
-Let me read the builder around lines 560-600 (letStmt, blockExpr) and 2650-2770 (break/return families). Check whether tail_/type_ are initialized.
-
-**Tool: read**
-
-**Input:**
-```json
-{
-  "filePath": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/frontend/ast_builder.cpp",
-  "limit": 60,
-  "offset": 560
-}
-```
-
-**Output:**
-```
-<path>/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/frontend/ast_builder.cpp</path>
-<type>file</type>
-<content>
-560: std::any ASTVisitor::visitIdentifierBinding(RxParser::IdentifierBindingContext *ctx) {
-561:     // Compressed
-562:     throw "visitIdentifierBinding";
-563:     return visitChildren(ctx);
-564: }
-565: 
-566: std::any ASTVisitor::visitLetStatement(RxParser::LetStatementContext *ctx) {
-567:     auto now = make<letStmt>();
-568:     now->isMut_ = (ctx->identifierBinding()->MUT() != nullptr);
-569:     now->name_ = ctx->identifierBinding()->identifier()->getText();
-570:     if (ctx->typeRef()) {
-571:         now->type_ = anyType(visit(ctx->typeRef()));
-572:     }
-573:     now->init_ = anyExpr(visit(ctx->expression()));
-574:     return static_cast<Stmt*>(now);
-575: }
-576: /*
-577: letStatement
-578:     : LET identifierBinding (COLON typeRef)? equalsSign expression SEMI
-579:     ;
-580: */
-581: 
-582: std::any ASTVisitor::visitBlockExpression(RxParser::BlockExpressionContext *ctx) {
-583:     auto now = make<blockExpr>();
-584:     auto stmts = ctx->statement();
-585:     for (auto stmt : stmts) {
-586:         if (stmt != *std::prev(stmts.end())) {
-587:             now->stmts_.push_back(anyStmt(visit(stmt)));
-588:         }
-589:         else {
-590:             bool last_value = false;
-591:             if (auto blk = stmt->expressionWithBlock(); blk) {
-592:                 if (ctx->statementExpression() == nullptr && stmt->SEMI() == nullptr) {
-593:                     last_value = true;
-594:                 }
-595:             }
-596:             if (last_value) {
-597:                 now->tail_ = anyExpr(visit(stmt->expressionWithBlock()));
-598:             }
-599:             else {
-600:                 now->stmts_.push_back(anyStmt(visit(stmt)));
-601:             }
-602:         }
-603:     }
-604:     if(ctx->statementExpression()) {
-605:         now->tail_ = anyExpr(visit(ctx->statementExpression()));
+515:     if (sig == nullptr) {
+516:         error("can't resolve name in lookupValue : " + name);
+517:         return semantic::makeError();
+518:     }
+519:     return sig->type_;
+520: }
+521: 
+522: semType* Checker::infer(Expr* expr) {
+523:     if (auto lit = dynamic_cast<intLitExpr*>(expr); lit) {
+524:         std::string suf = intSuffix(lit->value_);
+525:         return suf.empty() ? semantic::makeBuiltin("i32") : semantic::makeBuiltin(suf);
+526:     }
+527:     if (auto lit = dynamic_cast<boolLitExpr*>(expr); lit) {
+528:         return semantic::makeBuiltin("bool");
+529:     }
+530:     if (auto unit = dynamic_cast<unitExpr*>(expr); unit) {
+531:         return semantic::makeUnit();
+532:     }
+533:     if (auto block = dynamic_cast<blockExpr*>(expr); block) {
+534:         return checkBlock(block, nullptr);
+535:     }
+536:     if (auto path = dynamic_cast<pathExpr*>(expr); path) {
+537:         if (path->path_.size() == 1) {
+538:             std::string name = path->path_[0].name_;
+539:             return lookupValue(name);
+540:         }
+541:         else if (path->path_.size() == 2) {
+542:             std::string callee = path->path_[0].name_, name = path->path_[1].name_;
+543:             if (callee == "Self") {
+544:                 auto sig = findConst(currentStruct_, name);
+545:                 if (sig == nullptr) {
+546:                     error("can't resolve name in lookupValue : " + name);
+547:                     return semantic::makeError();
+548:                 }
+549:                 return sig->type_;
+550:             }
+551:             else {
+552:                 auto sig = findConst(callee, name);
+553:                 if (sig == nullptr) {
+554:                     error("can't resolve name in lookupValue : " + name);
+555:                     return semantic::makeError();
+556:                 }
+557:                 return sig->type_;
+558:             }
+559:         }
+560:         else {
+561:             error("length of a pathExpr appears to be longer than 2:");
+562:             return semantic::makeError();
+563:         }
+564:     }
+565:     return semantic::makeError();
+566: }
+567: 
+568: semType* Checker::expect(Expr* expr, semType* wish) {
+569:     if (wish == nullptr) {
+570:         return infer(expr);
+571:     }
+572:     if (auto lit = dynamic_cast<intLitExpr*>(expr); lit) {
+573:         std::string suf = intSuffix(lit->value_);
+574:         if (suf.empty()) {
+575:             if (isIntegerType(wish)) {
+576:                 return wish;
+577:             }
+578:             else {
+579:                 error("wish an unsuffixed integer to be a non-integer type");
+580:                 return semantic::makeError();
+581:             }
+582:         }
+583:         else {
+584:             semType* cur = semantic::makeBuiltin(suf);
+585:             if (!semantic::typeEqual(cur, wish)) {
+586:                 error("wish an suffixed integer to be another type");
+587:                 return semantic::makeError();
+588:             }
+589:             return wish;
+590:         }
+591:     }
+592:     if (auto block = dynamic_cast<blockExpr*>(expr); block) {
+593:         return checkBlock(block, wish);
+594:     }
+595:     semType* type = infer(expr);
+596:     if (!semantic::typeEqual(type, wish)) {
+597:         error("expect type mismatch");
+598:         return semantic::makeError();
+599:     }
+600:     return wish;
+601: }
+602: 
+603: void Checker::checkItem(Item* item){
+604:     if (auto func= dynamic_cast<funcItem*>(item); func) {
+605:         checkFunction(func, "");
 606:     }
-607:     return static_cast<Expr*>(now);
-608: }
-609: /*
-610: blockExpression
-611:     : LBRACE statement* statementExpression? RBRACE
-612:     ;
-613: */
-614: 
-615: std::any ASTVisitor::visitStatement(RxParser::StatementContext *ctx) {
-616:     if (ctx->letStatement()) {
-617:         return anyStmt(visit(ctx->letStatement()));
-618:     }
-619:     if (ctx->expressionWithBlock()) {
+607:     else if (auto impl = dynamic_cast<ImplItem*>(item); impl) {
+608:         if (impl->type_->kind_ != Type::kTypeKind::STRUCT) {
+609:             return;
+610:         }
+611:         for (Item* down : impl->items_) {
+612:             if (auto func = dynamic_cast<funcItem*>(down); func){
+613:                 checkFunction(func, impl->type_->name_);
+614:             }
+615:         }
+616:     }
+617: }
+618: 
+619: void Checker::checkFunction(funcItem* func, const std::string& owner) {
+620:     std::string mem = currentStruct_;
+621:     currentStruct_ = owner;
+622:     funcSignature* sig = owner.empty() ? &table_.funcSig[func->name_] : &table_.methods[owner][func->name_];
+623:     currentRet_ = sig->retType_; // Finally use this currentRet_ ! I can't remember the times where I type current and enter and I get currentRet instead of currentStruct_ .
+624:     scope_.levelUp();
+625:     for (auto para : func->parameter_) {
+626:         scope_.push(para.name_, localShadowing(transformType(para.type_), para.isMut_));
+627:     }
+628:     checkBlock(static_cast<blockExpr*>(func->body_), currentRet_);
+629:     scope_.levelDown();
+630:     currentStruct_ = mem; // +1, what can I say
+631:     return;
+632: }
+633: 
+634: semType* Checker::checkBlock(blockExpr* block, semType* wish) {
+635:     scope_.levelUp();
+636:     for (auto stmt : block->stmts_) {
+637:         checkStatement(stmt);
+638:     }
+639:     semType* ret = (block->tail_ ? expect(block->tail_, wish) : semantic::makeUnit()); // as mentioned in spec, our wish can inflitrate into block's tail
+640:     if (wish != nullptr && !semantic::typeEqual(ret, wish)) {
+641:         error("blockExpr's tail_ has a different semType with our wish");
+642:         return semantic::makeError();
+643:     }
+644:     scope_.levelDown();
+645:     return ret;
+646: }
+647: 
+648: void Checker::checkStatement(Stmt* stmt) {
+649:     if (auto let = dynamic_cast<letStmt*>(stmt); let) {
+650:         semType* curType = let->type_ ? transformType(let->type_) : nullptr;
+651:         semType* init = expect(let->init_, curType);
+652:         scope_.push(let->name_, localShadowing(init, let->isMut_));
+653:     }
+654:     if (auto expr = dynamic_cast<exprStmt*>(stmt); expr) {
+655:         infer(expr->expr_);
+656:     }
+657:     return;
+658: }
+659: 
+660: void Checker::error(std::string message) {
+661:     std::cerr << "error occurred!\n" << message << std::endl;
+662:     reject_ = true;
+663:     return;
+664: }
+665: 
+666: void Checker::checkCrate(Crate* crate) {
+667:     collect(crate);
+668:     if (reject_) {
+669:         return;
+670:     }
+671:     evaluateConstants(crate);
+672:     if (reject_) {
+673:         return;  
+674:     }
+675:     evaluateTypes(crate);
+676:     if (reject_) {
+677:         return;
+678:     } // stage 0 ended: register all functions, structs, constvalues, implements ; evaluated constvalues ; evaluated all types mentioned in former items
+679: 
+680:     for (Item* item : crate->items_) {
+681:         checkItem(item);
+682:     }  
+683:     return;
+684: }
 
-(Showing lines 560-619 of 2964. Use offset=620 to continue.)
-</content>
-```
-
-**Tool: read**
-
-**Input:**
-```json
-{
-  "filePath": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/frontend/ast_builder.cpp",
-  "limit": 125,
-  "offset": 2650
-}
-```
-
-**Output:**
-```
-<path>/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/frontend/ast_builder.cpp</path>
-<type>file</type>
-<content>
-2650:                     f.name_ = cur->identifier()->getText();
-2651:                     f.value_ = anyExpr(visit(cur->expression()));
-2652:                     now->fields_.push_back(f);
-2653:                 }
-2654:             }
-2655:             return static_cast<Expr*>(now);
-2656:         }
-2657:         return anyExpr(visit(path));
-2658:     }
-2659:     if (ctx->LPAREN()) {
-2660:         if (auto exp = ctx->expression(); exp) {
-2661:             return anyExpr(visit(exp));
-2662:         }
-2663:         auto now = make<unitExpr>();
-2664:         return static_cast<Expr*>(now);
-2665:     }
-2666:     if (auto arr = ctx->arrayExpression(); arr) {
-2667:         return anyExpr(visit(arr));
-2668:     }
-2669:     if (ctx->BREAK()) {
-2670:         auto now = make<breakExpr>();
-2671:         if (ctx->expression()) {
-2672:             now->tail_ = anyExpr(visit(ctx->expression()));
-2673:         }
-2674:         return static_cast<Expr*>(now);
-2675:     }
-2676:     if (ctx->RETURN()) {
-2677:         auto now = make<returnExpr>();
-2678:         if (ctx->expression()) {
-2679:             now->tail_ = anyExpr(visit(ctx->expression()));
-2680:         }
-2681:         return static_cast<Expr*>(now);
-2682:     }
-2683:     if (ctx->CONTINUE()) {
-2684:         auto now = make<continueExpr>();
-2685:         return static_cast<Expr*>(now);
-2686:     }
-2687:     return visitChildren(ctx);
-2688: }
-2689: /*
-2690: nonBlockPrimary
-2691:     : literalExpression
-2692:     | pathInExpression (LBRACE structExprFields? RBRACE)?
-2693:     | LPAREN expression? RPAREN
-2694:     | arrayExpression
-2695:     | BREAK expression?
-2696:     | RETURN expression?
-2697:     | CONTINUE
-2698:     ;
-2699: */
-2700: 
-2701: std::any ASTVisitor::visitConditionPrimary(RxParser::ConditionPrimaryContext *ctx) {
-2702:     if (ctx->conditionPrimaryWithoutBareBlock()) {
-2703:         return anyExpr(visit(ctx->conditionPrimaryWithoutBareBlock()));
-2704:     }
-2705:     else {
-2706:         return anyExpr(visit(ctx->blockExpression()));
-2707:     }
-2708: }
-2709: /*
-2710: conditionPrimary
-2711:     : conditionPrimaryWithoutBareBlock
-2712:     | blockExpression
-2713:     ;
-2714: */
-2715: 
-2716: std::any ASTVisitor::visitConditionPrimaryWithoutBareBlock(RxParser::ConditionPrimaryWithoutBareBlockContext *ctx) {
-2717:     if (auto lit = ctx->literalExpression(); lit) {
-2718:         return anyExpr(visit(lit));
-2719:     }
-2720:     if (auto path = ctx->pathInExpression(); path) {
-2721:         return anyExpr(visit(path));
-2722:     }
-2723:     if (ctx->LPAREN()) {
-2724:         if (auto exp = ctx->expression(); exp) {
-2725:             return anyExpr(visit(exp));
-2726:         }
-2727:         auto now = make<unitExpr>();
-2728:         return static_cast<Expr*>(now);
-2729:     }
-2730:     if (auto arr = ctx->arrayExpression(); arr) {
-2731:         return anyExpr(visit(arr));
-2732:     }
-2733:     if (auto f = ctx->ifExpression(); f) {
-2734:         return anyExpr(visit(f));
-2735:     }
-2736:     if (ctx->LOOP()) {
-2737:         auto now = make<loopExpr>();
-2738:         now->block_ = static_cast<blockExpr*>(anyExpr(visit(ctx->blockExpression())));
-2739:         return static_cast<Expr*>(now);
-2740:     }
-2741:     if (ctx->WHILE()) {
-2742:         auto now = make<whileExpr>();
-2743:         now->cond_ = anyExpr(visit(ctx->conditionExpression()));
-2744:         now->block_ = static_cast<blockExpr*>(anyExpr(visit(ctx->blockExpression())));
-2745:         return static_cast<Expr*>(now);
-2746:     }
-2747:     if (ctx->BREAK()) {
-2748:         auto now = make<breakExpr>();
-2749:         if (ctx->expression()) {
-2750:             now->tail_ = anyExpr(visit(ctx->expression()));
-2751:         }
-2752:         return static_cast<Expr*>(now);
-2753:     }
-2754:     if (ctx->RETURN()) {
-2755:         auto now = make<returnExpr>();
-2756:         if (ctx->expression()) {
-2757:             now->tail_ = anyExpr(visit(ctx->expression()));
-2758:         }
-2759:         return static_cast<Expr*>(now);
-2760:     }
-2761:     if (ctx->CONTINUE()) {
-2762:         auto now = make<continueExpr>();
-2763:         return static_cast<Expr*>(now);
-2764:     }
-2765:     return visitChildren(ctx);
-2766: }
-2767: /*
-2768: conditionPrimaryWithoutBareBlock
-2769:     : literalExpression
-2770:     | pathInExpression
-2771:     | LPAREN expression? RPAREN
-2772:     | arrayExpression
-2773:     | ifExpression
-2774:     | LOOP blockExpression
-
-(Showing lines 2650-2774 of 2964. Use offset=2775 to continue.)
+(End of file - total 684 lines)
 </content>
 ```
 
 ---
 
-## Assistant (Build · DeepSeek V4.1 Flash · 32.2s)
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 24.9s)
 
 _Thinking:_
 
-Key findings:
+Let me review:
 
-1. `visitBlockExpression`: `now->tail_` is only assigned conditionally; `blockExpr::tail_` has no default initializer in ast.h (`Expr* tail_;`). If the tail is never set, `dumpBlock` reads `if (b->tail_)` → uninitialized pointer. In practice, the freshly allocated `blockExpr` via `make<blockExpr>()` (unique_ptr + value-init? `std::make_unique<Tp>()` value-initializes: for a class with implicit default constructor, value-initialization zero-initializes the object first! `std::make_unique<Tp>()` performs `new Tp()` → value-initialization → zero-initializes members since Tp is not user-provided ctor... Actually `blockExpr` has no user-provided constructor, so `new Tp()` zero-initializes all members (scalar members get zero). Wait: value-initialization of a class with no user-provided/user-declared constructor: the object is zero-initialized, then the implicitly-defined default constructor is called. `std::string` members get their own default ctor. So pointers/ints are zeroed!
+1. `checkBlock`:
+```cpp
+semType* ret = (block->tail_ ? expect(block->tail_, wish) : semantic::makeUnit());
+if (wish != nullptr && !semantic::typeEqual(ret, wish)) { error; return makeError(); }
+```
+Problem: when tail exists, `expect(tail, wish)` already checks/returns; then typeEqual(ret, wish). If expect returned makeError(), typeEqual(ERROR, wish) returns true (their typeEqual treats ERROR as equal) → no double error. Fine.
+But if tail exists and wish == nullptr, ret = infer(tail) — but wait, `expect(tail, nullptr)` → infer. Fine.
+If no tail and wish != nullptr: ret=unit, typeEqual(unit, wish) fails unless wish unit → error. Good.
+If no tail and wish nullptr: unit. Good.
+Note: on error they `return semantic::makeError()` WITHOUT `scope_.levelDown()` → **scope leak!** The levelUp is not popped on the error path. Later checks would see leftover locals. Since reject_ is set, checkCrate continues checking other items (no early return inside loop) — leaks could cause wrong behavior/extra errors (not crashes). Better: levelDown before return, or avoid early return. Fix: compute the flag, levelDown, then return.
 
-Hmm! That means `make<blockExpr>()` → `std::make_unique<blockExpr>()` → `new blockExpr()` → value-init → all POD members zero-initialized. Is that right? `make_unique<Tp>()` with no args does `new Tp()` — yes, parentheses → value-initialization. For a class type with implicit default ctor, value-init zero-initializes then default-inits. So `int num_` = 0, `bool isMut_` = false, pointers = nullptr. So maybe there is NO uninitialized read! Let me double check `make<Tp>()` in ast_builder.h:
+Also potential issue: `for (auto stmt : block->stmts_) checkStatement(stmt);` — stmts_ may contain nullptr (empty `;` statements) as discussed! `checkStatement(nullptr)` → dynamic_cast on nullptr returns nullptr → both ifs false → return; harmless. OK, no crash. Fine.
+
+2. `checkStatement`:
+- let: init checked before push — good.
+- Note: if `expect(init, curType)` returns ERROR, pushes local with ERROR type; subsequent uses typeEqual ERROR→true; fine.
+- If init is null? grammar requires. fine.
+
+3. `expect`:
+- int literal branch: suffix empty + wish not integer → error. But consider wish is `()` or a struct: error correct. However: what about `let x: u32 = 1;` → wish u32, isIntegerType → return wish (u32). Good.
+- suffix branch: returns `wish` after typeEqual check; fine (cur==wish).
+- block branch: checkBlock(block, wish) — good.
+- default: infer + typeEqual. For infer returning ERROR: typeEqual(ERROR, wish) == true → no error, returns wish. Good (avoid cascade).
+- BUT: for `boolLit` with wish bool: infer bool, typeEqual true. Good.
+- For path const with declared type matches. Good.
+- One missing: `expect` should handle `ifExpr` expected propagation in Phase 3; fine for now.
+- Note: `expect` for `unitExpr` with wish unit → infer unit, equal. fine.
+
+4. `checkCrate`: wired correctly now. Note `if (reject_) return;` after evaluateTypes — if type errors, bodies skipped. Fine.
+
+5. `infer` path 2-seg: Self guard still missing (currentStruct_ empty). They didn't add. Minor but should fix: `if (currentStruct_.empty()) error("Self outside impl")`.
+
+6. Builtins registration: did they add? I saw no diff in collect in this read; let me check if "get_i32" appears in collect now. Earlier grep showed only line 324 (protected name check). So builtins still not registered! They said they wrote everything except callExpr. But without builtins, callExpr (when added) will fail for println_i32. Since callExpr isn't added yet, no effect. Mention: when adding callExpr, also add builtins.
+
+7. `lookupValue` still uses memory_ but with empty check — safe. okay.
+
+8. calls: not added yet (as they said). They ask: after adding callExpr, is name resolution done? Answer: mostly, but name resolution also includes:
+   - locals/scopes (done via checkBlock/checkStatement/lookupValue)
+   - consts top-level (done) and associated consts (done in path 2-seg)
+   - functions: free functions (callExpr branch to add), associated functions/methods via `Type::f()` (2-seg call, Phase 5), methods via dot (Phase 5)
+   - `self` path: `Path self` → it's a local binding pushed from params (name "self"), so lookupValue finds it. Good, once checkFunction pushes.
+   - `Self::` consts (done, with guard fix)
+   - 2-seg value paths that are functions but not called → function as value UB; ignore.
+   - Also `rej-self-outside-a-method` (`println_i32(self)` at top level): `self` is not in scope → lookupValue fails → error. Good, once infer path is reached via call args (need callExpr!). So callExpr addition fixes it.
+   - `rej-named-field-structs-are-not-callable-constructors`: `S(1)` — callExpr callee path "S"; S is a struct name (in type namespace), not in funcSig → error "unresolved function" → passes! Actually the test expects rejection; the error message is fine. So callExpr branch alone makes it pass (as long as struct name isn't registered as function). Good.
+   - Also name resolution "两个命名空间" for types vs values: struct names in type namespace; `S(1)` resolves as value → not found → error. Good.
+
+So after callExpr + builtins + Self guard + checkBlock leak fix, `namespace-errors` should be 16/16? Let's enumerate remaining 6 failures from earlier:
+- rej-unresolved-value-name ✓ (lookupValue)
+- rej-a-block-local-name-cannot-escape ✓ (scope pop)
+- rej-a-binding-is-invisible-in-its-own-initializer ✓
+- rej-a-local-shadows-a-function-without-callable-fallback → needs callExpr
+- rej-self-outside-a-method → `println_i32(self)` needs callExpr to check args
+- rej-named-field-structs-are-not-callable-constructors → callExpr (S is not a function)
+So yes: after callExpr (+builtins), namespace-errors could be 16/16.
+
+But watch out: positive tests in namespace-errors: acc-shadowing... uses `Same { ... }`, `Same()` function call, `*r`, `n as i32`, method? `Same { x: Same() }` → structInit (not implemented → infer returns makeError silently; no error), call Same() (function), deref `*r` (not implemented → makeError silently), cast `n as i32` (not implemented → makeError silently, but it's an argument to println_i32 → expect(arg, i32): infer returns ERROR, typeEqual ERROR true → passes). So positive tests pass despite unimplemented nodes. Good.
+
+However, note: silently returning makeError for unimplemented nodes means `rej-self-outside-a-method`'s `println_i32(self)` → arg `self` path → lookupValue errors → good.
+
+9. Also check `checkFunction` pushes self param; for `&mut self`, localShadowing isMut_=true (AST quirk) — later place checks. Not now.
+
+10. `checkBlock` error path scope leak — important to flag.
+
+11. Another subtlety: `checkBlock` calls `checkStatement(stmt)` without null check; safe as discussed (nullptr dynamic_cast). Actually `dynamic_cast<letStmt*>(nullptr)` is well-defined → nullptr. Both ifs false. Fine.
+
+12. `expect` returns `wish` for suffix branch rather than `cur`; they're typeEqual so same. fine.
+
+13. `infer` for `intLit` uses intSuffix; okay.
+
+So review: two fixes (scope leak, Self guard) + builtins + callExpr. Also mention that "name resolution" also needs the 2-seg call (assoc fn/method) and dot calls, but those are Phase 2/5; for names-and-shadowing suite, free call suffices.
+
+Let me also double check the `checkBlock` no-tail + wish=nullptr case returns unit; good.
+
+One more potential problem: `checkBlock` levelUp/levelDown around the body; `checkFunction` also levelUp for params. So params live in outer level, body locals inner. Correct.
+
+Also `checkBlock` early return on error without levelDown — flag.
+
+Also `checkStatement` for let pushes even if `init` is ERROR; fine.
+
+Also `expect` for int literal with suffix and wish ERROR: typeEqual(makeBuiltin, makeError) → ERROR check first in typeEqual returns true → OK.
+
+Now answer: review + confirm name resolution mostly done after callExpr, but list what remains for full name resolution. Also mention their comment "stage 0 ended" is fine.
+
+Provide the callExpr code again? They said they'll add it; maybe short reference. They asked "把 callExpr 补上之后，名称解析就差不多了吗？" — answer yes for free functions/locals/consts; list remaining name-resolution aspects (associated functions/methods, dot calls, self-binding, builtin registration). Also note `Self::N` guard and the scope leak.
+
+Keep concise.
+
+看完了，两个 bug 要先修：
+
+1. **`checkBlock` 的错误路径漏了 `levelDown()`**：
+   ```cpp
+   if (wish != nullptr && !typeEqual(ret, wish)) {
+       error(...);
+       return semantic::makeError();   // ← levelUp 了没 levelDown
+   }
+   ```
+   这个块里的局部绑定会一直留在栈上，后面检查别的函数时会看到不该看到的变量（虽然 `reject_` 已置，但会产生连锁误报）。改成先记 flag、`levelDown()` 之后再返回，或者把判断挪到 `levelDown` 前、返回值统一在最后。
+
+2. **`infer` 的 `Self::N` 没判 `currentStruct_` 为空**：
+   ```cpp
+   if (callee == "Self") {
+       if (currentStruct_.empty()) { error("\"Self\" outside impl"); return makeError(); }
+       ...
+   }
+   ```
+   否则顶层函数里的 `Self::N` 会退化成查顶层常量，错的程序可能被放过。
+
+其他都正确：`checkBlock` 的 expected 穿透、`checkStatement` 先 init 后 push、`expect` 的字面量取值/块穿透/ERROR 不级联、`checkCrate` 的接线都没问题。
+
+**关于"补完 callExpr 是否名称解析就差不多了"：**
+
+对 `names-and-shadowing` 这个 suite 来说，补上 free function 的 call 分支就齐了：
+- `rej-a-local-shadows-a-function-without-callable-fallback`：callee 先查局部 → 命中就报 not callable；
+- `rej-self-outside-a-method`：`println_i32(self)` 会走到参数检查，`self` 在顶层函数作用域里查不到 → unresolved；
+- `rej-named-field-structs-are-not-callable-constructors`：`S(1)` 的 `S` 只在类型空间，`funcSig` 查不到 → 报 unresolved function。
+
+但**完整名称解析**还包括（都不是这个 suite 的）：
+- `Type::assocFn()` / `Self::assocFn()` 的 2 段 call（Phase 5 方法表）；
+- `x.method()` 的 dot 调用（Phase 5，`methodCallExpr` 节点）；
+- `Box::<T>::new` / `Vec::<T>::new` 等内置（Phase 5）；
+- 类型命名空间（`S { ... }`、`x as S`）已经在 transformType 里做了。
+
+还有两件配套的别忘了：
+
+- **注册内置函数**（`get_i32`/`print_i32`/`println_i32`），不然加了 callExpr 后所有正例都会报 unresolved；
+- callExpr 里 2 段路径先 `return makeError()` 占位，别在 Phase 2 硬写。
+
+补完 `callExpr` + 上面两个 bug，跑 `names-and-shadowing`，预期 16/16。
+
+---
+
+## User
+
+这里的 callExpr 需要处理第一个元素是 self 的情况吗？以及，应该暂时不用管是否 ref，是否 mut 吧？
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 19.5s)
+
+_Thinking:_
+
+The user asks about callExpr handling:
+1. Does callExpr need to handle "the first element is self"? (i.e., can a callExpr callee path start with `self`?) 
+2. Do we need to care about ref/mut for now?
+
+Let me think about Rx grammar:
+- `pathExprSegment: pathIdentSegment (PATHSEP? genericArgs)?`
+- `pathIdentSegment: identifier | SELF_VALUE | SELF_TYPE` where SELF_VALUE is `self` and SELF_TYPE is `Self`.
+- So a path can be `self::foo`? In Rust, `Self::foo` is a path; `self::foo` refers to module self in Rust (but Rx has no modules; `self` as a path prefix?). In expression paths, `self` alone is a value (the receiver). `self::x` syntax is legal per grammar but semantically meaningless in Rx (no modules). Tests won't have it. So callExpr callee `self(...)`: would be `self` as a call target — invalid (self is a value). Also `Self::method()` is possible (associated function/method called via Self) — but that's a 2-segment path where head is "Self", handled in the 2-segment branch (Phase 5), not 1-segment.
+- The user probably asks: when looking up a 1-segment callee name, should we handle name == "self"? `self(...)` → self is a local binding (pushed from params) with a non-function type; the call branch already checks `scope_.find(name)` first → if found, error "not callable". So no special handling needed. Good.
+- If they mean "callee path's first segment is Self" for 2-segment calls (`Self::new()`), that's the 2-seg branch to defer to Phase 5. But note: within an impl, `Self::associated_fn()` is a valid call; defer.
+
+2. Ref/mut: For Phase 2 free-function calls, no receiver adjustments: just check arg count and param types. Ref/mut matter in Phase 4 (coercions) and Phase 5 (method receivers). For calls, arguments are checked with `expect(arg, paramType)`; `&x` arguments (refExpr) aren't implemented yet; they'll return makeError until Phase 4, so the call check won't reject valid code. So yes—don't handle ref/mut now. BUT there's one subtlety: the "local shadows function" check uses scope presence only; no mut relevance. Also `self` binding type is a reference for `&self` methods; if someone calls a function with `self` argument, expect compares types; not relevant Phase 2.
+
+Also, since `expect` currently calls `typeEqual` and refExpr/deref/etc. return makeError (which typeEqual treats as compatible), valid tests pass. Good.
+
+But another point: in callExpr, should we skip checking if callee name is a struct/type (named-field structs not callable)? The lookup order local → funcSig; struct name not in funcSig → unresolved function error. Good.
+
+Also 2-segment `Self::CONST` as a bare path (value) is handled in infer(path). `Self::method()` as call → defer.
+
+So answer:
+- No special-case for `self` as callee: if it's 1 segment, the existing `scope_.find(name)` catches it (self is a local when in a method) → "not callable". If `Self::foo()`, that's 2-segment → Phase 5. Note path head "self" (lowercase) can't be a type; `self::foo` unsupported; ignore.
+- Correct: no ref/mut/coercion in Phase 2 call handling. Just arity + expect(param types) + return type. Ref/mut/coercion belong to Phase 4 (argument coercion: &mut→&, deref coercion) and Phase 5 (method receivers).
+- One caveat: don't `expect` on ERROR types; expect handles ERROR via typeEqual. fine.
+- Also mention: for `self` param pushed into scope, its name is "self" from AST; so `self` path resolves. Good.
+
+Keep concise, with a small snippet showing the 1-segment branch order. The user hasn't shown new code; answer conceptual. Maybe mention where to add 2-seg placeholder.
+
+Also mention: when Phase 4 arrives, call args will use a `coerce(arg, param)` instead of plain expect (one-to-one coercion sites); so structure the call branch to make that swap easy. Good forward-looking note.
+
+1. **不需要特判 `self`。** 1 段 callee 的检查顺序本身就是：
 
 ```cpp
-template<typename Tp> Tp* make(){
-    auto node = std::make_unique<Tp>();
+if (scope_.find(name)) { error("called value is not a function"); ... }   // self 会在这里被抓住
+auto it = table_.funcSig.find(name);
+...
+```
+
+`self` 在方法体里是被 `checkFunction` 当成参数 push 进局部栈的，所以 `self(...)` 会走"局部存在但不可调用"那条，正是你要的行为（`&self`/`self` 都无所谓）。`Self::foo()` 是 2 段路径（`Self` 是类型空间），属于 Phase 5 的方法表/关联函数，现在直接 `return makeError()` 占位即可。小写 `self::x` 这种模块路径 Rx 没有，测试不会出现，不用管。
+
+2. **对，暂不管 ref/mut/coercion。** Phase 2 的调用检查就三件事：
+
+```cpp
+// 参数个数
+if (call->args_.size() != sig.params_.size()) { error(...); }
+// 逐个按形参类型 check
+for (size_t i = 0; i < args.size(); ++i) expect(args[i], sig.params_[i]);
+// 返回
+return sig.retType_;
+```
+
+引用、自动借用、`&mut T → &T`、`&Box<T> → &T` 这些是 Phase 4 的 `coerceTo(arg, param)`；方法接收者（`&self`/`&mut self` 的可变性、自动 borrow）是 Phase 5。现在如果实参是 `&x`/`*p`（`refExpr`/`derefExpr` 还没实现，`infer` 返回 ERROR），`typeEqual(ERROR, T)` 会当成兼容，不会误拒正例——正好给你留了后路。
+
+唯一要提前留意的设计点：将来把 `expect(arg, param)` 换成 `coerceTo(arg, param)` 时，调用点只改这一处，所以现在就把"逐个实参检查"封装成一个小循环/helper，别把逻辑散在 call 分支里。
+
+---
+
+## User
+
+我写完了，你看看。这就算 stage 2 通过了吗？接下来的 stage 3 干什么呢？
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 14.4s)
+
+_Thinking:_
+
+The user says they finished (callExpr etc.). They ask me to review, whether this counts as Phase 2 passing, and what Phase 3 does next.
+
+I need to:
+1. Read the current checker.cpp (infer call branch, builtins, etc.) to review.
+2. Run the Phase 2 test suites to see progress: names-and-shadowing, casts-and-literals, integer-arithmetic, shifts, compound-assignment, boolean-and-short-circuit.
+3. Answer: is Phase 2 done? Likely not fully — Phase 2 also needs unary/binary/cast/assignment/if/while/loop basics, which they may not have written. They only said "写完了" referring to callExpr. Need to check what's implemented.
+4. Explain Phase 3 (expected/LUB/never + check/infer dual entry) and what's needed.
+
+Let me read the file sections: infer (522+), builtins in collect, and any new branches. Let me grep for infer branches (dynamic_cast in infer) and read the function.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "grep -n \"get_i32\\|print_i32\\|println_i32\" \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp\" | head; echo ===; sed -n '/semType\\* Checker::infer/,/^}/p' \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp\""
+}
+```
+
+**Output:**
+```
+324:            else if (!insideImpl && (funcName == "get_i32" || funcName == "print_i32" || funcName == "println_i32")) {
+342:            else if (constName == "get_i32" || constName == "print_i32" || constName == "println_i32") {
+351:    table_.funcSig["get_i32"].retType_ = semantic::makeBuiltin("i32");
+352:    table_.funcSig["print_i32"].retType_ = semantic::makeUnit();
+353:    table_.funcSig["print_i32"].params_.push_back(semantic::makeBuiltin("i32"));
+354:    table_.funcSig["println_i32"].retType_ = semantic::makeUnit();
+355:    table_.funcSig["println_i32"].params_.push_back(semantic::makeBuiltin("i32"));
+===
+semType* Checker::infer(Expr* expr) {
+    if (auto lit = dynamic_cast<intLitExpr*>(expr); lit) {
+        std::string suf = intSuffix(lit->value_);
+        return suf.empty() ? semantic::makeBuiltin("i32") : semantic::makeBuiltin(suf);
+    }
+    if (auto lit = dynamic_cast<boolLitExpr*>(expr); lit) {
+        return semantic::makeBuiltin("bool");
+    }
+    if (auto unit = dynamic_cast<unitExpr*>(expr); unit) {
+        return semantic::makeUnit();
+    }
+    if (auto block = dynamic_cast<blockExpr*>(expr); block) {
+        return checkBlock(block, nullptr);
+    }
+    if (auto path = dynamic_cast<pathExpr*>(expr); path) {
+        if (path->path_.size() == 1) {
+            std::string name = path->path_[0].name_;
+            return lookupValue(name);
+        }
+        else if (path->path_.size() == 2) {
+            std::string callee = path->path_[0].name_, name = path->path_[1].name_;
+            if (callee == "Self") {
+                auto sig = findConst(currentStruct_, name);
+                if (sig == nullptr) {
+                    error("can't resolve name in lookupValue : " + name);
+                    return semantic::makeError();
+                }
+                return sig->type_;
+            }
+            else {
+                if (callee == "") {
+                    error("\"Self\" outside implement");
+                    return semantic::makeError();
+                }
+                auto sig = findConst(callee, name);
+                if (sig == nullptr) {
+                    error("can't resolve name in lookupValue : " + name);
+                    return semantic::makeError();
+                }
+                return sig->type_;
+            }
+        }
+        else {
+            error("length of a pathExpr appears to be longer than 2:");
+            return semantic::makeError();
+        }
+    }
+    if (auto call = dynamic_cast<callExpr*>(expr); call) {
+        auto path = dynamic_cast<pathExpr*>(call->callee_);
+        if (path == nullptr) {
+            error("callExpr callee is not a function");
+            return semantic::makeError();
+        }
+        if (path->path_.size() > 1) {
+            // This won't be dealt until stage 5
+            return semantic::makeError();
+        }
+        if (!path->path_[0].types_.empty()) {
+            error("callExpr single word path have types");
+            return semantic::makeError();
+        }
+        std::string callee = path->path_[0].name_;
+        if (scope_.find(callee)) {
+            error("called function name is shadowed by local variables");
+            return semantic::makeError();
+        }
+        if (table_.funcSig.find(callee) == table_.funcSig.end()) {
+            error("callExpr attempted to use an non-existing function");
+            return semantic::makeError();
+        }
+        auto sig = table_.funcSig[callee];
+        if (sig.params_.size() != call->args_.size()) {
+            error("callExpr parameters number mismatch");
+            return semantic::makeError();
+        }
+        for (int i = 0; i < sig.params_.size(); i++) {
+            expect(call->args_[i], sig.params_[i]);
+        }
+        return sig.retType_;
+    }
+    return semantic::makeError();
+}
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 17.4s)
+
+_Thinking:_
+
+Review:
+
+1. **BUG in Self path branch**: 
+```cpp
+if (callee == "Self") {
+    auto sig = findConst(currentStruct_, name);
+    ...
+}
+else {
+    if (callee == "") {   // ← dead check: else branch means callee != "Self", but callee is a nonempty segment name; can't be ""
+        error("\"Self\" outside implement");
+```
+The `callee == ""` check is in the wrong place (dead code). The intended check was: if callee == "Self" and currentStruct_ empty → error. But `findConst("", name)` falls back to top-level constSig, so a top-level `Self::N` would wrongly resolve a top-level const. Need to fix inside the Self branch:
+```cpp
+if (callee == "Self") {
+    if (currentStruct_.empty()) { error("Self outside impl"); return makeError(); }
     ...
 }
 ```
-`std::make_unique<Tp>()` → `new Tp()` → value-initialization. Yes! So all scalar members are zero-initialized, strings default-constructed. So `num_` is 0 and `isMut_` false deterministically (not UB). Phew.
+2. Call branch issues:
+   - `auto sig = table_.funcSig[callee];` copies the signature (fine but use `auto&` to avoid copy; minor).
+   - `path->path_[0].types_.empty()` check: for a call like `f::<i32>()`? Turbofish on free functions isn't in Rx (no generics), fine.
+   - `for (int i = 0; i < sig.params_.size(); i++)` — signed/unsigned comparison warning; use size_t. Minor.
+   - `if (path->path_.size() > 1) return makeError();` — silently treats 2-segment calls as ERROR type (no error message). That's deliberate Phase 5 placeholder. But careful: a positive test with `S::new()` will pass silently without checking — fine for now. A negative test where an assoc function doesn't exist would not be caught — later.
+   - `scope_.find(callee)` — good.
+   - `table_.funcSig.find(callee) == end` → error. Good.
+   - builtins registered at collect lines 351-355 — good, but note they're registered inside collect BEFORE the loop? Let me check placement: lines 351-355 are in collect, likely at the top (after lambda?). Let me read around 345-360 to confirm they're before registration loop. Also note: since builtins are in funcSig, `registerFuncAndConst` for a user-defined `fn print_i32` would hit `funcSig.count(funcName)` → duplicate error; also protected; either error. Fine.
+   - `expect(call->args_[i], sig.params_[i])` — good.
+   - Return `sig.retType_`. Good.
 
-So my "uninitialized" claim is **wrong** — due to value-initialization via make_unique(). Let me verify this understanding:
-- In C++17, `std::make_unique<T>()` where T is not an array: `new T(std::forward<Args>(args)...)`; with empty pack → `new T()`. `new T()` is value-initialization. For class T with implicitly-defined default constructor (not user-provided), value-initialization zero-initializes the object before calling the default ctor. So yes, members without default member initializers are zeroed.
-- Caveat: if T had a user-provided constructor, zero-init wouldn't happen. `refExpr` etc. have no ctors. `Param` no ctor. `blockExpr` no ctor. So all zeroed.
+3. **Infer still missing unary/binary/cast/if/while/loop/break/return/ref/deref/field/index/structInit/array/etc.** So Phase 2 is NOT complete. The `infer` only handles literals/unit/block/path/call. The user asks "这就算 stage 2 通过了吗？" — No. Phase 2 requires: literals, paths, operators (arith/bitwise/shift/comparison/logical), casts, assignment/mut check, calls, return/block tails, if/while/loop basics. Currently missing:
+   - unaryExpr, binaryExpr (all operators + assignments), castExpr, refExpr/deref (Phase 4), if/while/loop/break/return/continue, field/index/structInit/array (Phase 5).
+   - Also `isPlaceable`/`isMutablePlaceable` still not defined (phase 2 needs for assignment).
+   - `expect` propagation only literal/block; Phase 3 handles if/break propagation.
 
-Therefore `refExpr::num_` is 0 deterministically, and `Param::isMut_` false for `self`/`&self`. No UB. But still: `num_` is a semantically meaningless leftover field (never set), and `Param::isMut_` is 0 for `&self` (which is correct: `&self` binding is not `mut self`; the mutability of the reference is in the type). Actually for `&mut self`, MUT() is present → isMut_=true — hmm, that sets the *binding* mut flag for `&mut self`. Is that intended? The comment in visitSelfParam: `if(ctx->MUT()){ ret.isMut_ = true; }`. For `&mut self`, MUT() matches the `mut` after `&`? Grammar ShortHandSelf: ( & Lifetime? )? mut? self. So `&mut self` has MUT() = the mut before self → ret.isMut_ = true. And ref->isMut_ = ret.isMut_ → true. Hmm, for `&mut self`, the TYPE should be `&mut Self`. They set both ret.isMut_=true (binding mut) and ref isMut=true. Is ret.isMut_ for `&mut self` semantically "self is a mutable binding"? In Rust, `&mut self` is sugar for `self: &mut Self` with a non-mut binding (the binding itself isn't reassignable, but the referent is mutable via the reference). Marking isMut_=true might be wrong semantically for later place checks. But dump prints "mut self" for `&mut self` (also for `mut self`). The dump output for `fn add(&mut self, ...)` showed `add(mut self, delta)` — ambiguous between `mut self` and `&mut self`, because isMut_ is true in both cases. The TYPE distinguishes them: `&mut self` → type_ = Ref(mut, Self); `mut self` → type_ = Self. For semantic method receiver checks, they plan to use `selfRef_`/`selfMut_` derived from the type. But Param.isMut_ for `&mut self` being true... the semantic might interpret parameter mutability. Hmm.
+4. `checkBlock` issue from before: did they fix the levelDown leak? Let me check current lines. I saw earlier `checkBlock` returns early without levelDown. Let me re-read the current version. Also check `Self` guard. Let me read checkBlock/expect/checkStatement current. Let me grep the file around those.
 
-Wait, actually let me look at visitSelfParam again:
+Let me read lines 560-700 to see current state (checkBlock etc.). Actually the infer function output above is current; let me read checkBlock/checkStatement.
 
-```cpp
-Param ret;
-ret.name_ = "self";
-ret.isSelf_ = true;
-if(ctx->MUT()){ ret.isMut_ = true; }
-if(ctx->AMP()){
-    auto ref = make<Type>();
-    ref->kind_ = REF;
-    ref->isMut_ = ret.isMut_;   // &mut self → true; &self → false
-    ref->elem_ = STRUCT "Self";
-    ret.type_ = ref;
-} else {
-    // self or mut self
-    STRUCT "Self"
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "sed -n '/semType\\* Checker::checkBlock/,/^}/p; /void Checker::checkStatement/,/^}/p; /semType\\* Checker::expect/,/^}/p' \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp\""
 }
 ```
 
-For `&mut self`: MUT() exists (the `mut` token). So ret.isMut_=true, ref->isMut_=true. Good for type. But ret.isMut_ (binding mutability) is arguably wrong/irrelevant for reference receivers. For `mut self`: MUT() exists → isMut_=true, type STRUCT Self. Good.
-
-Is there a test that would expose a problem? For AST correctness, not really; the dump just can't distinguish. For semantic, the checker will compute selfMut_ from the type (REF+isMut) and binding mut from Param.isMut_. If they use Param.isMut_ to decide "&mut self receiver", they'd think `&mut self` and `mut self` both mutable (correct in a sense) — but `let` binding mutability of `self` in `&mut self` shouldn't matter. Probably fine.
-
-BUT: there's a subtle AST issue: for `&mut self`, is `ret.isMut_` supposed to mean "binding is mut"? The straightforward reading of Param.isMut_ is the binding's `mut` keyword. The grammar's MUT() in ShortHandSelf is indeed the `mut` in `&mut self`, which modifies the reference type, not the binding. So setting Param.isMut_=true for `&mut self` conflates. If the checker uses Param.isMut_ for by-value binding only (self without &), fine. Keep as a note: dump cannot distinguish `mut self` from `&mut self` because of this; not necessarily a bug but worth flagging in review? Hmm, actually it IS the kind of thing the user asked: "confirm AST is correct". The AST for `&mut self` has correct type; Param.isMut_ semantics could be debated. I'll note it as a minor concern.
-
-Now, are there really no uninitialized reads? Since make_unique value-initializes, yes. But wait — `std::make_unique<Tp>()` requires Tp to be value-initializable; with `std::string` members it's fine. Good. So the `num_` dump reading is deterministic 0. Not a bug, just a dead field. The dump prints `n=` which was presumably intended for something (maybe `&&` count). If dump is for debugging, printing a never-set field is misleading but harmless. I should correct my earlier note: not UB due to value-init.
-
-Let me verify empirically that `make_unique` value-init is indeed relied upon: `Param.isMut_` for `&self` printed not-mut (dump showed `value(self)`) → zero. If it were uninitialized garbage, we might have seen "mut self" at least sometimes. Both consistent with zero-init. Fine.
-
-To be thorough, I could compile a tiny test of value-init semantics... it's standard C++: `new T()` value-initializes. `std::make_unique<T>()` calls `new T()`. Confirmed.
-
-OK so the AST findings so far:
-1. **Mixed shift chains broken** in all 8 shift visitors — real, significant.
-2. refExpr::num_ never assigned — dead field, dumps as 0 (value-init), not UB. Minor.
-3. Param.isMut_ for `&mut self` is set true (the `mut` of the reference); dump can't distinguish `mut self` vs `&mut self`. Semantically the type is right; note for checker.
-
-Need to keep hunting for other AST bugs. Areas not yet tested:
-- `visitExpression` / assignment precedence: `a = b = c`? grammar assignmentExpression: `(expression assignmentOperator)? expression`? Actually Rust assignment is right-assoc? In Rust, `a = b = c` is not allowed (assignment returns ()) but parses right-assoc? Let me check grammar: Parser.g4 lines ~200. Let me look at the expression hierarchy rules to find any other unusual patterns like shifts. Search Parser.g4 for rules with `( ... | ... )*` containing different operators or "closed" variants. Let me print the relevant portion of Parser.g4 (expression section lines 180-560). This will help spot other tricky interleavings.
-
-- Also `assignmentExpression` handles `a = b`, compound. The builder for assignment: binaryExpr with op. We tested.
-- `constValue` handling: tested.
-- `structExprFields` with options? shorthand field init `S { x }` is not in Rx grammar (StructExprField: IDENTIFIER COLON Expression). Fine.
-- `outerAttribute` with multiple derives: works.
-- Function return type omitted → UNIT type; worked (Fn g Type ()).
-- `fn main() {}` empty block: dump shows Block with no children. tail_ zero. Fine.
-- Method with lifetime self `&'c self`: tested 19 — type & i32 return; the dump prints param name only. Param type for `&'c self` → REF mut false elem Self. Can't see in dump. But shared visitSelfParam code path; fine.
-
-Potential issues in `visitBlockExpression`:
-```cpp
-auto stmts = ctx->statement();
-for (auto stmt : stmts) {
-    if (stmt != *std::prev(stmts.end())) { push stmt; }
-    else {
-        bool last_value = false;
-        if (auto blk = stmt->expressionWithBlock(); blk) {
-            if (ctx->statementExpression() == nullptr && stmt->SEMI() == nullptr) last_value = true;
-        }
-        if (last_value) now->tail_ = visit(stmt->expressionWithBlock());
-        else now->stmts_.push_back(...);
+**Output:**
+```
+semType* Checker::expect(Expr* expr, semType* wish) {
+    if (wish == nullptr) {
+        return infer(expr);
     }
+    if (auto lit = dynamic_cast<intLitExpr*>(expr); lit) {
+        std::string suf = intSuffix(lit->value_);
+        if (suf.empty()) {
+            if (isIntegerType(wish)) {
+                return wish;
+            }
+            else {
+                error("wish an unsuffixed integer to be a non-integer type");
+                return semantic::makeError();
+            }
+        }
+        else {
+            semType* cur = semantic::makeBuiltin(suf);
+            if (!semantic::typeEqual(cur, wish)) {
+                error("wish an suffixed integer to be another type");
+                return semantic::makeError();
+            }
+            return wish;
+        }
+    }
+    if (auto block = dynamic_cast<blockExpr*>(expr); block) {
+        return checkBlock(block, wish);
+    }
+    semType* type = infer(expr);
+    if (!semantic::typeEqual(type, wish)) {
+        error("expect type mismatch");
+        return semantic::makeError();
+    }
+    return wish;
 }
-if(ctx->statementExpression()) now->tail_ = visit(...);
-```
-Note: `stmts` is a vector of statement contexts; comparing pointers with `!=` fine. What if the last statement is a letStatement and there's a statementExpression? fine.
-
-What if the last statement is an expressionWithBlock with SEMI absent but followed by statementExpression? Then statementExpression is the tail; the last statement goes to stmts. Fine.
-
-Edge: a block ending with `if` without semicolon as a statement when its type must be unit — AST treats it as tail. That's correct per spec (tail governing).
-
-Another edge: block ending with `loop {}` without semicolon — becomes tail. E.g. `fn g() { loop { continue; } }` — dump 06 showed:
-```
-Tail
-  Loop
-```
-Wait: `loop { continue; }` was the last thing in g? Source: fn g(c) { while c {...} loop {break 42;} loop {continue;} if c {} else {} }. The last is if — dump shows Tail If. The loops are ExprStmt'd. OK.
-
-Now the statement boundary logic: statementWithBlock *as a statement* with no semicolon but not last → e.g. `if c {} -1;`? Tested.
-
-What about `if a {1} else {2} + 3;`? Grammar statement boundary: if terminates statement immediately, then `+3` — wait spec says: "An attached else ... Other expression statements extend until their terminating semicolon". The example `if true {} else {} -1;` shows if statement then `-1` statement. But what about `if true {1} else {2} + 3;`? Per spec, the if-expression ends at the block, so `+ 3` would start a new expression statement — but `+3` is not a valid expression start (unary + doesn't exist in Rx); the parser's statement rule might parse it differently (the grammar likely has statementPostfixExpression which allows postfix after expressionWithBlock, but not infix). Our test 20 `if true {1} else {2} - 3;` parsed as two statements → ExprStmt(Unary-3). Good.
-
-Now, other areas: `visitPathInExpression` and generic args: works.
-
-`visitStructInitExpr` path: `visitNonBlockPrimary` handles `pathInExpression (LBRACE structExprFields? RBRACE)?` — our test uses `P { x: 1 }`. What about qualified struct init like `Config::N`? not struct init.
-
-`visitMethodCallExpr`: dot suffix with turbofish method? `x.method::<i32>()`? Rx no generics; not tested.
-
-`visitIndexExpr` chain: tested.
-
-`visitArrayExpression`: `[1,2]` and repeat `[v; N]`. What about `[v; N, ]`? trailing comma in array elements? Grammar ArrayElements: `Expression (COMMA Expression)* COMMA?` OR `Expression SEMI ConstValue`; our tests fine.
-
-`visitCastExpression`: expression family `castExpression: unaryExpression (AS typeRef)*`; closedCast handles ANDAND etc. Tested chains.
-
-`visitUnaryExpression`: `unaryOperator unaryExpression | postfixExpression`. Operators: `-`, `!`, `*`, `&`, `&&`, `&mut`, `&&mut`. Did we test `&&mut`? Yes 05. And `&mut` yes.
-
-`visitPostfixExpression`: tested chains.
-
-`visitIfExpression`: grammar includes `else if` maybe via else being ifExpression. Tested nested; dump showed Else → If. Good.
-
-`visitWhileExpression`: condition rule variants; tested with complex conditions in 27.
-
-`visitLoopExpression`: tested.
-
-`visitBreakExpression` / `visitReturnExpression`: jump to expression; tested with complex expressions in 29/30.
-
-`visitContinueExpression`: tested.
-
-Types: tested all forms in struct fields.
-
-Const values: tested forms. What about `const C: bool = (true);` dump showed ConstBool TRUE. What about `const V: usize = M;` path; tested.
-
-Statements: `;` empty dropped. Is that correct behavior? It's a design choice; dump can't show it. In AST, an empty statement has no representation; that's fine for semantics (no effect). But careful: does dropping empty statements matter for statement-boundary semantics? No.
-
-`use` declarations: tested at top; discarded. Our files with `use rx::core::*;` dumped no Use item (01, 12). Good — but check: visitUseDeclaration throws; how is `use` skipped? In visitCrate presumably it filters. Let me check visitCrate/visitItem to confirm use is skipped without calling the throwing visitor. 01 has use and dumped fine, so yes.
-
-Attributes: `#[derive(...)]` on struct captured. What about `#[derive()]` or attributes on functions? Grammar may allow outerAttribute only on struct? `Function` production has no outerAttribute; struct has. Fine.
-
-Now let me also check the parse grammar for other tricky spots: let me view Parser.g4 expression section (lines ~180-560) to see the `closed` mechanism and any other rules where builder might mishandle interleaving. Especially:
-- `bitOrExpression | closedBitOrExpression LT bitOrExpression` (comparison LT special)
-- `comparisonExceptLt` includes GT GE_EQ GT_SECOND SHR_EQ? Line 681: `comparisonExceptLt : EQEQ | NE | LE | GT GE_EQ | GT_SECOND SHR_EQ | genericClose ;` — hmm interesting: `GT GE_EQ` = `>=` split, `GT_SECOND SHR_EQ` = `>>=`? So `>=` lexes as GT GE_EQ? Let me check lexer modes. Also comparisonExceptLt has `genericClose`?! Weird.
-
-The builder for comparison: does it handle `>=`, `>`, `>>=`? `>>=` is compound assignment, not comparison. We tested `>=` in 03 (dump `Binary >=`) and `>` works. `<=` works.
-
-What about `a >= b` in condition/statement families? 27 had `>` and `!=`; 03 had `>=` in expression family. Probably fine.
-
-- `closedBitOrExpression LT bitOrExpression` — when parsing `a < b`, uses LT; builder visitComparisonExpression must handle both alternatives. Our tests fine.
-
-Let me look at the Parser.g4 and the builder's visitComparisonExpression for any subtleties (e.g., `a > b` where GT consumed with GE_EQ). We saw `>` fine.
-
-Another area: **genericClose** in comparisons: `a < b` vs `Vec<i32>>` ambiguities in types, not expressions.
-
-OK, let me now scan the rest of Parser.g4 rules quickly to identify any other builder function with accessor-splitting like shifts. Let me grep for rules containing `)*` with `|` inside parens.
-
-Let me scan the grammar for other rules with the same "interleaved alternatives" shape as shifts, to see whether other visitors share the flaw.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "grep -nE \"\\)\\*|\\)\\+\" /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/grammar/Parser.g4 | grep -E \"\\|\" | head -40"
+semType* Checker::checkBlock(blockExpr* block, semType* wish) {
+    scope_.levelUp();
+    for (auto stmt : block->stmts_) {
+        checkStatement(stmt);
+    }
+    semType* ret = (block->tail_ ? expect(block->tail_, wish) : semantic::makeUnit()); // as mentioned in spec, our wish can inflitrate into block's tail
+    if (wish != nullptr && !semantic::typeEqual(ret, wish)) {
+        error("blockExpr's tail_ has a different semType with our wish");
+        scope_.levelDown();
+        return semantic::makeError();
+    }
+    scope_.levelDown();
+    return ret;
 }
-```
-
-**Output:**
-```
-24:    : (usePath? PATHSEP)? (STAR | LBRACE (useTree (COMMA useTree)* COMMA?)? RBRACE)
-43:    | functionParam (COMMA functionParam)* COMMA?
-168:    | (typePathSegment PATHSEP)* pathIdentSegment PATHSEP? genericArgs
-264:    : (closedAdditiveExpression SHL | additiveExpression shiftRight)* additiveExpression
-268:    : (closedAdditiveExpression SHL | additiveExpression shiftRight)* closedAdditiveExpression
-352:    : (conditionClosedAdditiveExpression SHL | conditionAdditiveExpression shiftRight)* conditionAdditiveExpression
-356:    : (conditionClosedAdditiveExpression SHL | conditionAdditiveExpression shiftRight)* conditionClosedAdditiveExpression
-422:    | conditionBreakBitXorExpression PIPE (conditionBitXorExpression PIPE)* conditionClosedBitXorExpression
-431:    | conditionBreakBitAndExpression CARET (conditionBitAndExpression CARET)* conditionClosedBitAndExpression
-440:    | conditionBreakShiftExpression AMP (conditionShiftExpression AMP)* conditionClosedShiftExpression
-446:      (conditionClosedAdditiveExpression SHL | conditionAdditiveExpression shiftRight)* conditionAdditiveExpression
-452:      (conditionClosedAdditiveExpression SHL | conditionAdditiveExpression shiftRight)* conditionClosedAdditiveExpression
-521:    | statementBitXorExpression PIPE (bitXorExpression PIPE)* closedBitXorExpression
-530:    | statementBitAndExpression CARET (bitAndExpression CARET)* closedBitAndExpression
-539:    | statementShiftExpression AMP (shiftExpression AMP)* closedShiftExpression
-545:      (closedAdditiveExpression SHL | additiveExpression shiftRight)* additiveExpression
-551:      (closedAdditiveExpression SHL | additiveExpression shiftRight)* closedAdditiveExpression
-644:    : LBRACKET (expression (SEMI constValue | (COMMA expression)* COMMA?))? RBRACKET
-
-```
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "sed -n '180,270p' /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/grammar/Parser.g4"
+void Checker::checkStatement(Stmt* stmt) {
+    if (auto let = dynamic_cast<letStmt*>(stmt); let) {
+        semType* curType = let->type_ ? transformType(let->type_) : nullptr;
+        semType* init = expect(let->init_, curType);
+        scope_.push(let->name_, localShadowing(init, let->isMut_));
+    }
+    if (auto expr = dynamic_cast<exprStmt*>(stmt); expr) {
+        infer(expr->expr_);
+    }
+    return;
 }
-```
-
-**Output:**
-```
-magnitude
-    : INTEGER_LITERAL | pathInExpression | LPAREN magnitude RPAREN
-    ;
-
-identifierBinding
-    : MUT? identifier
-    ;
-
-letStatement
-    : LET identifierBinding (COLON typeRef)? equalsSign expression SEMI
-    ;
-
-blockExpression
-    : LBRACE statement* statementExpression? RBRACE
-    ;
-
-statement
-    : SEMI
-    | letStatement
-    | expressionWithBlock SEMI?
-    | statementExpression SEMI
-    ;
-
-expressionWithBlock
-    : blockExpression
-    | ifExpression
-    | LOOP blockExpression
-    | WHILE conditionExpression blockExpression
-    ;
-
-ifExpression
-    : IF conditionExpression blockExpression
-      (ELSE (blockExpression | ifExpression))?
-    ;
-
-// Ordinary value expressions. Repeated binary operators are left folds;
-// assignment recurses on the right. The closed* alternatives constrain the
-// final cast type before < or << (see closedCastType and README.md).
-expression
-    : assignmentExpression
-    ;
-
-assignmentExpression
-    : logicalOrExpression (assignmentOperator expression)?
-    ;
-
-logicalOrExpression
-    : logicalAndExpression (OROR logicalAndExpression)*
-    ;
-
-logicalAndExpression
-    : comparisonExpression (ANDAND comparisonExpression)*
-    ;
-
-comparisonExpression
-    : bitOrExpression (comparisonExceptLt bitOrExpression)?
-    | closedBitOrExpression LT bitOrExpression
-    ;
-
-bitOrExpression
-    : bitXorExpression (PIPE bitXorExpression)*
-    ;
-
-closedBitOrExpression
-    : (bitXorExpression PIPE)* closedBitXorExpression
-    ;
-
-bitXorExpression
-    : bitAndExpression (CARET bitAndExpression)*
-    ;
-
-closedBitXorExpression
-    : (bitAndExpression CARET)* closedBitAndExpression
-    ;
-
-bitAndExpression
-    : shiftExpression (AMP shiftExpression)*
-    ;
-
-closedBitAndExpression
-    : (shiftExpression AMP)* closedShiftExpression
-    ;
-
-shiftExpression
-    : (closedAdditiveExpression SHL | additiveExpression shiftRight)* additiveExpression
-    ;
-
-closedShiftExpression
-    : (closedAdditiveExpression SHL | additiveExpression shiftRight)* closedAdditiveExpression
-    ;
-
 
 ```
 
 ---
 
-## Assistant (Build · DeepSeek V4.1 Flash · 18.4s)
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 44.7s)
 
 _Thinking:_
 
-The grammar has several more interleaved closed rules:
+They fixed the levelDown leak. Good.
 
-```
-conditionBreakBitXorExpression
-    | conditionBreakBitXorExpression ... 
-```
-Let me look at lines 410-460 and 510-560 for the conditionBreak and statement bitAnd/bitXor/bitOr rules which use `X OP (Y OP)* Z` patterns. Those separate initial operand from loop, but single operator kind (PIPE etc.), so order is fine. The interleaving problem only arises when two DIFFERENT op kinds alternate, i.e., SHL and shiftRight. So shifts are the only case.
+Now run the Phase 2 suites to see where they stand: names-and-shadowing, casts-and-literals, integer-arithmetic, shifts, compound-assignment, boolean-and-short-circuit. Since infer only handles literals/paths/calls/blocks, most operator tests will fail (not rejected? Actually negative tests where expected reject because of bad operators won't be caught; positive tests will pass because unimplemented → makeError silently). Let's run to quantify and then answer.
 
-But wait: there's another subtlety in `closedBitOr` etc.: `(bitXorExpression PIPE)* closedBitXorExpression` — the builder for closedBitOrExpression? Let me check it handles operands via accessor lists — single op kind so fine.
-
-Also `assignmentExpression: logicalOrExpression (assignmentOperator expression)?` — right recursion; builder handles nested. Test `a = b = c`? Grammar allows (assignmentOperator expression → expression → assignment). Builder must recurse to build right-assoc. Let me test `a = b = c;` and `a += b = c`? Rust allows `a = b = c`? In Rust, `a = b = c` is `a = (b = c)` and b=c is `()`... actually assignment expressions have type `()` in Rust, so `a = (b = c)` type error but parses. Rx grammar allows. AST builder: visitAssignmentExpression: `if (ctx->assignmentOperator()) { binaryExpr op, lhs=logicalOr, rhs=visit(ctx->expression()) }` — expression recursion gives right-assoc. Fine; not important.
-
-Now other suspicious grammar bits:
-- Line 168 closedCastType: `(typePathSegment PATHSEP)* pathIdentSegment PATHSEP? genericArgs` — for `a as Vec<i32>`; builder visitClosedCastType handles. We tested `as u32`; test `as Box<Vec<i32>>`? Let me add a cast to a complex type: `a as Vec<i32>`? Casting to Vec is semantically invalid but AST-wise parse. Also `a as [i32; 2]`, `a as &i32`, `a as &&mut i32`, `a as ()`. Let me test these type forms in casts to exercise visitClosedCastType (which has its own type construction paths distinct from visitTypeRef!). Important: visitClosedCastType duplicates type-building code (lines 456-495). Bugs there would only show in casts. Let me test.
-
-- Unit cast `a as ()`: closedCastType LPAREN typeRef? RPAREN with empty → UNIT.
-
-Let me create 31_cast_types.rx:
-```rust
-fn f(a: i32) {
-    let x = a as Box<Vec<i32>>;
-    let y = a as [i32; 2];
-    let z = a as &i32;
-    let w = a as &&mut i32;
-    let v = a as ();
-    let u = a as (i32);
-    let t = a as Vec<Box<[i32; 3]>>;
-}
-```
-Some semantically invalid but parse fine? `as &&mut i32` per closedCastType: (AMP|ANDAND) lifetime? MUT? closedCastType. Should parse.
-
-- Also cast in condition context: `if a as &&i32 == b {}`? Hmm weird. conditionCast uses conditionClosedCastType maybe. Let me check grammar around 320-360 for conditionCast/conditionClosedCast. Likely the same duplication. Test in if condition: `if (a as u32 as isize) > 0 {}` tested. Also closed cast inside condition with `<`: e.g., `if a as u32 < b {}` — the closed mechanism ensures `u32 < b` isn't parsed as generics. This is exactly what closedCastType is for. Test: `if a as u32 < b {}` and `let x = a as u32 < b;`? For expression context: comparison `a as u32 < b` — hmm, after `as typeRef`, `<` might be ambiguous; grammar uses closedCast to prevent. Let me test:
-```rust
-fn f(a: i32, b: i32) {
-    let x = a as u32 < b;
-    if a as u32 < b { }
-    while a as u32 < b { }
-    a as u32 < b;
-    loop { break a as u32 < b; }
-}
-```
-Wait semantics: `a as u32 < b` → (a as u32) < b. Parse should work due to closed mechanism. Let me test all families. This might reveal builder bugs in condition/statement cast handling.
-
-Also shift closed mechanism: `let x = a as u32 << b;`? Grammar closedShift: `(closedAdditive SHL ...)` where closedAdditive uses closedCast? Actually closedAdditiveExpression: `(closedMultiplicative SHL?)`... let me look at the rules 270-330: closedMultiplicative etc. Let me view Parser.g4 270-360 to understand closed propagation; test `a as u32 << b`, `a as u32 & b`, etc.
-
-Let me view the grammar section and then write tests.
+Let me run those suites.
 
 **Tool: bash**
 
 **Input:**
 ```json
 {
-  "command": "sed -n '270,460p' /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/grammar/Parser.g4"
-}
-```
-
-**Output:**
-```
-
-additiveExpression
-    : multiplicativeExpression (additiveOperator multiplicativeExpression)*
-    ;
-
-closedAdditiveExpression
-    : (multiplicativeExpression additiveOperator)* closedMultiplicativeExpression
-    ;
-
-multiplicativeExpression
-    : castExpression (multiplicativeOperator castExpression)*
-    ;
-
-closedMultiplicativeExpression
-    : (castExpression multiplicativeOperator)* closedCastExpression
-    ;
-
-castExpression
-    : unaryExpression (AS typeRef)*
-    ;
-
-closedCastExpression
-    : unaryExpression
-    | castExpression AS closedCastType
-    ;
-
-unaryExpression
-    : unaryOperator unaryExpression
-    | postfixExpression
-    ;
-
-postfixExpression
-    : primaryExpression postfixSuffix*
-    ;
-
-// Condition expressions: no undelimited struct construction.
-conditionExpression
-    : conditionAssignmentExpression
-    ;
-
-conditionAssignmentExpression
-    : conditionLogicalOrExpression (assignmentOperator conditionExpression)?
-    ;
-
-conditionLogicalOrExpression
-    : conditionLogicalAndExpression (OROR conditionLogicalAndExpression)*
-    ;
-
-conditionLogicalAndExpression
-    : conditionComparisonExpression (ANDAND conditionComparisonExpression)*
-    ;
-
-conditionComparisonExpression
-    : conditionBitOrExpression (comparisonExceptLt conditionBitOrExpression)?
-    | conditionClosedBitOrExpression LT conditionBitOrExpression
-    ;
-
-conditionBitOrExpression
-    : conditionBitXorExpression (PIPE conditionBitXorExpression)*
-    ;
-
-conditionClosedBitOrExpression
-    : (conditionBitXorExpression PIPE)* conditionClosedBitXorExpression
-    ;
-
-conditionBitXorExpression
-    : conditionBitAndExpression (CARET conditionBitAndExpression)*
-    ;
-
-conditionClosedBitXorExpression
-    : (conditionBitAndExpression CARET)* conditionClosedBitAndExpression
-    ;
-
-conditionBitAndExpression
-    : conditionShiftExpression (AMP conditionShiftExpression)*
-    ;
-
-conditionClosedBitAndExpression
-    : (conditionShiftExpression AMP)* conditionClosedShiftExpression
-    ;
-
-conditionShiftExpression
-    : (conditionClosedAdditiveExpression SHL | conditionAdditiveExpression shiftRight)* conditionAdditiveExpression
-    ;
-
-conditionClosedShiftExpression
-    : (conditionClosedAdditiveExpression SHL | conditionAdditiveExpression shiftRight)* conditionClosedAdditiveExpression
-    ;
-
-conditionAdditiveExpression
-    : conditionMultiplicativeExpression (additiveOperator conditionMultiplicativeExpression)*
-    ;
-
-conditionClosedAdditiveExpression
-    : (conditionMultiplicativeExpression additiveOperator)* conditionClosedMultiplicativeExpression
-    ;
-
-conditionMultiplicativeExpression
-    : conditionCastExpression (multiplicativeOperator conditionCastExpression)*
-    ;
-
-conditionClosedMultiplicativeExpression
-    : (conditionCastExpression multiplicativeOperator)* conditionClosedCastExpression
-    ;
-
-conditionCastExpression
-    : conditionUnaryExpression (AS typeRef)*
-    ;
-
-conditionClosedCastExpression
-    : conditionUnaryExpression
-    | conditionCastExpression AS closedCastType
-    ;
-
-conditionUnaryExpression
-    : unaryOperator conditionUnaryExpression
-    | conditionPostfixExpression
-    ;
-
-conditionPostfixExpression
-    : conditionPrimary postfixSuffix*
-    ;
-
-// Break operands in conditions: the first primary cannot be a bare block.
-// Subsequent operands use the ordinary condition rules.
-conditionBreakExpression
-    : conditionBreakAssignmentExpression
-    ;
-
-conditionBreakAssignmentExpression
-    : conditionBreakLogicalOrExpression (assignmentOperator conditionExpression)?
-    ;
-
-conditionBreakLogicalOrExpression
-    : conditionBreakLogicalAndExpression (OROR conditionLogicalAndExpression)*
-    ;
-
-conditionBreakLogicalAndExpression
-    : conditionBreakComparisonExpression (ANDAND conditionComparisonExpression)*
-    ;
-
-conditionBreakComparisonExpression
-    : conditionBreakBitOrExpression (comparisonExceptLt conditionBitOrExpression)?
-    | conditionBreakClosedBitOrExpression LT conditionBitOrExpression
-    ;
-
-conditionBreakBitOrExpression
-    : conditionBreakBitXorExpression (PIPE conditionBitXorExpression)*
-    ;
-
-conditionBreakClosedBitOrExpression
-    : conditionBreakClosedBitXorExpression
-    | conditionBreakBitXorExpression PIPE (conditionBitXorExpression PIPE)* conditionClosedBitXorExpression
-    ;
-
-conditionBreakBitXorExpression
-    : conditionBreakBitAndExpression (CARET conditionBitAndExpression)*
-    ;
-
-conditionBreakClosedBitXorExpression
-    : conditionBreakClosedBitAndExpression
-    | conditionBreakBitAndExpression CARET (conditionBitAndExpression CARET)* conditionClosedBitAndExpression
-    ;
-
-conditionBreakBitAndExpression
-    : conditionBreakShiftExpression (AMP conditionShiftExpression)*
-    ;
-
-conditionBreakClosedBitAndExpression
-    : conditionBreakClosedShiftExpression
-    | conditionBreakShiftExpression AMP (conditionShiftExpression AMP)* conditionClosedShiftExpression
-    ;
-
-conditionBreakShiftExpression
-    : conditionBreakAdditiveExpression
-    | (conditionBreakClosedAdditiveExpression SHL | conditionBreakAdditiveExpression shiftRight)
-      (conditionClosedAdditiveExpression SHL | conditionAdditiveExpression shiftRight)* conditionAdditiveExpression
-    ;
-
-conditionBreakClosedShiftExpression
-    : conditionBreakClosedAdditiveExpression
-    | (conditionBreakClosedAdditiveExpression SHL | conditionBreakAdditiveExpression shiftRight)
-      (conditionClosedAdditiveExpression SHL | conditionAdditiveExpression shiftRight)* conditionClosedAdditiveExpression
-    ;
-
-conditionBreakAdditiveExpression
-    : conditionBreakMultiplicativeExpression (additiveOperator conditionMultiplicativeExpression)*
-    ;
-
-conditionBreakClosedAdditiveExpression
-    : conditionBreakClosedMultiplicativeExpression
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 15.3s)
-
-_Thinking:_
-
-Now I see the full picture. The "closed" mechanism is used to constrain the final type before `<` or `<<`. The shift rules are special because they need `additiveExpression shiftRight` (using the *open* additive to capture `b >> c` where c could itself be the start of something?). The builder's handling is buggy for mixed shifts.
-
-Now let me test casts with complex closed types and closed-context comparisons in all families. Let me create test 31 and 32:
-
-31_cast_types.rx (expression family):
-```rust
-fn f(a: i32, b: i32) {
-    let x = a as Box<Vec<i32>>;
-    let y = a as [i32; 2];
-    let z = a as &i32;
-    let w = a as &&mut i32;
-    let v = a as ();
-    let u = a as (i32);
-    let t = a as Vec<Box<[i32; 3]>>;
-}
-```
-
-32_closed_contexts.rx:
-```rust
-fn f(a: i32, b: i32, c: bool) {
-    let x = a as u32 < b;
-    let y = a as u32 << b;
-    let z = a as u32 & b;
-    if a as u32 < b { }
-    if a as u32 << b > 0 { }
-    while a as u32 < b { }
-    a as u32 < b;
-    a as u32 << b;
-    loop { break a as u32 < b; }
-    loop { break a as u32 << b; }
-}
-```
-Hmm `let x = a as u32 < b;` — type ambiguity? Should parse as comparison. `let y = a as u32 << b;` — shift. `let z = a as u32 & b;` — bitand.
-
-Also test `let t = a as Vec<Box<i32>>;` etc. Semantically invalid casts but AST fine.
-
-Also test types in casts of all four families (expression/condition/conditionBreak/statement) — done via above.
-
-Let me also verify `return` with closed types? `return a as u32 < b;` maybe.
-
-Let me run these.
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "content": "fn f(a: i32) {\n    let x = a as Box<Vec<i32>>;\n    let y = a as [i32; 2];\n    let z = a as &i32;\n    let w = a as &&mut i32;\n    let v = a as ();\n    let u = a as (i32);\n    let t = a as Vec<Box<[i32; 3]>>;\n}\n",
-  "filePath": "/tmp/opencode/ast-check/31_cast_types.rx"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "content": "fn f(a: i32, b: i32, c: bool) {\n    let x = a as u32 < b;\n    let y = a as u32 << b;\n    let z = a as u32 & b;\n    if a as u32 < b { }\n    if a as u32 << b > 0 { }\n    while a as u32 < b { }\n    a as u32 < b;\n    a as u32 << b;\n    loop { break a as u32 < b; }\n    loop { break a as u32 << b; }\n    return a as u32 < b;\n}\n",
-  "filePath": "/tmp/opencode/ast-check/32_closed_contexts.rx"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 14.4s)
-
-_Thinking:_
-
-Wait, `fn f(...)` returns () but I put `return a as u32 < b;` at the end — semantically type error but parse fine. Actually `return expr;` in a () function is compile error later, but AST fine. But is `return` allowed mid-block? Yes. Fine.
-
-Run and inspect.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cd /tmp/opencode/ast-check && RXCC=\"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/target/build/rxcc\"; for f in 31_cast_types.rx 32_closed_contexts.rx; do \"$RXCC\" --stage semantic --dump-ast \"$f\" >\"${f%.rx}.ast\" 2>\"${f%.rx}.err\"; echo \"exit=$? $f syntax_err=$(grep -c 'syntax error' ${f%.rx}.err)\"; done; echo ==============; cat 31_cast_types.ast; echo ==============; cat 32_closed_contexts.ast",
-  "timeout": 60000
-}
-```
-
-**Output:**
-```
-exit=0 31_cast_types.rx syntax_err=0
-exit=1 32_closed_contexts.rx syntax_err=3
-==============
-Fn f(a)
-  Type ()
-  Block
-    Let x
-      Cast
-        Path a
-        Type Box
-          Type Vec
-            Type i32
-    Let y
-      Cast
-        Path a
-        Type array len=2
-          Type i32
-    Let z
-      Cast
-        Path a
-        Type &
-          Type i32
-    Let w
-      Cast
-        Path a
-        Type &
-          Type &mut
-            Type i32
-    Let v
-      Cast
-        Path a
-        Type ()
-    Let u
-      Cast
-        Path a
-        Type i32
-    Let t
-      Cast
-        Path a
-        Type Vec
-          Type Box
-            Type array len=3
-              Type i32
-==============
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 12.9s)
-
-_Thinking:_
-
-31 cast types all correct.
-
-32 has 3 syntax errors. Let me see which lines fail. The condition "a as u32 << b" might not parse in condition contexts? Or `a as u32 < b` in some contexts. Let me check the stderr.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cd /tmp/opencode/ast-check && cat 32_closed_contexts.err"
-}
-```
-
-**Output:**
-```
-2:21: syntax error: mismatched input '<' expecting ';'
-3:21: syntax error: mismatched input '<<' expecting ';'
-5:20: syntax error: no viable alternative at input 'if a as u32 < b {'
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 18.6s)
-
-_Thinking:_
-
-Interesting! `let x = a as u32 < b;` fails to parse: "mismatched input '<' expecting ';'" at 2:21. Line 2 is `let x = a as u32 < b;`. Column 21 is the `<`. So the parser parses `a as u32` and then expects `;`?! That means the expression grammar doesn't allow `<` after a cast in a let initializer? But the grammar showed `comparisonExpression : bitOrExpression (comparisonExceptLt bitOrExpression)? | closedBitOrExpression LT bitOrExpression`. Hmm.
-
-Wait, maybe the issue is the lexer: after `u32`, a space then `<`. LT token `<`; should be fine. But "expecting ';'" suggests the expression ended after `a as u32`, i.e., the cast expression is greedy: `castExpression : unaryExpression (AS typeRef)*`. The typeRef after AS might greedily consume `<`? No, `<` is not part of a typeRef. Hmm.
-
-Hmm, maybe the comparison rule `closedBitOrExpression LT bitOrExpression` — closedBitOrExpression includes closedCastExpression which is `unaryExpression | castExpression AS closedCastType`; closedCastType for `u32` — the closedCastType rule includes paths with genericArgs: `(typePathSegment PATHSEP)* pathIdentSegment PATHSEP? genericArgs`; genericArgs can match... `LT ... GT`? But there's no `>`; genericArgs is `LT (genericArg ...) genericClose`; without `>`, it shouldn't match. But ANTLR adaptive prediction might choose to enter genericArgs and then fail? The error "mismatched input '<' expecting ';'" means it parsed `a as u32` and then stopped before `<`.
-
-Wait, is this actually a **parser bug in the provided grammar** or my invalid test? Let me check the official tests: casts-and-literals `acc-operator-precedence-and-left-association.rx` (177 bytes). Let me look at how casts and comparisons are combined in official tests. The `closed` mechanism exists precisely for `a as u32 < b`; the README/grammar comment says "The closed* alternatives constrain the final cast type before < or <<".
-
-Hmm, so `a as u32 < b` SHOULD parse. Unless the lexer mode for `>`/`<`... The LT token is just '<'. Let me test with rustc? No, let me test the parse tree for a minimal case.
-
-Actually wait — maybe the issue is `u32` recognized as INTEGER_SUFFIX? Lexer: `u32` could be lexed as identifier or as part of number? `a as u32` — "u32" is an identifier (NON_KEYWORD). Not a number. Fine.
-
-Let me test minimal files:
-```
-fn f(a: i32, b: i32) { let x = a as u32 < b; }
-```
-and
-```
-fn f(a: i32, b: i32) { let x = a as u32; }
-```
-and maybe `let x = (a as u32) < b;`.
-
-Also test `a as u32 > b`? GT is special (mode AFTER_GT) but `<` is LT.
-
-Hold on, maybe the issue is different: `let x = a as u32 < b;` Inside the let, the expression is `expression` → assignmentExpression → logicalOr → ... → comparisonExpression → `closedBitOrExpression LT bitOrExpression`. closedBitOrExpression starts with closedBitXorExpression → ... → closedCastExpression → `castExpression AS closedCastType`. closedCastType for `u32`: rule 168 `(typePathSegment PATHSEP)* pathIdentSegment PATHSEP? genericArgs` — note this REQUIRES genericArgs! `PATHSEP? genericArgs` — genericArgs is not optional! So closedCastType can only be a path WITH generic args (e.g., `Vec<i32>`, `Box<i32>`) or builtin? Hmm, that can't be right — then `a as u32` in closed context couldn't parse.
-
-Wait, let me re-read the closedCastType rule from Parser.g4 line ~160-170. Earlier in visitClosedCastType comment:
-```
-closedCastType
-    : LPAREN typeRef? RPAREN
-    | arrayType
-    | (AMP | ANDAND) lifetime? MUT? closedCastType
-    | (typePathSegment PATHSEP)* pathIdentSegment PATHSEP? genericArgs
-    ;
-```
-So the last alternative requires genericArgs, but the first (castExpression AS typeRef) alternative in the *open* castExpression uses full typeRef. In closed context, builtins like `u32` are covered how? Maybe closedCastType's last alternative has optional genericArgs in the actual file. Let me check the actual Parser.g4 lines 160-170.
-
-Also the error line 5 `if a as u32 < b {` — "no viable alternative" — this uses conditionComparisonExpression | conditionClosedBitOr... | LT... So same issue.
-
-Let me look at the real grammar lines. Actually the spec grammar summary says TypeCastExpression → Expression `as` TypeNoBounds. The closedCastType is a parser-internal rule in this g4. Let me view lines 150-180.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "sed -n '140,180p' /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/grammar/Parser.g4"
-}
-```
-
-**Output:**
-```
-    ;
-
-pathExprSegment
-    : pathIdentSegment (PATHSEP genericArgs)?
-    ;
-
-pathIdentSegment
-    : identifier | SELF_VALUE | SELF_TYPE
-    ;
-
-genericArgs
-    : LT (genericArg (COMMA genericArg)* COMMA?)? genericClose
-    ;
-
-genericArg
-    : lifetime | typeRef
-    ;
-
-genericClose
-    : GT | GT_SECOND
-    ;
-
-// A cast ending in one of these types can be followed by < or <<. A bare
-// final type-path segment instead interprets < as the start of type arguments.
-closedCastType
-    : LPAREN typeRef? RPAREN
-    | arrayType
-    | (AMP | ANDAND) lifetime? MUT? closedCastType
-    | (typePathSegment PATHSEP)* pathIdentSegment PATHSEP? genericArgs
-    ;
-
-constValue
-    : INTEGER_LITERAL
-    | TRUE
-    | FALSE
-    | pathInExpression
-    | MINUS magnitude
-    | LPAREN constValue RPAREN
-    ;
-
-magnitude
-
-```
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cd /tmp/opencode/ast-check && printf 'fn f(a: i32, b: i32) {\\n    let x = a as u32;\\n    let y = (a as u32) < b;\\n    let z = a as u32 > b;\\n}\\n' > 33_cast_cmp.rx && /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/target/build/rxcc --stage semantic --dump-ast 33_cast_cmp.rx"
-}
-```
-
-**Output:**
-```
-Fn f(a, b)
-  Type ()
-  Block
-    Let x
-      Cast
-        Path a
-        Type u32
-    Let y
-      Binary <
-        Cast
-          Path a
-          Type u32
-        Path b
-    Let z
-      Binary >
-        Cast
-          Path a
-          Type u32
-        Path b
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 33.3s)
-
-_Thinking:_
-
-Now I understand the grammar design:
-
-`closedCastType` last alternative: `(typePathSegment PATHSEP)* pathIdentSegment PATHSEP? genericArgs` — requires genericArgs (not optional!). This is deliberate: "A cast ending in one of these types can be followed by < or <<. A bare final type-path segment instead interprets < as the start of type arguments." So in closed contexts (before `<` or `<<`), a cast to a bare path like `u32` is NOT allowed to be followed by `<` — because `a as u32 < b` is ambiguous with `a as u32<b>` (generic args with unclosed `<`)? Hmm, but the comment says "A bare final type-path segment instead interprets < as the start of type arguments", i.e., `a as u32 < b` parses as a cast to `u32<b>` (type args!) and then expects `>`... which fails or continues. That's why `let x = a as u32 < b;` gives "mismatched input '<' expecting ';'" — wait, actually it parsed `a as u32` as open cast? Let me think.
-
-The open `castExpression : unaryExpression (AS typeRef)*`; typeRef → typePath → typePathSegment → `pathIdentSegment (PATHSEP? genericArgs)?` — `u32` followed by `<` may greedily consume `<b>` as generic args, then expects `;` but sees... hmm, the error said mismatched input '<' expecting ';' at 2:21. So it did NOT consume `<` into generic args; it parsed `a as u32` and then found `<` while expecting `;`. So the expression ended at `a as u32`.
-
-Why didn't comparisonExpression apply? Because in `let x = <expression>;` the expression is `assignmentExpression → ... → comparisonExpression : bitOrExpression (comparisonExceptLt bitOrExpression)? | closedBitOrExpression LT bitOrExpression`. We have `a as u32 < b`. The first alternative `bitOrExpression (comparisonExceptLt bitOrExpression)?` — comparisonExceptLt is EQEQ|NE|LE|GT GE_EQ|GT_SECOND SHR_EQ|genericClose — LT is not in there. So first alt can't match `<`. The second alt requires `closedBitOrExpression LT ...` — closedBitOrExpression → ... → closedCastExpression → `castExpression AS closedCastType`. For `a as u32`, closedCastType must match `u32`: last alternative requires genericArgs. Not present → fail. So the whole comparison can't parse as closed; hence it parses just `a as u32` and stops. Hence syntax error.
-
-So per the grader's grammar, **`a as u32 < b` is actually a SYNTAX ERROR** (unless the cast target has a parenthesized/array/reference/generic form). The comment says: "A cast ending in one of these types can be followed by < or <<" — i.e., only closedCastType forms (parenthesized, array, references, or paths WITH generic args like `Vec<i32>`). A bare `u32` can't be followed by `<` because it's interpreted as the start of type arguments. So in Rx, you must write `(a as u32) < b`. Interesting.
-
-Hmm wait, but is that intended? `let x = a as u32 < b;` failing means the language requires parens. The grammar comment acknowledges the ambiguity design choice. Since this is the provided parser, it's authoritative. My test was wrong; not an AST bug. Good to note: `a as u32 < b` → syntax error (by design); `(a as u32) < b` works and produces Binary < Cast. And `a as u32 << b` similarly — `<<` (SHL) after bare cast type is also a syntax error? Line 3 error confirms "mismatched input '<<' expecting ';'". To write it: `(a as u32) << b`. But what about `a as Vec<i32> << b`? closedCastType with generic args is allowed before `<<`. Let me verify:
-```
-let y = a as Vec<i32> << b;  // should parse as (a as Vec<i32>) << b
-```
-And `a as [i32;2] < b`, `a as &i32 < b`? Let me test these to confirm the closed mechanism and builder. This is exactly what `closed` variants are for. Also condition/statement/conditionBreak families.
-
-But sematically casts to Vec invalid; AST only. Let me test:
-```rust
-fn f(a: i32, b: i32, v: Vec<i32>) {
-    let x = v as Vec<i32> < b;   // hmm comparing Vec with int — invalid semantically
-    let y = a as &i32 < b;      // ...
-}
-```
-Just for parse. Let me also test `a as [i32; 2] << b`.
-
-Anyway, this "limit" is grammar behavior, not builder bug.
-
-Now let me consider whether there are official tests relying on `x as T < y` with bare T — no, since parser would reject.
-
-OK. Let me update todos and continue looking for genuine AST bugs. So far: only mixed shifts.
-
-Let me now do a broader systematic check: run the AST dump over the **entire official semantic suite** and check structural invariants:
-1. All exit 0? No — negative tests will exit 1 (collect errors) but AST still dumped; however, if Checker crashes (throw), we'd see internal error. The user already smoke-tested 236 cases no crash before semantic existed; now Checker runs collect, so crashes could occur. Let me run all and check: syntax errors (expected 0), internal errors (should be 0), unknown nodes in AST (should be 0). Also compare against earlier smoke logs? Let me just run.
-
-2. Write a small Python validator that parses the dump indentation and checks:
-   - node types and children counts.
-   - Known dump node set; no "Expr?" etc.
-   - Binary nodes have exactly 2 children, etc.
-   This can catch structural anomalies across all official tests.
-
-Actually, a stronger method for correctness would be to compare AST dumps against the parse tree for a few programs, but manual review is fine.
-
-Let me run the full suite dumping ASTs now, checking for internal errors/crashes and unknown nodes. That's the "全量" verification. Then examine a few semantically interesting ASTs (e.g., precedence tests in official suite).
-
-Let me write the loop and collect stats. 236+ tests; output maybe large; write AST files to /tmp/opencode/ast-check/official/. Run time fine.
-
-The `as T <` case is a parser-grammar design limitation (bare cast types can't be followed by `<`; need parens/closed forms), not an AST bug. Now let me run the AST dump across the entire official suite with structural checks.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "mkdir -p /tmp/opencode/ast-check/official && cd /tmp/opencode/ast-check/official && RXCC=\"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/target/build/rxcc\"; ROOT=\"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic\"; n=0; bad=0; for f in $(find \"$ROOT\" -name '*.rx' | sort); do out=$(basename \"$f\").ast; \"$RXCC\" --stage semantic --dump-ast \"$f\" >\"$out\" 2>\"$out.err\"; rc=$?; n=$((n+1)); if grep -q \"internal error\" \"$out.err\"; then echo \"INTERNAL $f\"; bad=$((bad+1)); fi; done; echo \"ran $n, internal errors $bad\"; grep -l \"Expr?\\|Stmt?\\|Item?\" *.ast | head; echo \"unknown-node files: $(grep -l 'Expr?\\|Stmt?\\|Item?' *.ast 2>/dev/null | wc -l)\"",
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && cmake --build target/build -j 2>&1 | grep -E \"error|warning|Built target\" | head -5 && make test FILTER=official:semantic:names-and-shadowing,official:semantic:casts-and-literals,official:semantic:integer-arithmetic,official:semantic:shifts,official:semantic:compound-assignment,official:semantic:boolean-and-short-circuit STAGE=semantic 2>&1 | grep -E \"^\\s*[0-9]+\\)|passed|failed\" | head -20",
   "timeout": 300000
 }
 ```
 
 **Output:**
 ```
-INTERNAL /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/invalid-impls-and-generics/rej-a-reference-is-not-a-struct-impl-target.rx
-INTERNAL /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/invalid-impls-and-generics/rej-impl-target-must-be-a-user-struct.rx
-INTERNAL /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/invalid-impls-and-generics/rej-no-array-inherent-impl.rx
-INTERNAL /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/invalid-impls-and-generics/rej-no-container-inherent-impl.rx
-INTERNAL /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/methods-and-self/rej-associated-values-share-a-namespace-across-impl-blocks.rx
-INTERNAL /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/namespace-errors/rej-a-top-level-function-cannot-have-a-receiver.rx
-INTERNAL /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/namespace-errors/rej-duplicate-constant.rx
-INTERNAL /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/namespace-errors/rej-duplicate-field.rx
-INTERNAL /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/namespace-errors/rej-duplicate-parameter.rx
-INTERNAL /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/namespace-errors/rej-duplicate-struct.rx
-INTERNAL /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/namespace-errors/rej-duplicate-top-level-function.rx
-INTERNAL /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/namespace-errors/rej-function-and-constant-share-the-value-namespace.rx
-INTERNAL /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/protected-names/rej-protected-type-name-i32.rx
-ran 236, internal errors 13
-unknown-node files: 0
+[100%] Built target rxcc
+. passed  F failed
+1) official:semantic:boolean-and-short-circuit/rej-no-integer-truthiness.rx@semantic
+2) official:semantic:boolean-and-short-circuit/rej-lazy-operators-require-bool.rx@semantic
+3) official:semantic:boolean-and-short-circuit/rej-lazy-operators-have-no-reference-variants.rx@semantic
+4) official:semantic:boolean-and-short-circuit/rej-bitwise-operand-types-must-match.rx@semantic
+5) official:semantic:casts-and-literals/rej-integer-to-bool-cast-is-unsupported.rx@semantic
+6) official:semantic:casts-and-literals/rej-reference-to-integer-cast-is-unsupported.rx@semantic
+7) official:semantic:compound-assignment/rej-compound-destination-must-be-mutable.rx@semantic
+8) official:semantic:compound-assignment/rej-an-explicit-mismatched-suffix-cannot-coerce.rx@semantic
+9) official:semantic:compound-assignment/rej-reference-destinations-are-not-implicitly-dereferenced.rx@semantic
+10) official:semantic:compound-assignment/rej-a-literal-is-not-an-assignment-place.rx@semantic
+11) official:semantic:integer-arithmetic/rej-explicitly-different-arithmetic-operand-types.rx@semantic
+12) official:semantic:integer-arithmetic/rej-unary-minus-is-signed-only.rx@semantic
+13) official:semantic:integer-arithmetic/rej-booleans-are-not-arithmetic-integers.rx@semantic
+14) official:semantic:shifts/rej-shift-count-must-be-integer.rx@semantic
+15) official:semantic:shifts/rej-shift-left-operand-must-be-integer.rx@semantic
+======================== 15 failed, 20 passed in 22.29s ========================
 
 ```
 
 ---
 
-## Assistant (Build · DeepSeek V4.1 Flash · 18.0s)
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 15.7s)
 
 _Thinking:_
 
-13 "INTERNAL" errors. But note: these are negative tests where `collect` sets reject_, and main.cpp does `throw 0;` which is caught by `catch (...)` and prints "internal error"! So these aren't real internal errors — they're the known main.cpp hack. My grep for "internal error" caught the misleading message. Indeed all 13 are negative tests with collect-detected errors.
+Results: 20 passed / 15 failed across the Phase-2 suites. All 15 failures are negative tests needing unary/binary/cast/assignment checks. So Phase 2 is NOT complete; infer still lacks operators.
 
-Let me verify: check one err file. E.g., rej-duplicate-struct.err should contain "internal error" from main's catch, plus the semantic error message. Let me confirm. Also, importantly, no real crash: AST dumped for all? The unknown-node count is 0. Let me check the exit codes and whether these 13 correspond exactly to tests that collect rejects (all negative collect tests from namespace-errors: duplicates, etc. — yes).
+Answer their question:
+1. Review findings:
+   - Fixed levelDown leak — good.
+   - `Self` guard bug: the `callee == ""` check is dead/wrong; should check inside Self branch.
+   - Call branch good otherwise; use `auto&`; unsigned loop index; 2-seg silent makeError placeholder fine.
+   - Builtins registered — good.
+2. Phase 2 status: Not done. Suites: 20/35; all failures are operator/cast/assignment negatives. Need to implement:
+   - unaryExpr (-, !)
+   - binaryExpr (arith/bitwise/shift/comparison/equality/logical/assignment/compound) + isPlaceable/isMutablePlaceable
+   - castExpr
+   - if/while/loop/break/return/continue (basic)
+   - ref/deref/field/index/structInit/array/methodCall remain Phase 4/5.
+3. Phase 3 next: expected propagation, `check/expect` for if branches and loop breaks, LUB helper, never, unreachable. But Phase 3 depends on Phase 2 completion. Actually the user asks "接下来的 stage 3 干什么呢?" — I should explain, but first emphasize Phase 2 isn't done.
 
-So no AST issues in the suite. The AST dump succeeded for all 236 (except maybe those that exit before dump due to syntax errors — all have .ast files? count lines).
+Let me detail Phase 2 remaining implementation with operator rules, plus the fix to Self.
 
-Wait, these 13 tests: the AST dump happens before Checker, so .ast files exist. Good.
+Also note: the compound-assignment test `rej-a-literal-is-not-an-assignment-place` etc. need isPlaceable/isMutablePlaceable (declared, undefined). Assignment handling is Phase 2 per todo (basic mut check), Phase 4 expands (refs).
 
-Now, the "internal error" print is main.cpp's `throw 0` hack (as I noted earlier). Not AST.
+Also note `rej-unary-minus-is-signed-only`: unary minus on u32 → error.
+`rej-no-integer-truthiness`: `if 1 {}` → cond must bool. That requires if handling.
+`rej-lazy-operators-require-bool` → && || operands bool.
+`rej-lazy-operators-have-no-reference-variants` → e.g., `&true && ...`? needs refs to be non-bool (refExpr infer unimplemented → ERROR; typeEqual(ERROR,bool) true → would pass; so maybe need refExpr to return REF type even in Phase 2? Hmm, Phase 4. Let me check that test to know. Might need minimal ref handling. Let me look at these tests to give accurate guidance.
 
-Next: structural validator. Let me write a Python script that parses each .ast dump and validates:
-- indentation consistency.
-- known node labels.
-- child count invariants for known node types.
-- every Binary has exactly 2 children; Unary/Ref/Deref/Cast(child)/Field/Index(2)/Call(>=1)/MethodCall(>=1)/If(2 or 3 kids: cond, then, else...)/While(2)/Loop(1)/Break(0 or 1)/Return(0 or 1)/Let(0..2: Type? + init)/Path(0)/IntLit(0) etc.
+Let me check the failing test files to specify requirements:
+- boolean-and-short-circuit tests
+- casts tests
+- compound assignment tests
+- integer-arithmetic tests
+- shifts tests
 
-Given the dump format is a simple tree, the validator can group by node label. But some ambiguity: e.g., `Type &` node with one Type child; `Const` nodes. I'll define a generic check based on the dump line text prefix.
-
-Actually, the most valuable checks are:
-1. No `Expr?`/`Stmt?`/`Item?` — done (0).
-2. Every internal node has expected children count.
-3. Compare node label inventory against the set of AST node kinds, ensure coverage.
-
-Let me write the validator in /tmp/opencode/ast-check/validate.py. But is this necessary? The manual review on 33 targeted files found only the shift bug. The full suite dump has no unknown nodes. I think another useful check: verify that for all official tests, the AST dump size > 0 and no file contains "Expr?" etc. Done.
-
-However, I should also verify **precedence/associativity** more broadly. The official tests include `acc-operator-precedence-and-left-association.rx` (177B). Let me dump and inspect it against expected Rust semantics. Also `compound-assignment` test with 10 operators, `acc-all-ten-compound-operators-plus-boolean-assignments.rx`. Let me inspect those two dumps, plus the shifts ones (they only have single ops), plus `runtime-value-merges`, `loop-state-merges`, `reference-lub` (LUB-relevant ASTs: arrays with mixed refs, if branches, breaks).
-
-Interesting LUB cases from spec:
-- `let a = [&mut 1, &123];` etc. Let me check tests reference-lub for such array literals and verify AST shape (Array with Ref elements).
-- `let a = if c {1} else {2}`.
-
-Also `blocks-if-and-never` for block tails.
-
-Let me inspect the official precedence test dump now, then do a final check on a couple of LUB tests. Also verify no AST issue with `&&` unary vs `&&` binary in condition contexts (e.g., `a && &b`?). Let me look at official tests using `&&` unary (references) — e.g., `reference-lub`: `&mut &1`, `&mut &mut 2`. Our 05 tested &&x and &&mut x.
-
-Let me dump the official precedence test.
-
-The 13 "internal error" hits are the known `throw 0` hack in `main.cpp` for collect-rejected negative tests, not AST crashes. Let me verify that and inspect a few official AST dumps for precedence/LUB shapes.
+Let me cat a few.
 
 **Tool: bash**
 
 **Input:**
 ```json
 {
-  "command": "cd /tmp/opencode/ast-check/official && cat rej-duplicate-struct.rx.ast.err; echo =====; cat acc-operator-precedence-and-left-association.rx.ast; echo =====; cat /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic/casts-and-literals/acc-operator-precedence-and-left-association.rx"
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic\" && for f in boolean-and-short-circuit/rej-lazy-operators-have-no-reference-variants.rx boolean-and-short-circuit/rej-no-integer-truthiness.rx casts-and-literals/rej-reference-to-integer-cast-is-unsupported.rx compound-assignment/rej-reference-destinations-are-not-implicitly-dereferenced.rx compound-assignment/rej-a-literal-is-not-an-assignment-place.rx integer-arithmetic/rej-unary-minus-is-signed-only.rx; do echo \"=== $f\"; cat \"$f\"; done"
 }
 ```
 
 **Output:**
 ```
-error occurred!
-duplicate struct name : A
-internal error
-=====
-Fn main()
-  Type ()
-  Block
-    ExprStmt
-      Call
-        Path println_i32
-        Binary <<
-          Binary -
-            Binary +
-              IntLit 2
-              Binary *
-                IntLit 3
-                IntLit 4
-            IntLit 5
-          IntLit 1
-    ExprStmt
-      Call
-        Path println_i32
-        Binary /
-          Binary /
-            IntLit 20
-            IntLit 3
-          IntLit 2
-    ExprStmt
-      Call
-        Path println_i32
-        Binary -
-          Binary -
-            IntLit 10
-            IntLit 3
-          IntLit 2
-    ExprStmt
-      Call
-        Path println_i32
-        Cast
-          Binary <<
-            Cast
-              IntLit 5
-              Type usize
-            IntLit 2u32
-          Type i32
-=====
+=== boolean-and-short-circuit/rej-lazy-operators-have-no-reference-variants.rx
 use rx::core::*;
 
 fn main() {
-    println_i32((2 + 3 * 4 - 5) << 1);
-    println_i32(20 / 3 / 2);
-    println_i32(10 - 3 - 2);
-    println_i32((5 as (usize) << 2u32) as i32);
+    let x = &true && true;
+}
+=== boolean-and-short-circuit/rej-no-integer-truthiness.rx
+use rx::core::*;
+
+fn main() {
+    if 1 {}
+}
+=== casts-and-literals/rej-reference-to-integer-cast-is-unsupported.rx
+use rx::core::*;
+
+fn main() {
+    let x = &1i32;
+    let y = x as i32;
+}
+=== compound-assignment/rej-reference-destinations-are-not-implicitly-dereferenced.rx
+use rx::core::*;
+
+fn main() {
+    let mut x = 1;
+    let mut p = &mut x;
+    p += 1;
+}
+=== compound-assignment/rej-a-literal-is-not-an-assignment-place.rx
+use rx::core::*;
+
+fn main() {
+    1 += 2;
+}
+=== integer-arithmetic/rej-unary-minus-is-signed-only.rx
+use rx::core::*;
+
+fn main() {
+    let a = -1u32;
 }
 
 ```
 
 ---
 
-## Assistant (Build · DeepSeek V4.1 Flash · 32.5s)
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 24.2s)
 
 _Thinking:_
 
-The official precedence test:
-1. `(2 + 3 * 4 - 5) << 1` → `<<( -( +(2, *(3,4)), 5 ), 1)` ✓
-2. `20 / 3 / 2` → `/( /(20,3), 2)` ✓
-3. `10 - 3 - 2` → `-( -(10,3), 2)` ✓
-4. `(5 as (usize) << 2u32) as i32` → Cast( <<( Cast(5,usize), 2u32 ), i32 ) ✓ — note `5 as (usize) << ...` uses parenthesized closedCastType then `<<`; correct.
+These tests require:
+- refExpr infer to return REF type (at least minimal `&expr` → REF(infer(expr), isMut)); then `&true && true` → lhs REF(bool) ≠ bool → error. Without ref handling, ERROR type is treated as compatible → test fails. So Phase 2's lazy-boolean check needs at least a minimal refExpr handler (Phase 4 will add place checks). Same for cast test: `x as i32` where x is `&i32` → cast from REF invalid → need infer(path x) → REF type; that requires refExpr handling in `let x = &1i32;`. So a minimal refExpr in Phase 2 is useful:
+  ```cpp
+  if (auto* ref = dynamic_cast<refExpr*>(expr)) {
+      semType* inner = infer(ref->operand_);
+      return semantic::makeRef(inner, ref->isMut_);
+  }
+  ```
+  Wait: `&&x` AST is nested refExpr, so works. Place requirement (`&mut` needs mutable place) is Phase 4; for now just type. But careful: `&1i32` — borrow of a literal; place check would reject (literals not places?) Actually `&1` is allowed in Rust? `&1` creates a temporary; tests use `&1i32` (in casts test). So do not enforce place in Phase 2.
+- derefExpr: for `*r` in tests (names-and-shadowing positive uses `*r`); currently unimplemented → ERROR. Positive passes anyway. For compound-assignment `p += 1` where p: &mut i32: the rule is references are not implicitly dereferenced for assignment destinations → p itself is a local (mut) → isMutablePlaceable would say true, but the destination type is REF → compound requires integer lhs → error. So binary compound check needs lhs type integer; REF type is not integer → error. With refExpr infer, p's type is REF, so checking "lhs type is integer" catches it. Good.
+- `1 += 2` → lhs is not a place → need isPlaceable check on lhs (intLit not place).
+- `if 1 {}` → while/if cond bool check.
+- unary minus on u32 → signed check.
 
-So precedence is right. The mixed-shift bug isn't covered by official tests (I should double check whether any official test has mixed shifts; earlier grep showed only single shifts). 
+So Phase 2 remaining work:
+1. Fix `Self` guard in infer.
+2. Minimal `refExpr` (type only) and maybe `derefExpr` (type: operand REF/BOX → elem; Vec not).
+3. `unaryExpr`: `-` signed int; `!` int or bool.
+4. `binaryExpr`:
+   - assignment `=` and compound ops: isPlaceable/isMutablePlaceable lhs; compound lhs integer; rhs expect lhs type; result unit.
+   - arith/bitwise: same integer type; result same.
+   - shift: lhs integer, rhs integer, result lhs.
+   - comparisons: same integer or bool; result bool.
+   - equality: same type; result bool.
+   - `&&/||`: both bool.
+5. `castExpr`: int→int, bool→int; result target; reject REF.
+   - `x as i32` where x is REF → error.
+6. `if`: cond bool; branches (Phase 2 minimal: no else → then against unit, result unit; with else → infer both and compare, or defer LUB but need something). Test `rej-no-integer-truthiness` only needs cond bool.
+7. `while`: cond bool, body unit. `loop`: body unit.
+8. `return`: tail expect currentRet_; no tail → currentRet_ must be unit; result NEVER.
+9. `break`/`continue`: result NEVER (break value handled Phase 3).
+10. `isPlaceable`/`isMutablePlaceable` definitions.
 
-Let me now check reference-lub dumps and the arrays/structs tests quickly for structural sanity, then do a broader automated structural validation. Actually, let me think about what else could be wrong in the AST builder and design targeted tests:
+That should clear the 15 failures (except possibly ref-related place checks). Let me map each failing test:
+1. rej-no-integer-truthiness → if cond bool.
+2. rej-lazy-operators-require-bool → && ||.
+3. rej-lazy-operators-have-no-reference-variants → refExpr type + || bool check.
+4. rej-bitwise-operand-types-must-match → binary bitwise same int type.
+5. rej-integer-to-bool-cast-is-unsupported → cast from int to bool target: `1 as bool` → error (only int→int, bool→int).
+6. rej-reference-to-integer-cast-is-unsupported → refExpr + cast check.
+7. rej-compound-destination-must-be-mutable → isMutablePlaceable.
+8. rej-an-explicit-mismatched-suffix-cannot-coerce → compound rhs type match (`x += 1u32` where x i32?) — needs suffix literal type + expect.
+9. rej-reference-destinations-are-not-implicitly-dereferenced → compound lhs integer (REF rejected).
+10. rej-a-literal-is-not-an-assignment-place → isPlaceable.
+11. rej-explicitly-different-arithmetic-operand-types → binary same type.
+12. rej-unary-minus-is-signed-only → unary.
+13. rej-booleans-are-not-arithmetic-integers → bool in +.
+14. rej-shift-count-must-be-integer → shift rhs int.
+15. rej-shift-left-operand-must-be-integer → shift lhs int.
 
-1. **visitBlockExpression edge**: block with `statementExpression` after statements and also trailing expressionWithBlock without semicolon — e.g. `{ 1; 2 if true {} }`? Syntax? statement* statementExpression? — statementExpression is the final expression without block? e.g. `{ 1; 2 }` → statements=[1], tail=2. `{ 1; if c {2} }` → the if is an expressionWithBlock statement without semi and it's last → tail. `{ 1; if c {2} 3 }`? invalid.
+So yes, implementing 2-10 clears them.
 
-2. **If with block values and `-`** tested.
+Now, is "Phase 2 通过" = these 6 suites green? 20 passed + 15 to fix = 35 cases. After fixes should be 35/35 (assuming no false positives).
 
-3. **Assignment right recursion**: `a = b = c` — test quickly.
+Phase 3 after that:
+- Full expected-type propagation: currently expect only propagates into literals/blocks. Phase 3: `if` branches, loop break values, struct field initializers (Phase 5), call args (done), return (done). Need `check` at those sites.
+- LUB function for if/arrays/loop-break, with never ignored.
+- never type: break/return/continue return NEVER; LUB ignores; unreachable code still checked.
+- if with else result type; single-sided if unit; loop type from breaks.
+- This will fix `blocks-if-and-never`, `loops-and-jumps`, `expected-types`, `loop-state-merges`, `runtime-value-merges`.
 
-4. **The `condition` vs `expression` families**: conditions disallow unparenthesized struct init: `if S { x: 1 }.x {}`? The grammar conditionPrimaryWithoutBareBlock includes pathInExpression WITHOUT the struct-fields optional part (unlike nonBlockPrimary). Good. Test: `while v.len() > 0 {}` method calls in condition? conditionPostfixExpression: conditionPrimary postfixSuffix* — should work. Let me test method call in while condition and index and field:
+Let me now write the review response:
+1. Call branch review: good; Self guard bug; minor copy/`auto&` and int vs size_t; 2-seg placeholder ok.
+2. Phase 2 status: not done — suites 20/35; list exactly what's missing (unary/binary/cast/ref minimal/isPlace/if/while/loop/return/break). Explain that even though `infer` returns ERROR silently for them (so positives pass), all 15 failures are those negatives.
+3. Phase 3 explanation: expected propagation + LUB + never.
+4. Suggest order: finish Phase 2 first (the list), then Phase 3.
+
+Should I provide code for Phase 2? The user asks "look" and "what's phase 3". Give guidance. Maybe a compact operator table again? I already gave one. Keep it focused: list the missing branches and the key rules; mention refExpr minimal for two tests. Answer questions.
+
+Let me write concisely.
+
+看完了。callExpr 基本对，但有一个 bug 和两个小点：
+
+1. **`Self` 的保护写错位置了**：
+   ```cpp
+   if (callee == "Self") {
+       auto sig = findConst(currentStruct_, name);   // currentStruct_ 为空时会去查顶层常量
+       ...
+   }
+   else {
+       if (callee == "") { error("\"Self\" outside implement"); ... }  // ← 永远不可能成立
+   ```
+   应该把"`Self` 且 `currentStruct_` 为空 → 报错"放进 `Self` 分支里；`else` 里那句删掉。
+2. `auto sig = table_.funcSig[callee];` 按值拷了整个签名，改 `auto&`；`for (int i = 0; i < sig.params_.size(); ...)` 的 `int` 改 `size_t`（会有 signed/unsigned warning）。
+3. 2 段路径直接 `return makeError()` 没问题（Phase 5 再来），但注意它**不报错**，所以负例里的 `Missing::f()` 现在不会被抓——那是 Phase 5 的事。
+
+**这算 Phase 2 通过了吗？不算。** 我跑了 Phase 2 的六个 suite：**20 passed / 15 failed**。失败的全是"运算符/转换/赋值"负例，因为 `infer` 现在还只有字面量/path/block/call。`infer` 对未实现的节点静默返回 ERROR，所以正例能过、负例全漏。Phase 2 还差：
+
+| 要补 | 覆盖的失败用例 |
+|---|---|
+| `refExpr` 最小版（`&e` → `REF(infer(e), isMut)`，暂不查 place） | `rej-reference-to-integer-cast`、`rej-lazy-operators-have-no-reference-variants` |
+| `unaryExpr`（`-` 有符号整数；`!` 整数或 bool） | `rej-unary-minus-is-signed-only` |
+| `binaryExpr` 算术/位运算（同整数类型） | `rej-bitwise-operand-types-must-match`、`rej-booleans-are-not-arithmetic-integers`、`rej-explicitly-different-arithmetic-operand-types` |
+| `binaryExpr` 移位（左整数、右整数） | `rej-shift-count/left-operand-must-be-integer` |
+| `== != < <= > >= && \|\|` | `rej-lazy-operators-require-bool`、`rej-no-integer-truthiness`（后者要 if） |
+| `castExpr`（int→int、bool→int；REF 不行） | `rej-integer-to-bool-cast`、`rej-reference-to-integer-cast` |
+| `isPlaceable` / `isMutablePlaceable` + 赋值/复合赋值 | `rej-a-literal-is-not-an-assignment-place`、`rej-compound-destination-must-be-mutable`、`rej-reference-destinations...`、`rej-an-explicit-mismatched-suffix...` |
+| `if`（cond bool）、`while`、`loop`、`return`、`break`、`continue` | `rej-no-integer-truthiness`，以及后续 suite |
+
+补完这 15 个应该能过，Phase 2 才算完成。
+
+**Phase 3 做什么：**
+
+1. **expected 的完整穿透**：现在 `expect` 只穿透字面量和 block；Phase 3 要让它继续穿 `if` 的两分支、`loop` 的所有 `break` 值、`return`，以及"块尾/括号"。这是 `let x: u32 = if c { 1 } else { 2 };` 这类用例的前提。
+2. **LUB**：`if` 有 else、数组字面量、同一 loop 的所有 break 值，按"源码顺序 + 忽略 never + 能调整就保持/扩宽"的规则合并出公共类型。
+3. **never**：`return`/`break`/`continue` 的类型是 `!`；`!` 在 LUB 里被忽略、可以并入任意类型；`while` 体、无 else 的 `if`、无 break 值的 loop 是 `()`。
+4. **不可达代码**：`return` 之后的语句仍然要查名字/类型（只有 place 可变性违规在不可达里是 UB、不考）。
+
+对应 suite：`expected-types`、`blocks-if-and-never`、`loops-and-jumps`、`loop-state-merges`、`runtime-value-merges`。所以顺序就是：先把 Phase 2 那 15 个失败补掉，再进 Phase 3 写 `expect` 的穿透 + `lub()` + never。
+
+---
+
+## User
+
+你的意思是，我现在要补 infer 和 expect 对吧。那可变性检查之类的东西怎么办呢？
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 22.4s)
+
+_Thinking:_
+
+The user asks: "你的意思是，我现在要补 infer 和 expect 对吧。那可变性检查之类的东西怎么办呢？" — They want to know how to handle mutability checks (place checks) — whether to do them now in Phase 2 or defer, and how they fit with infer/expect.
+
+I should clarify the split between Phase 2 basic mutability (needed for the compound-assignment tests now) versus Phase 4 full place/coercion semantics.
+
+Key points:
+1. Phase 2 needs only a *minimal* `isPlaceable`/`isMutablePlaceable` to satisfy assignment/compound assignment:
+   - isPlace: local variable path (1 segment), field access chain, index chain, deref; NOT literals/calls/consts.
+   - isMutablePlace: 
+     - local: localShadowing.isMut_
+     - field/index: recursive on receiver (but through shared ref not recoverable — Phase 4)
+     - deref: operand type REF → isMut; Box → depends on owner (Phase 4)
+   - For Phase 2 tests: `1 += 2` (literal not place), `x += 1` where x non-mut (rej-compound-destination-must-be-mutable), `p += 1` with p: &mut i32 (REF dest not implicitly dereferenced → lhs type not integer → error).
+2. Full Phase 4 additions:
+   - place requirements for `&`/`&mut` (borrow requires place; `&mut` requires mutable place)
+   - deref through shared ref cannot recover mutability
+   - Box-owned mutability
+   - Vec index mutability subtleties
+   - coercion (`&mut T` → `&T`, deref paths, never) and receiver auto-borrow.
+3. How it integrates with infer/expect: mutability checks are not part of `infer`; they're side checks in specific expression positions:
+   - assignment/compound assignment: check lhs place/mutable
+   - refExpr `&mut`: check operand mutable place (Phase 4; Phase 2 minimal can skip or implement local-only)
+   - method call receiver (Phase 5)
+   - assignment destinations and place expressions are "place contexts"; rustc has place expressions, but our AST just has Expr.
+4. Important ordering: `infer` should compute types; place checks should call `infer` for the receiver type as needed (e.g., deref). Avoid double-side-effects.
+5. Practical plan for Phase 2 now:
+   - Implement minimal isPlaceable/isMutablePlaceable (locals + field + index + deref of &mut).
+   - In binary assignment handling: 
+     - `=`: require isPlaceable(lhs) && isMutablePlaceable(lhs); infer/lhs type; expect(rhs, lhsType); result unit.
+     - compound: require isPlaceable & mutable; lhs type must be integer; expect(rhs, lhsType); result unit.
+   - `&mut e` place check can be deferred to Phase 4 (but maybe implement local check now: `&mut x` requires x mutable place; the tests in references suite are Phase 4).
+   Note: `&x` (shared) requires place in Rust (can't borrow temporary? Actually in Rust `&1` is allowed—temporary lifetime extension; Rx tests use `&1i32` as valid, so require place would break it. So don't enforce place for shared borrow in Phase 2; Phase 4 spec says "要求 x 是可借用的 place" — but `&1` in tests? The casts test uses `let x = &1i32;` as valid (negative test is casting the ref). Hmm spec says `&x`/`&mut x` require x to be a borrowable place. Is `&1i32` valid? The test `rej-reference-to-integer-cast-is-unsupported.rx` has `let x = &1i32;` and expects rejection only due to the cast. Does that mean `&1i32` is valid in Rx? It must be, since the test is a negative only for the cast; if `&1i32` were invalid the test would still pass (rejected), but positive tests likely use `&1u32` too (reference-lub examples: `[&mut 1, &123]`). So borrowing literals is allowed (they're temporaries, place-ish via temporary). So implementing place requirement for `&` must be careful: literal borrows are allowed. Phase 4 handles with temporary semantics. So don't add place checks for `&` in Phase 2.
+6. Also mention mutability of `let` binding vs reference mutability are different (`let mut p: &mut T`).
+7. Also note the self param isMut quirk.
+
+So answer structure:
+- Yes, Phase 2 = fill infer/expect for the operator/cast/if/etc. branches.
+- Mutability checks are *side checks at specific positions*, not part of infer. Implement a minimal `isPlaceable`/`isMutablePlaceable` now (needed by the 4 compound-assignment negatives), with the table of cases; leave the full list for Phase 4.
+- Give minimal code sketch.
+- Explain what Phase 4 will extend (borrow place checks, shared-ref recovery rule, Box/Vec, coercion) and why deferring is safe (tests excluded/other suites).
+- Note `&mut` borrow checks can be deferred; but `&e`/`&mut e` type construction (refExpr) is needed now for the two Phase 2 tests.
+- Also mention assignment result unit and compound integer requirement.
+
+Keep it concise with a small table of minimal vs Phase 4. Let me write.
+
+对，Phase 2 的主体是补 `infer`/`expect` 的运算符分支。**可变性检查不是 `infer` 的一部分**，它是"在特定表达式位置顺手做的副作用检查"，按阶段分两档：
+
+**现在就写最小版（够 Phase 2 的 4 个负例）：**
+
+```cpp
+bool Checker::isPlaceable(Expr* e) {
+    if (auto* p = dynamic_cast<pathExpr*>(e); p && p->path_.size() == 1) {
+        return scope_.find(p->path_[0].name_) != nullptr;   // 只有局部；常量不是 place
+    }
+    if (auto* f = dynamic_cast<fieldExpr*>(e)) return isPlaceable(f->from_);
+    if (auto* i = dynamic_cast<indexExpr*>(e)) return isPlaceable(i->from_);
+    if (dynamic_cast<derefExpr*>(e)) return true;
+    return false;    // 字面量/调用/结构体构造……都不是
+}
+
+bool Checker::isMutablePlaceable(Expr* e) {
+    if (auto* p = dynamic_cast<pathExpr*>(e); p && p->path_.size() == 1) {
+        auto* local = scope_.find(p->path_[0].name_);
+        return local != nullptr && local->isMut_;
+    }
+    if (auto* f = dynamic_cast<fieldExpr*>(e)) return isMutablePlaceable(f->from_);   // Phase 4 补"穿过共享引用不可恢复"
+    if (auto* i = dynamic_cast<indexExpr*>(e)) return isMutablePlaceable(i->from_);   // Phase 4 补 Vec 索引细节
+    if (auto* d = dynamic_cast<derefExpr*>(e)) {                                       // Phase 4 补 Box
+        semType* t = infer(d->operand_);
+        return t->kind_ == semType::kTypeKind::REF && t->isMut_;
+    }
+    return false;
+}
+```
+
+赋值分支（`binaryExpr` op 是 `=` / `+=` 等）：
+
+```cpp
+if (op == "=") {
+    if (!isPlaceable(lhs) || !isMutablePlaceable(lhs)) { error("not a mutable place"); return unit; }
+    semType* lt = infer(lhs);
+    expect(rhs, lt);
+    return unit;
+}
+// 复合赋值
+if (!isPlaceable(lhs) || !isMutablePlaceable(lhs)) { error(...); return unit; }
+semType* lt = infer(lhs);
+if (!isIntegerType(lt)) { error("compound assignment requires integer destination"); }  // 挡住 p += 1（p 是 &mut i32）
+expect(rhs, lt);
+return unit;
+```
+
+这正好清掉 Phase 2 的四个失败：字面量不是 place、非 mut 局部、`&mut i32` 目标不是整数、后缀不匹配（靠 `expect(rhs, lt)`）。
+
+**Phase 4 再扩的东西（现在别做）：**
+
+| Phase 4 内容 | 为什么现在不做 |
+|---|---|
+| `&mut e` 要求 e 可变、`&e` 要求可借用 | 正例里有 `&1i32`、`&mut 1`（借用字面量/临时值），需要"临时值也算 place"的语义，容易误伤 |
+| 穿过共享引用后不可恢复（`&x` 再取字段不能写） | `references-and-mutability` suite 才考 |
+| `*p` 中 p 是 `Box<T>` 时看 Box 自己的 owner | 需要 Box 语义，Phase 5 才有 |
+| Vec 索引的隐式借用/写检查 | `vec-index-mutability` suite |
+| 实参 coercion（`&mut T → &T`、`&Box<T> → &T`） | 现在 `expect` 只做 `typeEqual`；Phase 4 把调用点换成 `coerceTo` |
+
+另外注意：`infer` 里 `refExpr` 现在要写成"类型构造"（`&e` → `makeRef(infer(e), isMut)`），但**不要**在里面做 place 检查——两个 Phase 2 负例只是靠它的类型（REF 不能当 bool/不能 cast 成 int）来挂。可变性检查留在赋值、Phase 4 的借用、Phase 5 的方法接收者那几个"位置"上，别塞进 `infer` 的通用路径。
+
+---
+
+## User
+
+你先给我讲讲什么叫 Placeable,MutablePlaceable，我不太会 Rust。
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 23.9s)
+
+_Thinking:_
+
+The user asks for a conceptual explanation of "place" / "placeable" / "mutable placeable" — they don't know Rust well. I should explain in plain terms, with analogies, then tie to Rx rules and why assignment/borrow need it.
+
+Key concepts:
+1. Value vs place. In Rust, expressions can be used in two ways:
+   - as values: reading/evaluating produces a value (e.g., `1 + 2` → 3)
+   - as places: denoting a memory location where a value can be read or written (e.g., variable `x`, field `p.x`, array element `a[i]`, dereference `*r`).
+2. "place expression" (place) — an expression that denotes storage. Categories per Rust reference:
+   - local variables (and params)
+   - static/const? Consts are not places (they're inlined values) — assigning to a const is not allowed.
+   - field access on a place
+   - array/slice indexing
+   - dereference of a reference/Box
+   - (temporaries can be places for borrow purposes, but keep simple)
+   - things that are NOT places: literals `1`, results of operators `a+b`, function calls `f()`, struct literals, casts? (casting produces a value).
+3. Why it matters: assignment `x = e` requires LHS be a place; `x += e` too. Borrowing `&e`/`&mut e` requires `e` be a place (in Rust; in Rx, temporaries/borrow literals are allowed in tests; mention nuance). Method receivers with `&mut self` require receiver be mutable place.
+4. "Mutable place": a place you're allowed to write through:
+   - local binding must be declared `mut`
+   - fields/index inherit from base place
+   - `*r`: writable only if r is `&mut T`; through `&T` not writable; `Box<T>` writable if the box binding/place is mutable? In Rust, `*b` for Box works if b is a place; the box owns the value, so mutability comes from the place b. (Rx rule: `*p`: p is `&mut T` → mutable; `&T` → readonly; `Box<T>` → depends on Box owner's place mutability.)
+   - crucially: `&T` blocks mutability permanently (shared reference: even if the binding holding the reference is mut, you can't write through it).
+5. Examples in Rust/Rx:
+   ```rust
+   let x = 1;
+   x = 2;        // x is a place but not mutable (not declared mut) → error
+   let mut y = 1;
+   y = 2;        // place + mutable → ok
+   1 = 2;        // literal is not a place → error
+   let r = &y;
+   *r = 3;       // *r is a place, but through &T → not mutable
+   let m = &mut y;
+   *m = 4;       // *m place + mutable (m is &mut) → ok
+   struct P { v: i32 }
+   let mut p = P { v: 0 };
+   p.v = 3;      // field of mutable place → mutable place
+   ```
+   Note: `let r = &y` — r is immutable binding, but `*r` not writable because shared ref.
+6. Terminology: "placeable" is the user's naming for `isPlace`; "mutablePlaceable" for `isMutablePlace`. Explain that `isPlaceable(e)` = "can this expression denote storage we can assign to / borrow?" and `isMutablePlaceable(e)` = "and are we allowed to write through it?".
+7. Important subtlety: `isPlaceable` is about syntax shape, `isMutablePlaceable` combines shape + binding mutability + reference mutability.
+8. Why infer can't answer this: type doesn't encode binding mutability (`let mut x: i32` and `let x: i32` have same type); mutability of a place depends on how you reached it (through & vs &mut), not just the final type.
+
+Also mention: in the checker, mutability is stored in localShadowing (isMut_), and in Type for references (REF isMut_). Two different things.
+
+Maybe give a small decision table:
+| expression | place? | mutable place? |
+| `x` (let mut) | yes | yes |
+| `x` (let) | yes | no |
+| `x` (param mut x) | yes | yes |
+| `x` (param x) | yes | no |
+| `1` | no | no |
+| `a + b` | no | no |
+| `f()` | no | no |
+| `p.field` | if p place | if p mutable place |
+| `arr[i]` | if arr place | if arr mutable place (+ Phase 4 Vec rules) |
+| `*r` | yes | r: &mut T yes; r: &T no; Box follows r's place |
+| `S { .. }` | no | no |
+
+Also explain why `&mut 1` is allowed in Rx tests but `1 += 2` isn't: assignment requires a place; borrowing a value can create a temporary place. Mention that Rx's tests allow `&1`, `&mut 1` (temporaries) so our borrow checks are lenient.
+
+Keep it conceptual but concrete; no code changes. Chinese. Maybe 30-40 lines.
+
+"Place" 是 Rust 的一个核心概念，跟类型是**两回事**。简单说：
+
+> **Place（位置）= 一段内存**；**Value（值）= 从内存里读出来的东西**。
+
+同一个表达式可以当"值"用，也可以当"位置"用：
+
 ```rust
-fn f(v: Vec<i32>, s: S) {
-    while v.len() > 0 { }
-    if s.x > 0 { }
-    while v[0] > 0 { }
-}
-```
-This exercises condition postfix. Also `loop { break s.x; }`.
-
-5. **`while` with `break`/`return` in condition?** weird.
-
-6. **Array expression in condition**: `if [1,2][0] > 0 {}`? conditionPrimaryWithoutBareBlock includes arrayExpression; fine.
-
-7. **`loop` as condition primary**? grammar conditionPrimary includes loop/while... weird but allowed? Probably for `if loop {}`; not needed.
-
-8. **Unit expr in condition**: `if () == () {}`? not needed.
-
-9. **Unary in condition/statement**: tested `!c`, `-a` in statement; condition `!c` in if? 30 had `while !c {}` and `if c && !c {}` ✓.
-
-10. **Cast families in condition**: tested with parens; bare cast then comparison is syntax error by design. Cast then additive: `if a as u32 + b > 0`? Hmm, `a as u32 + b` — after cast, `+` is fine (not ambiguous). conditionCastExpression handles. Let me test: `if a as u32 + b > 0u32 { }`. Also statement `a as u32 + b;`, break `break a as u32 + b;`. Let me add.
-
-11. **`&&` vs `&&`**: `if a > 0 && &b > 0`? type nonsense but AST.
-
-Rather than chase every family, maybe a smarter approach: the builder has many copy-pasted families; the shift bug shows they can share latent bugs. A systematic differential test: generate random expressions and compare the AST against expected semantics computed by... we don't have a reference frontend for AST. But we could compare against **rustc parse tree**? Not available for Rx (but Rx is Rust subset; rustc could parse most). Overkill.
-
-Alternative: for each duplicated family (expression/condition/conditionBreak/statement and closed variants), run the *same expression* in contexts hitting each family and compare resulting AST shapes (modulo labels) they should be identical. We can automate: for a set of expressions E and contexts, dump and compare normalized ASTs. Differences reveal family-specific bugs. That's a strong differential test!
-
-Contexts:
-- expression family: `let x = E;`
-- condition family: `if E == E0 {}`? Hmm, E already includes comparison maybe. To force condition family, put E as condition: `if E { }` requires E:bool parse-wise fine (semantics irrelevant). But some E end with `;` statement contexts.
-- conditionBreak family: `loop { break E; }`
-- statement family: `E;` (for expressions valid as statement).
-
-If E is e.g. `a << b >> c`, the trees from `let x = E;`, `if E {}`, `loop{break E;}`, `E;` should all be same shape. We know shifts differ all broken. But other ops should agree.
-
-This differential harness is elegant: generate contexts for a battery of expressions and diff normalized dumps. Let me implement with Python: 
-- expressions list (strings): 
-  - "a + b * c - d / e % f"
-  - "a & b | c ^ d"
-  - "a << b" (single)
-  - "a >> b"
-  - "a << b >> c" (known broken)
-  - "a as u32 as isize"
-  - "-a"
-  - "!flag"
-  - "&a"
-  - "&&a"
-  - "&&mut a"
-  - "*p"
-  - "a < b"
-  - "a <= b", "a == b", "a != b", "a > b", "a >= b"
-  - "flag && a < b || flag"
-  - "(a + b) * c"
-  - "a.x" ... requires struct
-  - "f(a,b)" call? In condition context call is fine.
-  
-But careful: statement context `E;` for `E = "a < b"` works; condition `if a < b {}` — the condition family's comparison handling; etc.
-
-Variables need declaration; write a prelude with fn params so all names resolve parse-wise: `fn f(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32, g: i32, p: &i32, q: &mut i32, flag: bool, s: S, v: Vec<i32>)`. Wait, function params shadow? Fine for parsing.
-
-For `a.x`, need struct S with x. Use `s.x`.
-
-Then for each expression E:
-- expr ctx: `fn main() { let z = E; }` — hmm must use `let z = E;` inside main.
-- cond ctx: `fn main() { if E { } }`
-- brk ctx: `fn main() { loop { break E; } }`
-- stmt ctx: `fn main() { E; }`
-
-But note: using `fn main` repeatedly requires per-case file. We'll generate one file per (ctx, E) in /tmp and dump; then normalize dumps: extract the line `Let z` subtree / condition subtree / break subtree / statement subtree. Compare structures.
-
-Caveat: the condition context AST root is If with cond child; closed variants might legitimately differ? No — AST should be identical expression tree. There may be a wrinkle: `if E { }` with E containing `<` could hit conditionComparisonExpression's different alternative but same resulting AST. Fine.
-
-Caveat: expressions starting with `-` in statement context: `-a;` fine. `&a;` fine? `&mut a;` fine.
-
-Caveat: some expressions are not valid in condition because of grammar differences? All ordinary ops should be.
-
-Let me implement this differential test with Python in /tmp/opencode/ast-check/diff_test.py. It will:
-1. Write prelude variants per context.
-2. Run rxcc.
-3. Extract subtree from normalized dump: for expr context take lines after "Let z" until indent back; simpler: find marker line and take following lines with greater indent.
-4. Normalize: replace variable names? Not needed since all contexts use identical expression text; but the surrounding root differs; extracting the expression subtree suffices. For cond context, the expression is direct child of If; extract child lines. For break, child of Break. For statement, child of ExprStmt.
-5. Compare normalized trees across contexts; report mismatches.
-
-Also within expr/cond contexts, closed vs open differences might produce same tree.
-
-Let me also include "let z = E as T < b"? skip due to grammar rule.
-
-This is a good systematic check. Let me write it.
-
-Note: expressions with `a & b | c ^ d` in `if E {}` — E must be bool semantically but parsing doesn't care.
-
-Also for condition context, `if a << b >> c > 0 {}`? E already has comparison; condition handles. But simpler E as full expression.
-
-Potential issue: `if E { }` where E is a statement-like expression with assignment `a = b`? conditionAssignmentExpression allows. Include "a = b" and "a += b". Statement context also. Let me include.
-
-Also `E` = `{ 1 }`? Blocks as statements/expr contexts: `let z = { 1 };`, `if { true } {}`? conditionPrimary includes blockExpression. Statement context `{ 1 };`? statement expressionWithBlock SEMI? okay. Include `{ a }`? Might differ? Include `{ a + b }`.
-
-Also `if a {} else {}` as E? That's expressionWithBlock; `let z = if a {} else {};` vs statement `if a {} else {};`. Could compare too, but the tail/statement boundary logic differs by context intentionally. Maybe skip if/loop/block.
-
-Let me write the differential harness for pure expressions (operators, casts, unary, paths, literals, calls, fields, index, arrays). 
-
-Expressions list:
-```
-"a",
-"1",
-"true",
-"a + b * c - d / e % f",
-"a & b | c ^ d",
-"a << b",
-"a >> b",
-"a << b << c",
-"a >> b >> c",
-"a << b >> c",
-"a >> b << c",
-"a as u32",
-"a as u32 as isize",
-"-a",
-"!flag",
-"&a",
-"&mut a",
-"&&a",
-"&&mut a",
-"*p",
-"a < b",
-"a <= b",
-"a == b",
-"a != b",
-"a > b",
-"a >= b",
-"flag && a < b || flag",
-"(a + b) * c",
-"s.x",
-"f(a)",
-"v[0]",
-"[a, b]",
-"loop_expr?" no
-"a = b",  // statement/expr contexts; condition too
-"a += b",
-"1u32 + 2u32",
-"0xFFu32",
+let mut x = 1;
+x;        // 当值用：读出 1
+x = 2;    // 当位置用：把 2 写进 x 那块内存
 ```
 
-Wait: `f(a)` with param named f shadows? Name the function differently in prelude, e.g., `fn fun(x: i32) -> i32`. Use "fun(a)".
+**哪些表达式是 place？** 能"指到一块可写/可借的内存"的：
 
-Also `v[0]` needs v: Vec<i32>. And `[a, b]`.
-Also method call `s.get()` maybe.
+| 表达式 | 是 place 吗 | 为什么 |
+|---|---|---|
+| 局部变量 `x`、参数 `p` | 是 | 它就是一块存储 |
+| `p.x` 字段 | 取决于 `p` | 有地方才谈得上它的字段 |
+| `arr[i]` 索引 | 取决于 `arr` | 元素在数组/容器里 |
+| `*r` 解引用 | 是 | 它指向的那块内存 |
+| 字面量 `1`、`true` | **不是** | 临时算出来的值，没有"存储"可写 |
+| `a + b`、`f()`、`S { .. }`、`a as i32` | **不是** | 结果是一个新值，不是一个地址 |
 
-But careful: expression `a = b` in condition: `if a = b {}` — conditionAssignmentExpression allows; semantically bool required. Parse fine.
+`isPlaceable(e)` 就是回答"**这个表达式能不能当左值/被借用**"——注意它只看**形状**（变量/字段/索引/解引用），不看类型。
 
-Also expression `a = b = c` right assoc: include in expression context only? In condition: `if a = b = c {}` should parse. In statement: `a = b = c;`. Compare.
+**Mutable place 再多一层：这个位置允许写吗？** 这就要看"走到这块内存的路径"上的可变性：
 
-Potential mismatch sources that are legitimate:
-- None expected; AST should be identical across families.
+| 表达式 | 类型 | mutable place？ | 原因 |
+|---|---|---|---|
+| `let mut x = 1; x` | i32 | 是 | 绑定声明了 `mut` |
+| `let x = 1; x` | i32 | **否** | 绑定没 `mut` |
+| `let mut y = 1; let r = &y; *r` | i32 | **否** | `r` 是 `&T`（共享引用），不能写穿 |
+| `let m = &mut y; *m` | i32 | 是 | `m` 是 `&mut T` |
+| `let mut p = P{v:0}; p.v` | i32 | 是 | 字段继承基址 `p` 的可变性 |
+| `let p = P{v:0}; p.v` | i32 | 否 | 基址不可变 |
+| `let mut b = Box::new(1); *b` | i32 | 是（Phase 4/5 再细看） | Box 自己拥有内容 |
+| `&y` 本身 | `&i32` | 不是 place | 引用是个值，不是存储 |
 
-Let me implement:
+两个容易混的"mut"：
 
-prelude for expr: `struct S { x: i32 }\nimpl S { fn get(&self) -> i32 { self.x } }\nfn fun(x: i32) -> i32 { x }\nfn f(a: i32, b: i32, c: i32, d: i32, e: i32, p: &i32, q: &mut i32, flag: bool, s: S, v: Vec<i32>) {\n    let z = EXPR;\n}\n`
-cond: same params, body `if EXPR { }`
-brk: body `loop { break EXPR; }`
-stmt: body `EXPR;`
+- `let mut x` 的 mut 存在**局部符号**里（你的 `localShadowing::isMut_`）；
+- `&mut T` 的 mut 是**类型的一部分**（你的 `semType::isMut_`）。
 
-Note: `if EXPR { }` with EXPR = `true` fine. With EXPR containing `{}`? we don't include blocks.
+`isMutablePlaceable(e)` 就是"place 形状 + 路径上允许写"。**不能只看类型**：`let mut x: i32` 和 `let x: i32` 类型相同，但一个能赋值一个不能；`&mut i32` 和 `&i32` 虽然类型带 mut，但 `*p` 能不能写取决于引用本身是不是 `&mut`。
 
-Extraction:
-- expr root: after line matching r'^\s*Let z$' take children.
-- cond root: after `If` line take first child (cond) subtree.
-- brk root: after `Break` line take its tail subtree.
-- stmt: after `ExprStmt` take child.
+回到 Rx 的规则就是：
 
-Normalize indentation: strip leading spaces, then reindent relative. Compare strings.
+- `x = 2` / `x += 1`：左边必须 `isPlaceable && isMutablePlaceable`；
+- `&mut e`：e 必须可变 place（Phase 4；注意测试里 `&mut 1` 这种借用临时值是允许的，所以借用字面量不要一棍子打死）；
+- `&e`：e 要能借（Phase 4）；
+- 方法接收者 `&mut self`：接收者必须是可变 place（Phase 5）；
+- `*r = 3`：`*r` 是 place，但只有 `r: &mut T` 时才是 mutable place。
 
-Edge: For cond context with EXPR = `a = b`, conditionAssignmentExpression; dump If child = Binary =. fine.
-Edge: brk context with EXPR = `a = b` → break operand uses conditionBreak family; fine.
-
-Let me write the script and run. This gives strong differential evidence. Then report all findings.
-
-Also note the shift bug should show as mismatches for "a << b >> c" etc. — expected.
-
-Let me write the Python script.
-
-Let me build a differential test: the same expression in four grammar families (expression / condition / break / statement) should yield identical ASTs. This can expose family-specific copy-paste bugs.
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "content": "#!/usr/bin/env python3\nimport subprocess, re, os, sys\n\nRXCC = \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/target/build/rxcc\"\nWORK = \"/tmp/opencode/ast-check/diff\"\nos.makedirs(WORK, exist_ok=True)\n\nPRELUDE = \"\"\"struct S { x: i32 }\nimpl S { fn get(&self) -> i32 { self.x } }\nfn fun(x: i32) -> i32 { x }\nfn f(a: i32, b: i32, c: i32, d: i32, e: i32, p: &i32, q: &mut i32, flag: bool, s: S, v: Vec<i32>) {\n    %s\n}\n\"\"\"\n\nEXPRS = [\n    \"a\",\n    \"1\",\n    \"true\",\n    \"a + b * c - d / e\",\n    \"a & b | c ^ d\",\n    \"a << b\",\n    \"a >> b\",\n    \"a << b << c\",\n    \"a >> b >> c\",\n    \"a << b >> c\",\n    \"a >> b << c\",\n    \"a as u32\",\n    \"a as u32 as isize\",\n    \"-a\",\n    \"!flag\",\n    \"&a\",\n    \"&mut a\",\n    \"&&a\",\n    \"&&mut a\",\n    \"*p\",\n    \"a < b\",\n    \"a <= b\",\n    \"a == b\",\n    \"a != b\",\n    \"a > b\",\n    \"a >= b\",\n    \"flag && a < b || flag\",\n    \"(a + b) * c\",\n    \"s.x\",\n    \"fun(a)\",\n    \"s.get()\",\n    \"v[0]\",\n    \"[a, b]\",\n    \"a = b\",\n    \"a += b\",\n    \"a = b = c\",\n    \"1u32 + 2u32\",\n]\n\nCONTEXTS = {\n    \"expr\": \"let z = %s;\",\n    \"cond\": \"if %s { }\",\n    \"brk\":  \"loop { break %s; }\",\n    \"stmt\": \"%s;\",\n}\n\ndef run(expr, ctxname, bodyfmt):\n    body = bodyfmt % expr\n    src = PRELUDE % body\n    path = os.path.join(WORK, \"case.rx\")\n    with open(path, \"w\") as fh:\n        fh.write(src)\n    r = subprocess.run([RXCC, \"--stage\", \"semantic\", \"--dump-ast\", path],\n                       capture_output=True, text=True)\n    if \"syntax error\" in r.stderr:\n        return (\"SYNTAX\", r.stderr.strip().splitlines()[0])\n    return (\"OK\", r.stdout)\n\ndef extract_subtree(lines, marker_pat, root_indent):\n    \"\"\"Find marker line (e.g. 'Let z'), return normalized subtree lines.\"\"\"\n    out = []\n    started = False\n    for ln in lines:\n        if not started:\n            if re.match(marker_pat, ln) and len(ln) - len(ln.lstrip()) == root_indent:\n                started = True\n            continue\n        if ln.strip() == \"\":\n            continue\n        ind = len(ln) - len(ln.lstrip())\n        if ind <= root_indent:\n            break\n        out.append(\" \" * (ind - root_indent) + ln.strip())\n    return \"\\n\".join(out)\n\ndef normalize(dump, ctxname, expr):\n    lines = dump.splitlines()\n    if ctxname == \"expr\":\n        return extract_subtree(lines, r\"\\s*Let z$\", 2)\n    if ctxname == \"cond\":\n        # If node at indent 2; condition is its first child at indent >= 4\n        for i, ln in enumerate(lines):\n            if ln.strip() == \"If\" and len(ln) - len(ln.lstrip()) == 2:\n                sub = []\n                for ln2 in lines[i+1:]:\n                    ind = len(ln2) - len(ln2.lstrip())\n                    if ind <= 2:\n                        break\n                    sub.append(\" \" * (ind - 2) + ln2.strip())\n                return \"\\n\".join(sub)\n        return None\n    if ctxname == \"brk\":\n        for i, ln in enumerate(lines):\n            if ln.strip() == \"Break\" and len(ln) - len(ln.lstrip()) == 6:\n                sub = []\n                for ln2 in lines[i+1:]:\n                    ind = len(ln2) - len(ln2.lstrip())\n                    if ind <= 6:\n                        break\n                    sub.append(\" \" * (ind - 6) + ln2.strip())\n                return \"\\n\".join(sub)\n        return \"\"\n    if ctxname == \"stmt\":\n        for i, ln in enumerate(lines):\n            if ln.strip() == \"ExprStmt\" and len(ln) - len(ln.lstrip()) == 4:\n                sub = []\n                for ln2 in lines[i+1:]:\n                    ind = len(ln2) - len(ln2.lstrip())\n                    if ind <= 4:\n                        break\n                    sub.append(\" \" * (ind - 4) + ln2.strip())\n                return \"\\n\".join(sub)\n        return None\n    return None\n\nfails = 0\nsyntax_cases = []\nfor expr in EXPRS:\n    results = {}\n    for ctxname, bodyfmt in CONTEXTS.items():\n        status, data = run(expr, ctxname, bodyfmt)\n        if status == \"SYNTAX\":\n            results[ctxname] = (\"SYNTAX\", data)\n            continue\n        results[ctxname] = (\"OK\", normalize(data, ctxname, expr))\n    oks = {k: v for k, v in results.items() if v[0] == \"OK\"}\n    vals = set(v[1] for v in oks.values())\n    if len(vals) > 1:\n        fails += 1\n        print(\"=\" * 70)\n        print(\"MISMATCH for expression:\", repr(expr))\n        for k, v in results.items():\n            print(f\"--- {k}: {v[0]}\")\n            if v[0] == \"OK\":\n                print(v[1] if v[1] is not None else \"(extract failed)\")\n    syn = [k for k, v in results.items() if v[0] == \"SYNTAX\"]\n    if syn:\n        syntax_cases.append((expr, syn, results[syn[0]][1]))\n\nprint()\nprint(f\"total expressions: {len(EXPRS)}, mismatches: {fails}\")\nprint()\nprint(\"syntax-failing cases:\")\nfor expr, syn, msg in syntax_cases:\n    print(f\"  {expr!r} fails in {syn}: {msg}\")\n",
-  "filePath": "/tmp/opencode/ast-check/diff_test.py"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
+所以 `1 += 2` 报"不是 place"，`p += 1`（p 是 `&mut i32`）报"复合赋值目标不是整数"，`let x=1; x=2` 报"不是可变 place"——这三类错误分别对应上面三个判据。
 
 ---
 
-## Assistant (Build · DeepSeek V4.1 Flash · 18.4s)
+## User
 
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cd /tmp/opencode/ast-check && python3 diff_test.py 2>&1 | head -150",
-  "timeout": 120000
-}
-```
-
-**Output:**
-```
-======================================================================
-MISMATCH for expression: 'a'
---- expr: OK
-
---- cond: OK
-(extract failed)
---- brk: OK
-
---- stmt: OK
-  Path a
-======================================================================
-MISMATCH for expression: '1'
---- expr: OK
-
---- cond: OK
-(extract failed)
---- brk: OK
-
---- stmt: OK
-  IntLit 1
-======================================================================
-MISMATCH for expression: 'true'
---- expr: OK
-
---- cond: OK
-(extract failed)
---- brk: OK
-
---- stmt: OK
-  BoolLit true
-======================================================================
-MISMATCH for expression: 'a + b * c - d / e'
---- expr: OK
-
---- cond: OK
-(extract failed)
---- brk: OK
-
---- stmt: OK
-  Binary -
-    Binary +
-      Path a
-      Binary *
-        Path b
-        Path c
-    Binary /
-      Path d
-      Path e
-======================================================================
-MISMATCH for expression: 'a & b | c ^ d'
---- expr: OK
-
---- cond: OK
-(extract failed)
---- brk: OK
-
---- stmt: OK
-  Binary |
-    Binary &
-      Path a
-      Path b
-    Binary ^
-      Path c
-      Path d
-======================================================================
-MISMATCH for expression: 'a << b'
---- expr: OK
-
---- cond: OK
-(extract failed)
---- brk: OK
-
---- stmt: OK
-  Binary <<
-    Path a
-    Path b
-======================================================================
-MISMATCH for expression: 'a >> b'
---- expr: OK
-
---- cond: OK
-(extract failed)
---- brk: OK
-
---- stmt: OK
-  Binary >>
-    Path a
-    Path b
-======================================================================
-MISMATCH for expression: 'a << b << c'
---- expr: OK
-
---- cond: OK
-(extract failed)
---- brk: OK
-
---- stmt: OK
-  Binary <<
-    Binary <<
-      Path a
-      Path b
-    Path c
-======================================================================
-MISMATCH for expression: 'a >> b >> c'
---- expr: OK
-
---- cond: OK
-(extract failed)
---- brk: OK
-
---- stmt: OK
-  Binary >>
-    Binary >>
-      Path a
-      Path b
-    Path c
-======================================================================
-MISMATCH for expression: 'a << b >> c'
---- expr: OK
-
---- cond: OK
-(extract failed)
---- brk: OK
-
---- stmt: OK
-  Binary <<
-    Path a
-    Path b
-======================================================================
-MISMATCH for expression: 'a >> b << c'
---- expr: OK
-
---- cond: OK
-(extract failed)
---- brk: OK
-
---- stmt: OK
-(extract failed)
-======================================================================
-MISMATCH for expression: 'a as u32'
---- expr: OK
-
---- cond: OK
-(extract failed)
---- brk: OK
-
---- stmt: OK
-  Cast
-    Path a
-    Type u32
-
-```
+我写完了，你看看。以及，为什么 p 是 &mut i32 时不能写 p += 1 呢？
 
 ---
 
-## Assistant (Build · DeepSeek V4.1 Flash · 19.8s)
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 13.4s)
 
 _Thinking:_
 
-My extraction for the `expr` context and `cond` context is broken:
+The user says they finished writing (presumably the Phase 2 operator/cast/place code). They ask me to review, and explain why `p += 1` where `p: &mut i32` isn't allowed.
 
-- For expr context, marker "Let z" is at indent 2? Let's look at dump:
-```
-Fn f(...)
-  Type ()
-  Block
-    Let z
-      Binary ...
-```
-`Let z` is at indent 4, not 2. I used root_indent=2. Hence empty extraction. Need indent 4.
-- For cond context: `If` is at indent 4 (inside Block) when used as statement; I searched indent 2. Also `if EXPR {}` as a statement is ExpressionWithBlock statement → dump: Block → ExprStmt → If? For `if %s { }` with no semicolon as statement, visitBlockExpression: last statement expressionWithBlock without SEMI → becomes tail! So `if EXPR {}` is the block tail → dump shows `Tail → If`. Need to handle both. Let me look at an actual dump to fix extraction.
+First, read the current checker.cpp to see what they implemented (infer branches, isPlaceable/isMutablePlaceable). Then build/test the Phase 2 suites. Then answer the conceptual question.
 
-Let me run one case manually to see structure. Then fix script accordingly:
-- expr: root_indent=4 marker `Let z`.
-- cond: find `If` at indent 4 or 6 (under Tail). Better: find line.strip()=="If" and take first child subtree (children of If) — normalize children.
-- brk: `Break` at indent 8? dump: Block(indent2) → Tail? Actually `loop { break EXPR; }` body: `loop {...}` is last statement → Tail at indent 4 → Loop indent 6 → Block indent 8 → ExprStmt indent 10 → Break indent 12? Let me check the earlier dump: in 25_shift_mix:
-```
-    Tail
-      Loop
-        Block
-          ExprStmt
-            Break
-              Binary <<
-```
-Here Tail indent 4, Loop 6, Block 8, ExprStmt 10, Break 12, child 14. My brk extraction searched "Break" at indent 6 → failed, yet the output showed brk: OK with...? Actually for 'a' the brk printed empty string (extract returned None? no, it returns "" if Break found). Weird: results showed `brk: OK` with empty output for all. Because extract_subtree for Break at indent 6 not found returns None → normalize returns None? Looking at normalize: for brk, loop finds "Break" at indent 6; none found → returns None (falls through after loop). Then printed as nothing? Actually `print(v[1] if v[1] is not None else "(extract failed)")` — it didn't print "(extract failed)", so v[1] was "" not None. Hmm, maybe Break at indent 6 was found: `if ln.strip() == "Break" and indent == 6`? In the dump above Break at indent 12. Hmm.
-
-Whatever — fix the script with correct indents by inspecting real dumps. Better approach: use a proper tree parser and compare subtrees by re-rooting. Let me parse the dump into a tree (indent-based), then locate the appropriate node and serialize its subtree. Node locator:
-- expr: the child of the outermost `Let z`.
-- cond: the first child of the outermost `If`.
-- brk: the child of `Break`.
-- stmt: the child of `ExprStmt` under Block (indent 4) — but if ExprStmt turns into Tail? For simple expression statement with semicolon, it's ExprStmt.
-
-Let me implement a real parser:
-- lines → nodes (label = stripped text, children).
-- find marker by label with min indent, then take its first child (for If: first child is the condition; for Break: first/only child; ExprStmt: first child; Let z: first child).
-Serialize subtree with consistent indentation.
-
-Let me rewrite the script accordingly. Also note the mismatch for `a >> b << c` stmt extraction failed (starts differently?). With proper parsing this will be fine.
-
-Let me rewrite diff_test.py.
-
-Extraction logic was wrong (indent assumptions). Let me rewrite it as a proper dump-tree parser.
-
-**Tool: write**
-
-**Input:**
-```json
-{
-  "content": "#!/usr/bin/env python3\nimport subprocess, os\n\nRXCC = \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/target/build/rxcc\"\nWORK = \"/tmp/opencode/ast-check/diff\"\nos.makedirs(WORK, exist_ok=True)\n\nPRELUDE = \"\"\"struct S { x: i32 }\nimpl S { fn get(&self) -> i32 { self.x } }\nfn fun(x: i32) -> i32 { x }\nfn f(a: i32, b: i32, c: i32, d: i32, e: i32, p: &i32, q: &mut i32, flag: bool, s: S, v: Vec<i32>) {\n    %s\n}\n\"\"\"\n\nEXPRS = [\n    \"a\", \"1\", \"true\",\n    \"a + b * c - d / e\",\n    \"a & b | c ^ d\",\n    \"a << b\", \"a >> b\",\n    \"a << b << c\", \"a >> b >> c\",\n    \"a << b >> c\", \"a >> b << c\",\n    \"a as u32\", \"a as u32 as isize\",\n    \"-a\", \"!flag\", \"&a\", \"&mut a\", \"&&a\", \"&&mut a\", \"*p\",\n    \"a < b\", \"a <= b\", \"a == b\", \"a != b\", \"a > b\", \"a >= b\",\n    \"flag && a < b || flag\",\n    \"(a + b) * c\",\n    \"s.x\", \"fun(a)\", \"s.get()\", \"v[0]\", \"[a, b]\",\n    \"a = b\", \"a += b\", \"a = b = c\",\n    \"1u32 + 2u32\",\n]\n\nCONTEXTS = {\n    \"expr\": \"let z = %s;\",\n    \"cond\": \"if %s { }\",\n    \"brk\":  \"loop { break %s; }\",\n    \"stmt\": \"%s;\",\n}\n\nclass Node:\n    __slots__ = (\"label\", \"children\")\n    def __init__(self, label):\n        self.label = label\n        self.children = []\n\ndef parse_dump(text):\n    root = Node(\"<root>\")\n    stack = [(-1, root)]\n    for raw in text.splitlines():\n        if not raw.strip():\n            continue\n        ind = len(raw) - len(raw.lstrip())\n        node = Node(raw.strip())\n        while stack and stack[-1][0] >= ind:\n            stack.pop()\n        stack[-1][1].children.append(node)\n        stack.append((ind, node))\n    return root\n\ndef serialize(node, indent=0):\n    out = [\" \" * indent + node.label]\n    for ch in node.children:\n        out.append(serialize(ch, indent + 2))\n    return \"\\n\".join(out)\n\ndef find(node, label):\n    if node.label == label:\n        return node\n    for ch in node.children:\n        r = find(ch, label)\n        if r is not None:\n            return r\n    return None\n\ndef first_child_subtree(dump, marker):\n    root = parse_dump(dump)\n    n = find(root, marker)\n    if n is None or not n.children:\n        return None\n    return serialize(n.children[0])\n\ndef run_case(expr, bodyfmt):\n    body = bodyfmt % expr\n    path = os.path.join(WORK, \"case.rx\")\n    with open(path, \"w\") as fh:\n        fh.write(PRELUDE % body)\n    r = subprocess.run([RXCC, \"--stage\", \"semantic\", \"--dump-ast\", path],\n                       capture_output=True, text=True)\n    if \"syntax error\" in r.stderr:\n        return (\"SYNTAX\", r.stderr.strip().splitlines()[0])\n    return (\"OK\", r.stdout)\n\ndef normalize(dump, ctxname):\n    if ctxname == \"expr\":\n        return first_child_subtree(dump, \"Let z\")\n    if ctxname == \"cond\":\n        return first_child_subtree(dump, \"If\")\n    if ctxname == \"brk\":\n        return first_child_subtree(dump, \"Break\")\n    if ctxname == \"stmt\":\n        return first_child_subtree(dump, \"ExprStmt\")\n    return None\n\nfails = 0\nsyntax_cases = []\nfor expr in EXPRS:\n    results = {}\n    for ctxname, bodyfmt in CONTEXTS.items():\n        status, data = run_case(expr, bodyfmt)\n        if status == \"SYNTAX\":\n            results[ctxname] = (\"SYNTAX\", data)\n        else:\n            results[ctxname] = (\"OK\", normalize(data, ctxname))\n    oks = {k: v for k, v in results.items() if v[0] == \"OK\"}\n    vals = set(v[1] for v in oks.values())\n    if len(vals) > 1:\n        fails += 1\n        print(\"=\" * 70)\n        print(\"MISMATCH for expression:\", repr(expr))\n        for k, v in results.items():\n            print(f\"--- {k}: {v[0]}\")\n            if v[0] == \"OK\":\n                print(v[1] if v[1] is not None else \"(extract failed)\")\n    syn = [k for k, v in results.items() if v[0] == \"SYNTAX\"]\n    if syn:\n        syntax_cases.append((expr, syn, results[syn[0]][1]))\n\nprint()\nprint(f\"total expressions: {len(EXPRS)}, mismatches: {fails}\")\nprint()\nprint(\"syntax-failing cases:\")\nfor expr, syn, msg in syntax_cases:\n    print(f\"  {expr!r} fails in {syn}: {msg}\")\n",
-  "filePath": "/tmp/opencode/ast-check/diff_test.py"
-}
-```
-
-**Output:**
-```
-Wrote file successfully.
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 16.8s)
+Let me read the infer function and isPlaceable/isMutablePlaceable, plus binary assignment handling. Let me grep/read relevant sections.
 
 **Tool: bash**
 
 **Input:**
 ```json
 {
-  "command": "cd /tmp/opencode/ast-check && python3 diff_test.py 2>&1 | head -120",
+  "command": "sed -n '/semType\\* Checker::infer/,/^}/p' \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp\" | head -180"
+}
+```
+
+**Output:**
+```
+semType* Checker::infer(Expr* expr) {
+    if (auto lit = dynamic_cast<intLitExpr*>(expr); lit) {
+        std::string suf = intSuffix(lit->value_);
+        return suf.empty() ? semantic::makeBuiltin("i32") : semantic::makeBuiltin(suf);
+    }
+    if (auto lit = dynamic_cast<boolLitExpr*>(expr); lit) {
+        return semantic::makeBuiltin("bool");
+    }
+    if (auto unit = dynamic_cast<unitExpr*>(expr); unit) {
+        return semantic::makeUnit();
+    }
+    if (auto block = dynamic_cast<blockExpr*>(expr); block) {
+        return checkBlock(block, nullptr);
+    }
+    if (auto path = dynamic_cast<pathExpr*>(expr); path) {
+        if (path->path_.size() == 1) {
+            std::string name = path->path_[0].name_;
+            return lookupValue(name);
+        }
+        else if (path->path_.size() == 2) {
+            std::string callee = path->path_[0].name_, name = path->path_[1].name_;
+            if (callee == "Self") {
+                if (currentStruct_ == "") {
+                    error("\"Self\" outside implement");
+                    return semantic::makeError();
+                }
+                auto sig = findConst(currentStruct_, name);
+                if (sig == nullptr) {
+                    error("can't resolve name in lookupValue : " + name);
+                    return semantic::makeError();
+                }
+                return sig->type_;
+            }
+            else {
+                auto sig = findConst(callee, name);
+                if (sig == nullptr) {
+                    error("can't resolve name in lookupValue : " + name);
+                    return semantic::makeError();
+                }
+                return sig->type_;
+            }
+        }
+        else {
+            error("length of a pathExpr appears to be longer than 2:");
+            return semantic::makeError();
+        }
+    }
+    if (auto call = dynamic_cast<callExpr*>(expr); call) {
+        auto path = dynamic_cast<pathExpr*>(call->callee_);
+        if (path == nullptr) {
+            error("callExpr callee is not a function");
+            return semantic::makeError();
+        }
+        if (path->path_.size() > 1) {
+            // This won't be dealt until stage 5
+            return semantic::makeError();
+        }
+        if (!path->path_[0].types_.empty()) {
+            error("callExpr single word path have types");
+            return semantic::makeError();
+        }
+        std::string callee = path->path_[0].name_;
+        if (scope_.find(callee)) {
+            error("called function name is shadowed by local variables");
+            return semantic::makeError();
+        }
+        if (table_.funcSig.find(callee) == table_.funcSig.end()) {
+            error("callExpr attempted to use an non-existing function");
+            return semantic::makeError();
+        }
+        auto &sig = table_.funcSig[callee];
+        if (sig.params_.size() != call->args_.size()) {
+            error("callExpr parameters number mismatch");
+            return semantic::makeError();
+        }
+        for (int i = 0; i < sig.params_.size(); i++) {
+            expect(call->args_[i], sig.params_[i]);
+        }
+        return sig.retType_;
+    }
+    if (auto bin = dynamic_cast<binaryExpr*>(expr); bin) {
+        auto lhs = bin->lhs_, rhs = bin->rhs_;
+        std::string op = bin->op_;
+        if (op == "=") {
+            if (!isMutablePlaceable(lhs)) {
+                error("assignment lhs is not a mutable lvalue");
+                return semantic::makeError();
+            }
+            expect(rhs, infer(lhs));
+            return semantic::makeUnit();
+        }
+        if (op == "+=") {
+            if (!isMutablePlaceable(lhs)) {
+                error("addequal lhs is not a mutable lvalue");
+                return semantic::makeError();
+            }
+            semType* ltype = infer(lhs);
+            if (!isIntegerType(ltype)) {
+                error("addequal lhs is not an integer type");
+                return semantic::makeError();
+            }
+            expect(rhs, ltype);
+            return semantic::makeUnit();
+        }
+    }
+    return semantic::makeError();
+}
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 13.6s)
+
+_Thinking:_
+
+They've implemented binary `=` and `+=` only, no other operators yet. Let me see isPlaceable/isMutablePlaceable and check whether they handle unary/cast/if/while/etc. Let me grep the rest of the file for these.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "grep -n \"isPlaceable\\|isMutablePlaceable\\|castExpr\\|unaryExpr\\|refExpr\\|derefExpr\\|ifExpr\\|whileExpr\\|loopExpr\\|breakExpr\\|returnExpr\\|continueExpr\\|op ==\" \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp\" | head -40; echo ===; sed -n '/bool Checker::isPlaceable/,/^}/p; /bool Checker::isMutablePlaceable/,/^}/p' \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp\""
+}
+```
+
+**Output:**
+```
+522:bool Checker::isPlaceable(Expr* expr) {
+527:        return isPlaceable(field->from_);
+530:        return isPlaceable(index->from_);
+532:    if (auto deref = dynamic_cast<derefExpr*>(expr); deref) {
+538:bool Checker::isMutablePlaceable(Expr* expr) {
+546:        return isMutablePlaceable(field->from_);
+549:        return isMutablePlaceable(index->from_);
+551:    if (auto deref = dynamic_cast<derefExpr*>(expr); deref) {
+641:        if (op == "=") {
+642:            if (!isMutablePlaceable(lhs)) {
+649:        if (op == "+=") {
+650:            if (!isMutablePlaceable(lhs)) {
+===
+bool Checker::isPlaceable(Expr* expr) {
+    if (auto path = dynamic_cast<pathExpr*>(expr); path != nullptr && path->path_.size() == 1){
+        return scope_.find(path->path_[0].name_);
+    }
+    if (auto field = dynamic_cast<fieldExpr*>(expr); field) {
+        return isPlaceable(field->from_);
+    }
+    if (auto index = dynamic_cast<indexExpr*>(expr); index) {
+        return isPlaceable(index->from_);
+    }
+    if (auto deref = dynamic_cast<derefExpr*>(expr); deref) {
+        return true;
+    }
+    return false;
+}
+bool Checker::isMutablePlaceable(Expr* expr) {
+    if (auto path = dynamic_cast<pathExpr*>(expr); path != nullptr && path->path_.size() == 1){
+        if (!scope_.find(path->path_[0].name_)) {
+            return false;
+        }
+        return scope_.memory_[path->path_[0].name_].top().isMut_;
+    }
+    if (auto field = dynamic_cast<fieldExpr*>(expr); field) {
+        return isMutablePlaceable(field->from_);
+    }
+    if (auto index = dynamic_cast<indexExpr*>(expr); index) {
+        return isMutablePlaceable(index->from_);
+    }
+    if (auto deref = dynamic_cast<derefExpr*>(expr); deref) {
+        semType* inner = infer(deref->operand_);
+        return inner->kind_ == semType::kTypeKind::REF && inner->isMut_;
+    }
+    return false;
+}
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 46.7s)
+
+_Thinking:_
+
+Current state:
+- isPlaceable/isMutablePlaceable implemented (like my minimal version).
+- infer handles literals, unit, block, path, call, binary `=` and `+=` only. Missing: other compound ops (+= only), arithmetic/bitwise/shift/comparison/logical, unary, cast, ref, deref, if/while/loop/break/return/continue, fields/index/structInit/array/methodCall.
+- So they've done a small part; "我写完了" perhaps means they wrote what we discussed last turn (the place functions + =/+=). They haven't done the rest of Phase 2 yet.
+
+Let me build and run the Phase 2 suites to see status. Then review issues:
+
+1. `isPlaceable` returns `scope_.find(...)` which is `localShadowing*` implicitly converted to bool — okay.
+2. `isMutablePlaceable` uses `scope_.memory_[name]` after checking find — still safe? `scope_.find` returns nullptr if stack empty; the check `!scope_.find(...)` returns false if empty → returns false before memory_ access. Then memory_[name].top() safe (non-empty). OK.
+3. Note `isMutablePlaceable` for `&mut self` param: localShadowing.isMut_ = true (AST quirk) for `&mut self`, so `self` itself considered mutable binding; assignments to `self` (rebinding) would be allowed wrongly; but tests may not. Phase 4.
+4. In `=` handling: `expect(rhs, infer(lhs))` — infers lhs twice? No, once. But note order: rhs evaluated before lhs in Rust? Evaluation order test exists later (`evaluation-order-and-temporaries`), but this is semantic typing, not evaluation order; fine.
+5. `op == "+="` only; other compound ops not handled → tests for `*=`, etc. fail. They should generalize: if op ends with '=' and op != "=" && op != "==" && op != "<=" && op != ">=" && op != "!=" → compound.
+6. `=` result: unit. Good.
+7. For `=` they don't validate lhs type vs rhs? expect does.
+8. Missing checks: lhs must be place for `=`; isMutablePlaceable implies place, so fine (mutable place ⊂ place). Actually isMutablePlaceable returns false for non-place, so the error message says not mutable lvalue. Fine.
+9. For `p += 1` where p: &mut i32: isMutablePlaceable(p) → local p isMut_ from `let mut p` = true → passes; then ltype = infer(p) = REF i32; !isIntegerType(REF) → error. So this negative test should pass now. Good.
+10. `1 += 2`: isMutablePlaceable(intLit) → false → error. Good.
+11. `rej-compound-destination-must-be-mutable`: `let x = 1; x += 1;` → x local not mut → error. Good.
+12. `rej-an-explicit-mismatched-suffix-cannot-coerce`: let's check the test: probably `let mut x: i32 = 1; x += 1u32;` → expect(rhs u32, ltype i32) → typeEqual fails → error. Good.
+
+So these 4 compound tests likely pass now. The rest (arith/shift/comparison/logical/cast/unary/ref) still missing → 11 failures.
+
+Now the conceptual question: "为什么 p 是 &mut i32 时不能写 p += 1 呢？"
+
+Explain: `p += 1` means `p = p + 1`; the LHS destination is the **variable p itself**, whose type is `&mut i32`, not `i32`. `+=` requires an integer destination; a reference is not an integer. To write through the reference you must dereference: `*p += 1`. Rust doesn't auto-deref assignment destinations (no implicit deref coercion for places). The reference *points to* an i32, but the place `p` holds a reference value. Assigning `p += 1` would mean adding 1 to a reference (nonsensical), and Rust only auto-derefs for method calls/field access (autoref/autoderef in some contexts), not for assignment targets.
+
+Also, subtle: even `p = ...` would require p's binding mut (it is `let mut p`) and RHS `&mut i32`; but `p += 1` requires integer.
+
+Note test name: `rej-reference-destinations-are-not-implicitly-dereferenced`.
+
+Now, review + status:
+- Build and run Phase 2 suites to report progress (probably 20 + 4 = 24/35 now).
+- List remaining Phase 2 work explicitly (same list as before minus assignment).
+- Point out they need to generalize compound ops, add arithmetic/bitwise/shift/comparison/logical/unary/cast/ref, and basic if/while/loop/return/break/continue for the tests. Actually `if` not needed for current failing tests except `rej-no-integer-truthiness` (`if 1 {}`) — needs if handling. `refExpr` needed for two.
+- Also `derefExpr` for `*r` positive tests; and `infer` of deref needed by `*m` assignments (Phase 4/compound). Names-and-shadowing positive uses `*r` only as value → unimplemented returns ERROR → positive passes (checking not strong). But `println_i32(*r)` arg expect(i32): ERROR compatible → passes. Fine.
+
+Let me build/run. Then answer.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && cmake --build target/build -j 2>&1 | grep -E \"error|warning|Built target\" | head -3 && make test FILTER=official:semantic:names-and-shadowing,official:semantic:casts-and-literals,official:semantic:integer-arithmetic,official:semantic:shifts,official:semantic:compound-assignment,official:semantic:boolean-and-short-circuit STAGE=semantic 2>&1 | grep -E \"^\\s*[0-9]+\\)|passed|failed\" | head -20",
+  "timeout": 300000
+}
+```
+
+**Output:**
+```
+[100%] Built target rxcc
+. passed  F failed
+1) official:semantic:boolean-and-short-circuit/rej-no-integer-truthiness.rx@semantic
+2) official:semantic:boolean-and-short-circuit/rej-lazy-operators-require-bool.rx@semantic
+3) official:semantic:boolean-and-short-circuit/rej-lazy-operators-have-no-reference-variants.rx@semantic
+4) official:semantic:boolean-and-short-circuit/rej-bitwise-operand-types-must-match.rx@semantic
+5) official:semantic:casts-and-literals/rej-integer-to-bool-cast-is-unsupported.rx@semantic
+6) official:semantic:casts-and-literals/rej-reference-to-integer-cast-is-unsupported.rx@semantic
+7) official:semantic:compound-assignment/acc-all-ten-compound-operators-plus-boolean-assignments.rx@semantic
+8) official:semantic:integer-arithmetic/rej-explicitly-different-arithmetic-operand-types.rx@semantic
+9) official:semantic:integer-arithmetic/rej-unary-minus-is-signed-only.rx@semantic
+10) official:semantic:integer-arithmetic/rej-booleans-are-not-arithmetic-integers.rx@semantic
+11) official:semantic:shifts/rej-shift-count-must-be-integer.rx@semantic
+12) official:semantic:shifts/rej-shift-left-operand-must-be-integer.rx@semantic
+======================== 12 failed, 23 passed in 22.94s ========================
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 32.7s)
+
+_Thinking:_
+
+Progress: 20 → 23 passed, 15 → 12 failed. The compound-assignment negatives all pass now except the positive `acc-all-ten-compound-operators-plus-boolean-assignments` (because only `+=` is implemented; other compound ops return ERROR silently... wait, positive should pass; why does it fail? Let me check: the acc test uses all ten compound operators. For unimplemented ops like `-=`, infer returns makeError silently — positive should still pass (exit 0). But it failed. Maybe the failure is "compiler exited 0, expected 1"? No, it's an acc test expecting 0. Let me see the failure detail. Possibly the checker rejects because boolean assignment? The test name says "plus-boolean-assignments". Maybe `flag = true` works (op "=") → fine. Hmm. Let me look at the test and the log.
+
+Let me run that single test verbose to see. `make test FILTER=official:semantic:compound-assignment STAGE=semantic VERBOSE=true`. Or cat the source. Let me inspect.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && cat tests/official/semantic/compound-assignment/acc-all-ten-compound-operators-plus-boolean-assignments.rx; echo ===; make test FILTER=official:semantic:compound-assignment STAGE=semantic 2>&1 | grep -A4 \"acc-all-ten\" | head -12",
   "timeout": 180000
 }
 ```
 
 **Output:**
 ```
-======================================================================
-MISMATCH for expression: 'a >> b << c'
---- expr: OK
-Binary <<
-  Path b
-  Path a
---- cond: OK
-Binary <<
-  Path b
-  Path a
---- brk: OK
-Binary <<
-  Path b
-  Path a
---- stmt: OK
-(extract failed)
+use rx::core::*;
 
-total expressions: 37, mismatches: 1
+fn main() {
+    let mut x = 100;
+    x += 7;
+    x -= &2;
+    x *= 3;
+    x /= &5;
+    x %= 17;
+    x |= 16;
+    x &= &30;
+    x ^= 3;
+    x <<= &2u32;
+    x >>= 1usize;
+    println_i32(x);
+    let p = &mut x;
+    *p += 5;
+    println_i32(*p);
+    let mut b = true;
+    b &= &false;
+    b |= true;
+    b ^= &true;
+    println_i32(b as i32);
+}
+===
+1) official:semantic:compound-assignment/acc-all-ten-compound-operators-plus-boolean-assignments.rx@semantic
+   semantic / 0.09s
+   All ten compound operators plus boolean assignments.
 
-syntax-failing cases:
+    compiler exited 1, expected 0
 
 ```
 
 ---
 
-## Assistant (Build · DeepSeek V4.1 Flash · 134.3s)
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 26.3s)
 
 _Thinking:_
 
-Interesting results:
-- `a << b >> c` did NOT show as mismatch?! But we know it's broken (`a << b`). Why no mismatch? Because all four contexts produce the same wrong tree (`a << b`), so they match each other! The differential test only catches family-differences, not the shift bug common to all families. The one mismatch found: `a >> b << c` in stmt context extraction failed (empty/Binary?), while expr/cond/brk produced `Binary << (Path b, Path a)` — wrong tree too. The stmt extraction failed likely because the statement `a >> b << c;` produced something whose first ExprStmt child isn't there? Let me check the stmt dump for that case.
+The positive compound-assignment test uses operators beyond `+=` and also:
+- `x -= &2;` — rhs is `&2` (a reference!) — so compound assignment accepts a reference operand? In Rust, `x -= &2` works because `SubAssign<&i32>` is implemented for i32? In Rx spec: arithmetic operands allow "同一整数类型（或一层 &T）". So operators accept one level of reference on operands. That's why `x -= &2` is valid.
+- `*p += 5;` — lhs deref of &mut → valid.
+- `b &= &false;` — bool compound assignment? `&=`, `|=`, `^=` on bools are valid in Rust (BitAndAssign for bool). The test name says "plus-boolean-assignments". So compound ops on bool are allowed for `& | ^` (not for `+ - * / % << >>`).
+- `x <<= &2u32;` — rhs reference; match? The compound shift: lhs type L, rhs any integer (or one level ref); result L. Their expect(rhs, ltype) would fail for u32 vs i32? Actually for shift, rhs need not match lhs type; rhs can be any integer. `x` i32 `<<= 2u32` → valid (shift count any integer type). So compound assignment rules differ:
+  - `+= -= *= /= %= &= |= ^=`: operands must be same type (with one layer `&T` allowed); for `&= |= ^=` also bool allowed.
+  - `<<= >>=`: lhs integer, rhs any integer (with optional one-layer ref).
+- The test also uses `x /= &5`, `x &= &30` etc.
 
-Wait, the diff test compares families; `a >> b << c` produced `Binary << b, a` in expr/cond/brk — consistent wrong across those; stmt produced different (extract failed). Let me dump that case.
+The failure is because their implementation errors on rhs `&2` when `expect(rhs, int)`? Let's see: for `-=`, it's not implemented at all → returns makeError silently (no error). But `x += 7` works. Wait, the compiler exited 1 — some error occurred. Which one? `*p += 5`: op `+=`: isMutablePlaceable(*p) → deref → inner = infer(p) = REF mut → true; ltype = infer(*p) → derefExpr not implemented → makeError; isIntegerType(makeError) → false → error "addequal lhs is not an integer type" → exit 1. So the positive test fails at `*p += 5` because derefExpr isn't implemented.
 
-But more importantly, the differential test didn't catch the shift bug because all families share it. My manual test 25 already documented it.
+Also `b &= &false` — `&=` not implemented; if it were, rhs ref handling needed.
 
-Also `a << b >> c` matched all four (all = a<<b). Fine.
+So Phase 2 still needs:
+- derefExpr infer (operand REF/Box → elem) — actually needed for positives.
+- refExpr infer.
+- All binary ops with "one layer &T" operand adjustment.
+- Compound ops general + bool cases.
+- unary, cast, comparison, logical, if/while/loop/return/break/continue.
 
-Now fix the stmt extraction issue: for `a >> b << c;` maybe the statement parse produced something odd — let me dump it manually. Also note the mismatches list: only 1 besides extraction issue. So all other expressions produce identical ASTs across the four families — good (no other family-specific bugs among tested ops).
+Now, the user's question: why `p += 1` (p: &mut i32) is not allowed. Answer concept as planned: destination is p (a reference), not the pointee; no implicit deref on assignment destinations. `*p += 1` is required. Note the spec explicitly: "reference destinations are not implicitly dereferenced". Also note that operators DO accept one layer of `&T` for *operands* (`x -= &2`), but assignment destinations do not get auto-deref. Important nuance: `&` in operands is allowed one level, but `p += 1` is different: p is the destination, and it's `&mut i32`, not an operand adjustment.
 
-Let me now run the stmt case for `a >> b << c` and see.
+Wait, could `p += 1` be interpreted as `(*p) += 1` via some auto-deref? No — Rust doesn't auto-deref the LHS of assignment/compound assignment; the test explicitly rejects it. In Rust, actually: does `p += 1` where p: &mut i32 compile? Let's think: `AddAssign<i32> for &mut i32`? Is there an impl? `impl AddAssign<&i32> for i32`, but for `&mut i32` as LHS? In Rust, `let mut p = &mut x; p += 1;` — I believe this errors (cannot use `+=` on `&mut i32`)? Hmm, actually there might be `impl AddAssign for &mut T where T: AddAssign`? The standard library has `impl<'a, T> AddAssign<&'a T> for T where T: AddAssign<T>` etc. But `&mut i32` is not an integer, so no. Rx tests confirm rejection.
+
+Explain also that `isMutablePlaceable(p)` is true (p is `let mut p`), but the *type* of the place is `&mut i32`, and compound assignment requires the place's type to be an integer (or bool for bitwise ops). Since it's a reference, error. To write the pointee: `*p += 1` — `*p` is a place whose type is i32 and mutable because p is &mut.
+
+Also explain why `x -= &2` is OK though rhs is a reference: in operator operands, Rx allows one layer of `&T` for arithmetic/bitwise/comparison (spec: "两边是同一个整数类型（或一层 &T）"). So operands may be references; but the *destination* must not be. This distinction is exactly what the test wants.
+
+Now review of their latest code:
+1. Binary handles only `=` and `+=`. Need generalize.
+2. Missing deref → positive tests fail (acc compound).
+3. isPlaceable returns pointer as bool — fine but warning maybe.
+4. isMutablePlaceable deref: `infer(deref->operand_)` might return ERROR (if operand infer unimplemented) → kind != REF → false. Fine later.
+5. `lookupValue` uses memory_ but safe.
+6. In infer path 2-seg, the Self guard they added is correct now (I saw `if (currentStruct_ == "")` inside Self branch). Also else branch has dead `callee == ""` check (from previous version)? Let me check: in the latest infer dump, inside else branch:
+```cpp
+else {
+    auto sig = findConst(callee, name);
+```
+I saw earlier version had `if (callee == "")` in else; the latest dump shows the guard moved into Self branch and else directly finds. Good.
+
+So the review: assignment/place part correct; missing operators/deref cause failures. And answer the conceptual question.
+
+Should I enumerate what to add next? Yes, concise list:
+- `refExpr`, `derefExpr` (type only)
+- unary
+- binary: generalize compound (op ends with '='), handle arithmetic/bitwise/shift/comparison/equality/logical with optional one-layer `&T` operands; bool for `&= |= ^=`; shifts rhs any integer (or &integer).
+- cast
+- if/while/loop/break/return/continue basic.
+Then run the suites.
+
+Also mention operand ref rule: helper `stripOneRef(semType*)` for operands: if REF → elem (one layer only), and for comparisons mut must match etc. That's spec detail; Phase 2 tests include `x += &2` etc. So implement a helper `semType* noRef(semType* t)` returning t->elem_ if REF else t. For shift rhs: any integer or &integer.
+
+Also note `b &= &false`: bool compound only for `& | ^`.
+
+Now write the answer. First the conceptual explanation (since they explicitly asked), then review/status, then remaining work.
+
+Keep it structured. Also note `p += 1` would be `p = p + 1`, and p's type is a pointer-ish reference; Rust never auto-derefs assignment targets; use `*p += 1`. Also the test's name.
+
+Let me write.
+
+`p += 1` 不行，是因为**赋值/复合赋值的目标不会自动解引用**。
+
+`p += 1` 的语义是"把 `p` 这个位置的值加上 1 再写回 `p`"。`p` 的类型是 `&mut i32`，它是一个**引用值**，不是整数；加 1 没有定义。引用指向的那块 i32 是 `*p`，所以必须显式写：
+
+```rust
+let mut x = 1;
+let mut p = &mut x;
+p += 1;    // 错：目标是 &mut i32，不是整数
+*p += 1;   // 对：目标是 i32，且 p 是 &mut → 可变 place
+```
+
+Rust 只在**方法调用/字段访问**等少数地方做自动解引用，赋值目标不做。测试 `rej-reference-destinations-are-not-implicitly-dereferenced` 就是考这个。
+
+注意和另一个规则区分：**运算符的操作数**允许一层 `&T`（spec："两边是同一个整数类型（或一层 `&T`）"），所以正例里 `x -= &2`、`x &= &30`、`x <<= &2u32` 是合法的；但 `p += 1` 里 `p` 是**目标**不是操作数，两码事。
+
+---
+
+**代码 review：**
+
+- `isPlaceable` / `isMutablePlaceable` 没问题（`deref` 看 `&mut` 也对）；
+- `=` / `+=` 的检查写对了，四个 compound 负例已经过了（15 → 12 failed，20 → 23 passed）；
+- **12 个失败的原因**：`infer` 还只有 `=`、`+=` 两个二元分支，其余运算符/一元/cast/ref/deref/if 都没写。具体地：
+  - `rej-unary-minus-is-signed-only` → 缺 `unaryExpr`；
+  - `rej-*-arithmetic-*`、`rej-bitwise-*` → 缺算术/位运算；
+  - `rej-shift-*` → 缺 `<< >>`；
+  - `rej-lazy-operators-*`、`rej-no-integer-truthiness` → 缺 `&& ||` 和 `if`；
+  - `rej-integer-to-bool-cast`、`rej-reference-to-integer-cast` → 缺 `castExpr` 和 `refExpr`；
+  - `acc-all-ten-compound-operators...`（正例失败）→ 缺其他复合赋值，而且 `*p += 5` 需要 **`derefExpr` 的 infer**（现在 `infer(*p)` 返回 ERROR，`isIntegerType(ERROR)` false → 误报）。
+
+补的时候有几个要点：
+
+1. **复合赋值要通配**，不要只写 `+=`：
+   ```cpp
+   bool isCompound = op.size() >= 2 && op.back() == '=' &&
+                     op != "==" && op != "!=" && op != "<=" && op != ">=";
+   ```
+2. **操作数一层 `&T`**：写个 `semType* stripOneRef(semType* t)`（REF → elem，其余原样），算术/位运算/比较前先剥一层。shifts 的右操作数是"任意整数（或一层 `&整数`）"，不要求和左边同类型。
+3. **bool 复合赋值**：`&= |= ^=` 允许 bool（对应正例里的 `b &= &false`），`+= -= *= /= %= <<= >>=` 只允许整数。
+4. **`derefExpr` 的 infer**：`*p` 类型 = p 的 REF 的 elem（`Box<T>` → T 是 Phase 5；Vec 不允许）。这样 `*p += 5` 的 lhs 才能被识别成 i32。
+5. **`refExpr` 的 infer** 只造类型：`makeRef(infer(operand), isMut)`，**不要**在这里查 place（`&1i32` 这类借字面量的正例要留着）。
+6. `castExpr`：先 `infer(from_)`，目标 `transformType(to_)`；只允许 int→int、bool→int，`from` 是 REF/其他 → 报错。
+7. `if`：cond 必须 bool；无 else → then 按 unit 查；`while` cond bool + body unit；`loop` body unit；`break/continue/return` 先返回 `makeNever()`（LUB 是 Phase 3）。
+
+补齐这些，Phase 2 的六个 suite 应该能到 35/35。
+
+---
+
+## User
+
+我写了 unary,deref,ref,cast,if,while,loop,break/continue/return,你看看。以及你说的这个剥去一层操作数为什么参数是个 semType 呢？那我怎么用呢？或者你看看我的 binary？
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 13.1s)
+
+_Thinking:_
+
+The user says they implemented unary, deref, ref, cast, if, while, loop, break/continue/return. They ask me to review, and they question my suggestion of `stripOneRef(semType*)` — why take a semType parameter, and how to use it? They ask me to look at their binary implementation.
+
+I need to read the current infer code (and helpers) to review. Let me read the infer function and surrounding new code.
 
 **Tool: bash**
 
 **Input:**
 ```json
 {
-  "command": "cd /tmp/opencode/ast-check/diff && cat > case2.rx <<'EOF'\nfn f(a: i32, b: i32, c: i32) {\n    a >> b << c;\n}\nEOF\n/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/target/build/rxcc --stage semantic --dump-ast case2.rx"
+  "command": "sed -n '/semType\\* Checker::infer/,/^}/p' \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp\""
 }
 ```
 
 **Output:**
 ```
-(no output)
+semType* Checker::infer(Expr* expr) {
+    if (auto lit = dynamic_cast<intLitExpr*>(expr); lit) {
+        std::string suf = intSuffix(lit->value_);
+        return suf.empty() ? semantic::makeBuiltin("i32") : semantic::makeBuiltin(suf);
+    }
+    if (auto lit = dynamic_cast<boolLitExpr*>(expr); lit) {
+        return semantic::makeBuiltin("bool");
+    }
+    if (auto unit = dynamic_cast<unitExpr*>(expr); unit) {
+        return semantic::makeUnit();
+    }
+    if (auto block = dynamic_cast<blockExpr*>(expr); block) {
+        return checkBlock(block, nullptr);
+    }
+    if (auto path = dynamic_cast<pathExpr*>(expr); path) {
+        if (path->path_.size() == 1) {
+            std::string name = path->path_[0].name_;
+            return lookupValue(name);
+        }
+        else if (path->path_.size() == 2) {
+            std::string callee = path->path_[0].name_, name = path->path_[1].name_;
+            if (callee == "Self") {
+                if (currentStruct_ == "") {
+                    error("\"Self\" outside implement");
+                    return semantic::makeError();
+                }
+                auto sig = findConst(currentStruct_, name);
+                if (sig == nullptr) {
+                    error("can't resolve name in lookupValue : " + name);
+                    return semantic::makeError();
+                }
+                return sig->type_;
+            }
+            else {
+                auto sig = findConst(callee, name);
+                if (sig == nullptr) {
+                    error("can't resolve name in lookupValue : " + name);
+                    return semantic::makeError();
+                }
+                return sig->type_;
+            }
+        }
+        else {
+            error("length of a pathExpr appears to be longer than 2:");
+            return semantic::makeError();
+        }
+    }
+    if (auto call = dynamic_cast<callExpr*>(expr); call) {
+        auto path = dynamic_cast<pathExpr*>(call->callee_);
+        if (path == nullptr) {
+            error("callExpr callee is not a function");
+            return semantic::makeError();
+        }
+        if (path->path_.size() > 1) {
+            // This won't be dealt until stage 5
+            return semantic::makeError();
+        }
+        if (!path->path_[0].types_.empty()) {
+            error("callExpr single word path have types");
+            return semantic::makeError();
+        }
+        std::string callee = path->path_[0].name_;
+        if (scope_.find(callee)) {
+            error("called function name is shadowed by local variables");
+            return semantic::makeError();
+        }
+        if (table_.funcSig.find(callee) == table_.funcSig.end()) {
+            error("callExpr attempted to use an non-existing function");
+            return semantic::makeError();
+        }
+        auto &sig = table_.funcSig[callee];
+        if (sig.params_.size() != call->args_.size()) {
+            error("callExpr parameters number mismatch");
+            return semantic::makeError();
+        }
+        for (int i = 0; i < sig.params_.size(); i++) {
+            expect(call->args_[i], sig.params_[i]);
+        }
+        return sig.retType_;
+    }
+    if (auto una = dynamic_cast<unaryExpr*>(expr); una) {
+        if (una->op_ == "-") { // I remember unaryExpr only have -x?
+            if (!isSignedType(infer(una->operand_))) {
+                error("unary minus attempted to negate an unsigned value");
+                return semantic::makeError();
+            }
+        }
+    }
+    if (auto fi = dynamic_cast<ifExpr*>(expr); fi) {
+        expect(fi->cond_, semantic::makeBuiltin("bool"));
+        if (!semantic::typeEqual(infer(fi->then_), semantic::makeUnit())) {
+            error("ifExpr then is not unit");
+            return semantic::makeError();
+        }
+        return fi->else_ ? infer(fi->else_) : semantic::makeUnit();
+    }
+    if (auto whi = dynamic_cast<whileExpr*>(expr); whi) {
+        expect(whi->cond_, semantic::makeBuiltin("bool"));
+        if (!semantic::typeEqual(infer(whi->block_), semantic::makeUnit())) {
+            error("whileExpr block is not unit");
+            return semantic::makeError();
+        }
+        return semantic::makeUnit();
+    }
+    if (auto loop = dynamic_cast<whileExpr*>(expr); loop) {
+        if (!semantic::typeEqual(infer(loop->block_), semantic::makeUnit())) {
+            error("loopExpr block is not unit");
+            return semantic::makeError();
+        }
+        return semantic::makeUnit();
+    }
+    if (auto bre = dynamic_cast<breakExpr*>(expr); bre) {
+        return semantic::makeNever();
+    }
+    if (auto con = dynamic_cast<continueExpr*>(expr); con) {
+        return semantic::makeNever();
+    }
+    if (auto ret = dynamic_cast<returnExpr*>(expr); ret) {
+        return semantic::makeNever();
+    }
+    if (auto cast = dynamic_cast<castExpr*>(expr); cast) {
+        semType* ltype = infer(cast->from_);
+        semType* rtype = transformType(cast->to_);
+        if ((!isIntegerType(ltype) && !isBoolType(ltype)) || 
+             !isIntegerType(rtype)){
+            error("castExpr lhs is neither int nor bool");
+            return semantic::makeError();
+        }
+        return rtype;
+    }
+    if (auto der = dynamic_cast<derefExpr*>(expr); der) {
+        if (auto ref = dynamic_cast<refExpr*>(der); ref) {
+            return infer(ref->operand_);
+        }
+        else {
+            error("attempted to deref a non-reference type");
+            return semantic::makeError();
+        }
+    }
+    if (auto ref = dynamic_cast<refExpr*>(expr); ref) {
+        return semantic::makeRef(infer(ref->operand_), ref->isMut_);
+    }
+    if (auto bin = dynamic_cast<binaryExpr*>(expr); bin) {
+        auto lhs = bin->lhs_, rhs = bin->rhs_;
+        std::string op = bin->op_;
+        if (op == "=") {
+            if (!isMutablePlaceable(lhs)) {
+                error("assignment lhs is not a mutable lvalue");
+                return semantic::makeError();
+            }
+            expect(rhs, infer(lhs));
+            return semantic::makeUnit();
+        }
+        auto inside = [&](std::string str, std::vector<std::string> all) {
+            for (auto now : all) {
+                if (now == str){
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (inside(op, {"+=", "-=", "*=", "/=", "%=", "<<=", ">>="})) {
+            if (!isMutablePlaceable(lhs)) {
+                error("arithequal lhs is not a mutable lvalue");
+                return semantic::makeError();
+            }
+            semType* ltype = infer(lhs);
+            if (!isIntegerType(ltype)) {
+                error("arithequal lhs is not an integer type");
+                return semantic::makeError();
+            }
+            expect(rhs, ltype);
+            return semantic::makeUnit();
+        }
+    }
+    return semantic::makeError();
+}
 
-<shell_metadata>
-shell tool terminated command after exceeding timeout 120000 ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.
-</shell_metadata>
 ```
 
 ---
 
-## Assistant (Build · DeepSeek V4.1 Flash · 15.2s)
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 58.8s)
 
 _Thinking:_
 
-Whoa! `fn f(a,b,c) { a >> b << c; }` **hangs** (timeout 120s)! That's huge. Earlier in the corpus, 25_shift_mix had `a << b >> c;` (that worked and dumped), but `a >> b << c` as a statement: the differential test's stmt case returned... hmm, in the diff test it apparently completed (results showed stmt extraction failed with OK?) — wait, the diff test ran all 4 contexts for `a >> b << c`; stmt returned ("OK", extract failed) — meaning the process completed. But now it hangs?
+Let me review the new code carefully.
 
-Hmm, the shell command timed out after 120s. Maybe the process is stuck in an infinite loop in the parser or builder for this specific input. But the diff test completed? In diff test, the stmt case for `a >> b << c` printed "(extract failed)" — meaning run returned OK with dump lacking ExprStmt, or the extraction returned None. If the process had hung, the script would hang too. So why does it hang now?
+**Unary**:
+```cpp
+if (auto una = dynamic_cast<unaryExpr*>(expr); una) {
+    if (una->op_ == "-") {
+        if (!isSignedType(infer(una->operand_))) { error; return makeError; }
+    }
+}
+```
+Problems:
+1. No `return` after the `-` check! Falls through to other branches, eventually reaches `return makeError()`. So `-1` yields ERROR (not the operand's type), and `!x` is not handled at all (no return). Must return the operand type: `semType* t = infer(operand); if (op=="-") { require signed; return t; } if (op=="!") { require int or bool; return t; } else error`.
+2. `!` not handled.
 
-Wait, maybe the difference: in diff test the statement context file has prelude with struct S, impl, fn fun, etc. Let me re-run diff for that exact case with a timeout and check. Actually maybe the hang is due to `--dump-ast` in this manual invocation? No.
+**If**:
+```cpp
+if (auto fi = dynamic_cast<ifExpr*>(expr); fi) {
+    expect(fi->cond_, bool);
+    if (!typeEqual(infer(fi->then_), unit)) { error("ifExpr then is not unit"); return makeError; }
+    return fi->else_ ? infer(fi->else_) : makeUnit();
+}
+```
+Problems:
+- `fi->then_` is an `Expr*`? In AST, `ifExpr { cond_, then_ (blockExpr*?), else_ }` — check ast.h: `struct ifExpr : Expr { Expr* cond_; blockExpr* then_; Expr* else_; };` Yes then_ is blockExpr*, else_ is Expr* (either block or if). `infer(fi->then_)` works (blockExpr is Expr).
+- Requiring then to be unit is wrong: `if c { 1 } else { 2 }` — then type i32; spec says if with else can have any type; if without else requires unit. Their check errors on `if true {1} else {2}` (positive tests!). Should be: if no else → check then against unit; if else → Phase 3 does LUB/expected; for now, infer both and return then type if equal or mismatch handling. At minimum don't require unit when else exists.
+- `return fi->else_ ? infer(fi->else_) : makeUnit();` — returns else type only; if then and else differ, no error; if then non-unit without else, they error. Also for `if` without else, then must be unit (spec: an if without else requires unit result) — their check does that even when else exists (wrong).
+- Also `else_` can be an `ifExpr` (else if) → infer works.
+- Also condition check via expect(cond, bool) — good.
+- Missing expected propagation (Phase 3).
 
-Hmm, actually maybe the earlier diff test did hang on this case and the 180s timeout of the bash call killed it? The output showed the full report ("total expressions 37, mismatches 1") so it finished. Curious.
+**While**:
+```cpp
+expect(cond, bool);
+if (!typeEqual(infer(whi->block_), unit)) error;
+return unit;
+```
+Spec: loop bodies require unit results. Their check does it. But careful: `whi->block_` is blockExpr*; infer works. For `while c { break; }` — body block tail? `break;` is ExprStmt, body type unit. Good.
+But: body block with a tail like `while c { 1 }` → unit check fails → error (spec says loop bodies require unit? Actually spec: "loop bodies and an `if` without `else` require unit results"). Good.
 
-Let me retry with a shorter timeout and see. Maybe the command hung due to something else — e.g., the shell `cat > case2.rx` heredoc? No, that's fine. Perhaps the rxcc process got stuck. Let me run with `timeout 10` to confirm.
+**Loop**:
+```cpp
+if (auto loop = dynamic_cast<whileExpr*>(expr); loop) { ... }
+```
+**BUG**: casts to `whileExpr*` instead of `loopExpr*`! Since the while branch above catches whileExpr first, this branch never matches loopExpr (a loopExpr is not a whileExpr). So `loop` expressions fall through to makeError. Also it would deref `loop->block_` which exists in whileExpr; but unreachable. Fix to `dynamic_cast<loopExpr*>`.
+Also loop body unit check? Spec says loop bodies require unit. `loop { break 42; }` — the body block contains `break 42;` as ExprStmt, type unit. Good. But `loop { if c { break 1; } }` body tail is if without else → unit. Fine.
+
+**break/continue/return**: return NEVER, but don't check their operands:
+- `return e` should `expect(e, currentRet_)`; `return;` requires currentRet_ unit. Not done → negative tests (return type mismatch) will fail in later suites; Phase 2 basic maybe zhang. The todo says return/块尾 in Phase 2. So add.
+- `break e`: Phase 3 LUB; at least infer the tail (to catch errors inside). `break` outside loop? Not checked (loop depth). Phase 3.
+- `continue`: fine.
+- Note: since return/break return NEVER, and `checkBlock` tail logic: `return` as tail? e.g. `fn f() -> i32 { return 1; }` — the block's last statement `return 1;` is an ExprStmt (with semicolon) so body tail absent → unit vs ret i32 → their checkBlock errors! But spec/test: `fn f() -> i32 { return 1; }` is valid (return diverges; block type is unit? Hmm — the function body block with no tail has type unit, but the function returns i32; the spec says function body checked against ret; a block ending with a diverging statement... Actually in Rust, `fn f() -> i32 { return 1; }` compiles: the tail expression is absent, so block type is `()`, but the block diverges (unreachable end). Rust's special rule: if the block ends with a diverging expression statement, the block can coerce to any type? Actually the function body is checked as: the block's type must be `()` or `!`? In Rust, `fn f() -> i32 { return 1; }` indeed compiles. The reason: block with no tail has type `()`, but if all paths diverge (e.g., ends with `return;`), the block's type is `!`. Rust computes divergence: a block ending in a statement that diverges has type `!`? More precisely, the block's tail is `()` unless it diverges; type checking of `()` vs i32 would fail, but Rust special-cases expressions of type `!` from statements? Let me recall: `fn f() -> i32 { return 1; }` compiles. `fn f() -> i32 { if true { return 1; } }` doesn't (missing return). `fn f() -> i32 { loop {} }` compiles (loop diverges). So diverging statements do make the block diverge. In our AST/checker, implementing "block ends with diverging stmt → block type never" is part of Phase 3 (never). For now, their checkBlock would reject valid `fn f() -> i32 { return 1; }` — a false positive in many tests. Hmm, but currently they early-return in `checkCrate` if reject_ set during evaluateTypes? evaluateTypes passed; checkBlock runs for each function. This will false-reject lots of functions like `fn f() -> i32 { return 1; }`. Wait `rej-`/`acc-` tests: e.g., `acc-explicit-unit-result-and-early-completion.rx`: `fn main() -> () { return; }` — body no tail → unit vs unit fine. `fn f() -> i32 { return 1; }` appears in tests? Probably. Let me check: namespace-errors `rej-a-block-local-name-cannot-escape` main returns (); fine. `rej-a-local-shadows...` main. But many tests have functions with `return expr;` and non-unit ret. E.g., `rej-unreachable-checks` etc. This could cause false failures. Did the full suite drop? Let me run to see current count after their changes. But first note fix: in checkBlock, when tail absent and block's statements end with a diverging expression (return/break/continue/loop?), the block type should be NEVER, so typeEqual(NEVER, wish) — their typeEqual: NEVER returns true for any (now implemented? type.h: UNIT/NEVER return true). Actually their typeEqual returns true if either kind is ERROR; for NEVER, `if (now->kind_ == NEVER) return true;`? Let me check type.h current: earlier typeEqual had:
+```
+if (now->kind_ == UNIT) return true;
+if (now->kind_ == NEVER) return true;
+```
+Hmm, that's wrong semantics (NEVER equals everything is fine for coercion but typeEqual vs UNIT both true?). Let me re-read type.h to be accurate. Earlier version:
+```cpp
+if (now->kind_ == Type::kTypeKind::UNIT) { return true; }
+if (now->kind_ == Type::kTypeKind::NEVER) { return true; }
+```
+Wait that was before their fixes? The old session had them fix NEVER/UNIT to return true when kinds equal:
+Actually current type.h we read at the start: UNIT returns true; NEVER returns true. So typeEqual(unit, i32) → false (kinds differ → checked `kind_ != kind_` before? Let me look: typeEqual first checks kinds differ → return false; then per-kind. So unit vs i32 → false. NEVER vs i32 → kinds differ → false. Hmm, so NEVER doesn't unify. For checkBlock, they'd need explicit handling. Phase 3.)
+
+So Phase 2 has a semantic gap: blocks ending with return/continue/break should be treated as never (or at least not error against expected). But maybe they can defer and accept false failures for tests where a function ends with return; but that would make many positives fail now. Let me check by running the suite to see current failures.
+
+**Cast**:
+```cpp
+semType* ltype = infer(from_);
+semType* rtype = transformType(to_);
+if ((!isIntegerType(ltype) && !isBoolType(ltype)) || !isIntegerType(rtype)) error;
+return rtype;
+```
+Good: int/bool → int only. `&i32 as i32`: ltype REF → not int/bool → error. `1 as bool`: rtype bool not integer → error. Good.
+
+**Deref**:
+```cpp
+if (auto der = dynamic_cast<derefExpr*>(expr); der) {
+    if (auto ref = dynamic_cast<refExpr*>(der); ref) {   // ← BUG: casts der (a derefExpr) to refExpr*, always null!
+        return infer(ref->operand_);
+    } else { error("attempted to deref a non-reference type"); ... }
+}
+```
+They cast the derefExpr itself to refExpr (always fails). Should infer `der->operand_` and check its type is REF (or BOX):
+```cpp
+semType* t = infer(der->operand_);
+if (t->kind_ == REF) return t->elem_;
+if (t->kind_ == BOX) return t->elem_;   // Phase 5 maybe
+error(...); return makeError();
+```
+So all `*p` currently error → many positive tests fail (e.g., `println_i32(*r)` in names-and-shadowing acc!). Wait, does that acc currently fail? It was passing at 23/35? Let me check names-and-shadowing results. The Phase-2 suite run earlier: 23 passed/12 failed; names-and-shadowing probably had acc test fail? The failure list didn't include names-and-shadowing acc (the list showed 12; no names-and-shadowing). Hmm, the acc test has `println_i32(*r);` → infer(deref) → error → reject_ set → expected 0, got 1 → should fail. But the failure list from earlier run (before they added deref/cast) didn't include it because derefExpr wasn't handled at all (returned makeError silently, no reject). Now with the new deref branch, it emits an error → acc test will start failing! Similarly `*p` etc. So their new deref branch introduces false rejections. Must fix.
+
+**Ref**: makeRef(infer(operand), isMut) — good for now.
+
+**Binary**:
+- `=` good.
+- Compound: only arithmetic list `{"+=", "-=", "*=", "/=", "%=", "<<=", ">>="}`; missing `&= |= ^=` (bool allowed, and integer) → positive `b &= &false` fails; also positive test uses `x |= 16; x &= &30; x ^= 3` — these aren't handled → infer returns makeError silently → no error (so acc might pass them), but `b &= &false` not error, fine. However `*p += 5` requires deref fixed.
+- Compound rhs `&2`: `expect(rhs, ltype)` → infer(refExpr) now returns REF(i32) → typeEqual(REF, i32) false → error. Need strip one ref for operands. That's the user's question: why does stripOneRef take a semType? Because after inferring the operand expression you have a semType; strip one REF layer and compare. E.g.:
+```cpp
+semType* rhsType = stripOneRef(infer(rhs));
+if (!typeEqual(rhsType, ltype)) error;
+```
+For shift rhs: any integer (strip one ref), no equality with lhs.
+- Arithmetic/bitwise/comparison/logical not implemented at all yet (they only did compound). Wait, the failing list included them. They said they wrote "unary,deref,ref,cast,if,while,loop,break/continue/return" — not binary arithmetic. So still missing.
+- `inside` lambda is okay but could just use a set.
+
+**Loop branch typo** as noted.
+
+**Break/return** no operand checking; Phase 3.
+
+Let me now answer their question about stripOneRef and look at binary:
+
+Why `stripOneRef(semType*)`: because after `infer(operand)` you have its type; the spec allows operands to be "same integer type (or one layer &T)". So you normalize the inferred type by removing one REF layer, then compare. Example:
+```cpp
+semType* t = infer(rhs);
+if (t->kind_ == REF) t = t->elem_;   // one layer only
+```
+But careful: for `&mut i32` vs `i32` comparisons, mut must match? Spec: for comparisons "< <= > >=": "两边同为整数/bool（各层 mut 匹配的引用也行）". So refs must have same mutability on both sides? "各层 mut 匹配的引用" — hmm. For arithmetic: "两边是同一个整数类型（或一层 &T）". For ==: same type. So for arithmetic, `x + &y` where x i32, y i32 → strip ref → i32 match. If y is `&mut i32`? Probably allowed? The rule says "一层 &T" generically, maybe mut-agnostic. For comparisons, mut matching required. Let me check tests. The compound positive has `x -= &2` (shared ref, lhs i32), `x <<= &2u32` (rhs u32 ref, lhs i32 shift). For scalar-reference-operators suite (Phase 4), comparisons with refs. For Phase 2, simple strip-one-ref for operands suffices.
+
+But subtle: `&mut i32` operand for arithmetic — stripping mut? `stripOneRef` just returns elem regardless of mut. Fine for arithmetic (per spec "一层 &T" probably includes &mut? "各层 mut 匹配的引用" only comparisons). Tests will tell.
+
+So answer: yes, use `semType* operandType(Expr*)` helper: infer + strip one REF. Signature takes semType because the AST type isn't what you compare; operands can be refs. Actually they could also write `stripOneRef(Expr*)` calling infer internally; but separating is cleaner. Their question "为什么参数是个 semType 呢？那我怎么用呢？" — because after `infer(expr)`, the type is a semType; e.g., `x -= &2` — `infer(&2)` gives `REF(i32)`; you strip to i32 then compare with lhs i32. So:
+
+```cpp
+static semType* stripOneRef(semType* t) {
+    return (t != nullptr && t->kind_ == semType::kTypeKind::REF) ? t->elem_ : t;
+}
+// in binary:
+semType* lt = infer(lhs);
+semType* rt = stripOneRef(infer(rhs));
+```
+
+But for assignment `=` should NOT strip refs (destination type vs rhs; `x = &y` where x i32 is a type error). Yes, only operator operands allow the ref layer.
+
+Also for comparison mut matching (Phase 4), leave for later.
+
+Now, review summary:
+1. unary: missing returns and `!`; fix.
+2. if: wrongly requires then unit even with else; and returns else type; Phase 3 will handle LUB but at least: no else → then against unit; else → infer both, return then if equal else (or makeError/Phase 3). Also expected propagation Phase 3.
+3. loop: dynamic_cast typo (whileExpr instead of loopExpr).
+4. deref: dynamic_cast typo (der instead of der->operand_); must infer operand and check REF/BOX.
+5. return: should check tail against currentRet_; missing.
+6. binary: compound missing `&= |= ^=`; operand ref layer; shifts rhs not same-type; arithmetic/bitwise/comparison not yet written (they didn't claim; point out).
+7. break/continue: fine returning never, but break tail should at least infer (Phase 3).
+8. `checkBlock`: blocks ending with return/break/continue (diverging stmt) currently treated unit → will false-error `fn f() -> i32 { return 1; }` once return checking added; Phase 3 never handling. For now, maybe note.
+9. Also `loop` body unit: with `break 42`, body block is unit (exprStmt) — fine.
+
+Let me run the suite to get current status after their unary/if etc. changes, to report. But their code has the loop typo and deref typo → likely more failures now. Let me build/run to see. Also names-and-shadowing acc might now fail due to deref error. Let me run the six suites.
 
 **Tool: bash**
 
 **Input:**
 ```json
 {
-  "command": "cd /tmp/opencode/ast-check/diff && timeout 10 /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/target/build/rxcc --stage semantic --dump-ast case2.rx; echo \"rc=$?\"",
-  "timeout": 30000
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && cmake --build target/build -j 2>&1 | grep -E \"error|Built target\" | head -3 && make test FILTER=official:semantic:names-and-shadowing,official:semantic:casts-and-literals,official:semantic:integer-arithmetic,official:semantic:shifts,official:semantic:compound-assignment,official:semantic:boolean-and-short-circuit STAGE=semantic 2>&1 | grep -E \"^\\s*[0-9]+\\)|passed|failed\" | head -25",
+  "timeout": 300000
 }
 ```
 
 **Output:**
 ```
+[100%] Built target rxcc
+. passed  F failed
+1) official:semantic:boolean-and-short-circuit/acc-observable-evaluation-of-each-logical-form.rx@semantic
+2) official:semantic:boolean-and-short-circuit/rej-lazy-operators-require-bool.rx@semantic
+3) official:semantic:boolean-and-short-circuit/rej-lazy-operators-have-no-reference-variants.rx@semantic
+4) official:semantic:boolean-and-short-circuit/rej-bitwise-operand-types-must-match.rx@semantic
+5) official:semantic:casts-and-literals/acc-literal-boundaries-and-bool-casts.rx@semantic
+6) official:semantic:casts-and-literals/acc-every-integer-cast-preserves-all-32-bits.rx@semantic
+7) official:semantic:casts-and-literals/acc-operator-precedence-and-left-association.rx@semantic
+8) official:semantic:compound-assignment/acc-all-ten-compound-operators-plus-boolean-assignments.rx@semantic
+9) official:semantic:integer-arithmetic/acc-all-integer-arithmetic-bit-operations-and-comparisons-on-i32.rx@semantic
+10) official:semantic:integer-arithmetic/acc-all-integer-arithmetic-bit-operations-and-comparisons-on-u32.rx@semantic
+11) official:semantic:integer-arithmetic/acc-all-integer-arithmetic-bit-operations-and-comparisons-on-isize.rx@semantic
+12) official:semantic:integer-arithmetic/acc-all-integer-arithmetic-bit-operations-and-comparisons-on-usize.rx@semantic
+13) official:semantic:integer-arithmetic/rej-explicitly-different-arithmetic-operand-types.rx@semantic
+14) official:semantic:integer-arithmetic/rej-booleans-are-not-arithmetic-integers.rx@semantic
+15) official:semantic:names-and-shadowing/acc-shadowing-creates-new-storage-while-prior-references-remain-valid.rx@semantic
+16) official:semantic:shifts/acc-masked-dynamic-counts-and-signedness-of-i32-shifts.rx@semantic
+17) official:semantic:shifts/acc-masked-dynamic-counts-and-signedness-of-u32-shifts.rx@semantic
+18) official:semantic:shifts/acc-masked-dynamic-counts-and-signedness-of-isize-shifts.rx@semantic
+19) official:semantic:shifts/acc-masked-dynamic-counts-and-signedness-of-usize-shifts.rx@semantic
+20) official:semantic:shifts/acc-constant-folded-shifts-also-mask-the-count.rx@semantic
+21) official:semantic:shifts/rej-shift-count-must-be-integer.rx@semantic
+22) official:semantic:shifts/rej-shift-left-operand-must-be-integer.rx@semantic
+======================== 22 failed, 13 passed in 22.28s ========================
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 16.9s)
+
+_Thinking:_
+
+As predicted, the new deref branch broke positive tests (`acc-shadowing...`, arithmetic positives use `&` operands and comparisons not implemented, etc.). The unary branch also returns makeError for `-a` (no return), so arithmetic positives fail. Let me list the current state and then answer with fixes.
+
+Key issues to report:
+1. unary: no return; `!` missing.
+2. if: then must be unit check wrong when else exists; returns else type.
+3. loop: dynamic_cast<whileExpr*> typo.
+4. deref: dynamic_cast<refExpr*>(der) typo; should infer operand and unwrap REF (and later BOX).
+5. binary: arithmetic/bitwise/shift/comparison/logical missing; compound missing `&= |= ^=`; ref operand layer; shifts rhs any integer.
+6. return operand check missing.
+7. checkBlock + diverging statement issue (Phase 3).
+8. Also `if` expected: Phase 3.
+
+And answer the stripOneRef question: why semType param, how to use. Example with `x -= &2`.
+
+Let me also explain why the positive tests now fail: deref typo emits errors; unary `-` falls through to makeError (silently, no error; but `-a` used in expect? maybe type ERROR is compatible → positives could still pass; but comparisons aren't implemented → `x < y` yields ERROR; passed to println_i32 → compatible; so why arithmetic acc tests fail? Because `x -= &2` etc.? Let me check `acc-all-integer...`: uses `println_i32(a + b)` maybe with refs and comparisons; unimplemented binary returns makeError silently; no error... unless unary `-a` hits `isSignedType(infer)` → infer path i32 → signed → no error; then falls through all branches → makeError; no error set. So positives shouldn't fail from that. Why did `acc-all-integer...` fail? Maybe it contains `&` operands and comparisons; no error... Hmm, maybe it uses `assert`? Or maybe it contains a function ending with return? Let me look at one failing positive to understand. `names-and-shadowing/acc-shadowing...` failed now due to deref (false error). `integer-arithmetic/acc-all...` probably contains `x << 1` (unimplemented → no error), `-x` (unimplemented → no error), comparisons (no error), so why exit 1? Maybe it has `let r = &x;` then `*r`? Let me check the test source.
+
+Also `casts-and-literals/acc-operator-precedence...` has `(5 as (usize) << 2u32)` — shift unimplemented → makeError; then `as i32` cast branch: infer(from_) = makeError (silent); isIntegerType(ERROR) false && isBoolType(ERROR) false → error "castExpr lhs is neither int nor bool" → false reject! That's why. Similarly arithmetic tests containing casts? Hmm.
+
+`acc-literal-boundaries-and-bool-casts` uses many casts; cast branch errors when from_ is ERROR? No, from_ types are literals (fine). Maybe uses `true as i32` → fine. Hmm.
+
+Anyway, main fixes as above. Let me check one positive to cite: `acc-all-integer-arithmetic-bit-operations-and-comparisons-on-i32.rx`. Let me cat briefly.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic\" && cat integer-arithmetic/acc-all-integer-arithmetic-bit-operations-and-comparisons-on-i32.rx | head -30; echo ===; cat boolean-and-short-circuit/acc-observable-evaluation-of-each-logical-form.rx | head -20"
+}
+```
+
+**Output:**
+```
+use rx::core::*;
+
+fn main() {
+    let a = get_i32() as i32;
+    let b = get_i32() as i32;
+    println_i32((a + b) as i32);
+    println_i32((a - b) as i32);
+    println_i32((a * b) as i32);
+    println_i32((a / b) as i32);
+    println_i32((a % b) as i32);
+    println_i32((a & b) as i32);
+    println_i32((a | b) as i32);
+    println_i32((a ^ b) as i32);
+    println_i32((!a) as i32);
+    println_i32((a < b) as i32);
+    println_i32((a <= b) as i32);
+    println_i32((a > b) as i32);
+    println_i32((a >= b) as i32);
+    println_i32((a == b) as i32);
+    println_i32((a != b) as i32);
+    println_i32((-a) as i32);
+}
+===
+use rx::core::*;
+
+fn mark(n: i32, v: bool) -> bool {
+    println_i32(n);
+    v
+}
+fn main() {
+    println_i32((mark(1, false) && mark(2, true)) as i32);
+    println_i32((mark(3, true) || mark(4, false)) as i32);
+    println_i32((mark(5, true) && mark(6, true)) as i32);
+    println_i32((mark(7, false) || mark(8, true)) as i32);
+    println_i32((mark(9, false) & mark(10, true)) as i32);
+    println_i32((mark(11, true) | mark(12, false)) as i32);
+    println_i32((true ^ false) as i32);
+    println_i32((!true) as i32);
+    println_i32((false < true) as i32);
+    println_i32((true >= false) as i32);
+}
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 25.1s)
+
+_Thinking:_
+
+The positives fail because of `(!a) as i32` and `(a < b) as i32` etc.: the inner expression infer returns ERROR (unimplemented `!`, binary ops), then cast branch errors "castExpr lhs is neither int nor bool" because ERROR isn't integer/bool. So they need the operator implementations.
+
+Also `names-and-shadowing` acc fails due to deref typo.
+
+Now compose the review:
+
+**Answer to stripOneRef question:**
+- Because after `infer(operand)` you get a `semType*`; operator rules compare types. `x -= &2` infers `&2` as REF(i32); strip one REF → i32, compare with lhs i32.
+- Example:
+```cpp
+static semType* stripOneRef(semType* t) {
+    if (t && t->kind_ == semType::kTypeKind::REF) return t->elem_;
+    return t;
+}
+// arithmetic/bitwise/compound:
+semType* lt = infer(lhs);      // lhs not stripped? For compound dest, must be integer; if lhs is *p → i32. Don't strip lhs dest.
+semType* rt = stripOneRef(infer(rhs));
+if (!typeEqual(lt, rt)) error;
+```
+- For shift: rhs = stripOneRef(infer(rhs)); require isIntegerType(rhs), lhs require integer.
+- For comparisons: spec says operands may be references with mut matching; Phase 4 can refine; for now strip one layer maybe both sides? The rule "两边同为整数/bool（各层 mut 匹配的引用也行）" — comparisons also allow refs. So strip one ref from both sides for comparison? Note `a < b` with `a: &i32`? In tests reference comparisons appear in scalar-reference-operators (Phase 4). For Phase 2, handle plain ints/bools; strip both sides for comparison.
+- For `==`: same type exactly (no stripping? Cross-type equality is UB; `1 == &1` would be different source types → UB not tested). Keep exact typeEqual.
+- Logical `&& ||`: operands bool (no refs).
+
+**Review issues:**
+
+1. unary: missing returns; `!`; fix:
+```cpp
+semType* t = infer(op);
+if (op == "-") { require isSignedType(t); return t; }
+if (op == "!") { require isIntegerType(t) || isBoolType(t); return t; }
+error; return makeError;
+```
+Note: `-` on unsuffixed literal: infer gives i32 → allowed; expected not propagated (Phase 3/UB).
+
+2. if: don't require then unit when else exists. Minimal Phase 2:
+```cpp
+expect(cond, bool);
+if (!else_) { checkBlock(then_, unit); return unit; }
+semType* t1 = infer(then_);
+semType* t2 = infer(else_);
+if (!typeEqual(t1, t2)) { error; return makeError; }
+return t1;   // Phase 3 replace with LUB/expected
+```
+Note `then_` is blockExpr*; infer works.
+
+3. loop typo: `dynamic_cast<whileExpr*>` → `loopExpr*`.
+
+4. deref typo: `dynamic_cast<refExpr*>(der)` → should be:
+```cpp
+semType* t = infer(der->operand_);
+if (t->kind_ == REF) return t->elem_;
+if (t->kind_ == BOX) return t->elem_;   // Phase 5, optional now
+error; return makeError;
+```
+
+5. `binaryExpr`:
+- Add non-assignment operators; missing entire groups.
+- Compound: include `&= |= ^=`, with bool allowed; and strip one ref on rhs; for shifts rhs any integer; for `& | ^` allow bool.
+- Generalize compound detection (op ends with '=' and not comparison).
+- For `=`: rhs should NOT strip refs; expect(rhs, infer(lhs)).
+- Evaluation order not relevant here.
+
+6. return: check operand:
+```cpp
+if (tail) expect(tail, currentRet_);
+else if (!typeEqual(makeUnit(), currentRet_)) error("missing return value");
+return makeNever();
+```
+But careful: `currentRet_` may be null outside function? infer only called inside function; fine.
+
+7. break/continue: infer break tail to catch unresolved names; `break` outside loop not checked yet (Phase 3). Return never.
+
+8. checkBlock divergence: `fn f() -> i32 { return 1; }` — body has no tail, returns unit, compared to i32 → false error. Need Phase-3 never: if the last statement is an expression statement whose inferred type is NEVER (return/break/continue/loop), treat block result as NEVER. Minimal fix now:
+```cpp
+if (!block->tail_) {
+    result = unit;
+    if (!block->stmts_.empty()) {
+        // can't easily know type without storing; infer last stmt's expr?
+    }
+}
+```
+Simplest: have checkStatement return the type it checked (or have checkBlock track if last stmt is exprStmt with NEVER). Change `checkStatement` to return semType* (the statement's expression type, or unit for let), and in checkBlock, if no tail: use the last stmt's type if it's NEVER; else unit. Then `typeEqual(NEVER, i32)`? Their typeEqual: kinds differ → false (since NEVER and BUILTIN differ). Hmm — typeEqual currently returns true only for same kind after kind check? Let me re-read type.h: 
+```cpp
+if (now->kind_ == ERROR || oth->kind_ == ERROR) return true;
+if (now->kind_ != oth->kind_) return false;
+...
+if (now->kind_ == UNIT) return true;
+if (now->kind_ == NEVER) return true;
+```
+So NEVER vs i32 → kinds differ → false. For never coercion we need a separate check: `typeEqual(ret, wish) || ret->kind_ == NEVER` in checkBlock. Phase 3 will formalize. Mention: for now special-case `ret` NEVER as compatible. Or change typeEqual semantics? No.
+
+Actually, do Phase 2 tests have functions ending with `return` in non-unit functions? `boolean-and-short-circuit` `mark(n,v) -> bool { println_i32(n); v }` has tail. `casts` functions use tails. Some tests like `rej-unreachable-checks`... Phase 3. But `integer-arithmetic` positives: main returns unit; no return statements. So maybe not blocking Phase 2. But mention as Phase 3 item.
+
+9. Also `if` with else where one branch diverges (never) — Phase 3.
+
+Given the user asked "你看看" and "why stripOneRef semType", I'll answer these and list fixes. Keep it organized, maybe point form. Also mention current suite status 13/35 (regressed due to false errors) and that after fixes should jump.
+
+Let me write the response with:
+- Answer stripOneRef.
+- Review findings (5 bugs + missing operator families).
+- Status and next steps.
+
+Keep it reasonably concise.
+
+**先回答 `stripOneRef` 为什么收 `semType*`：** 因为运算符规则比较的是"**推断出来的类型**"，而不是 AST 节点。`x -= &2` 里 `infer(rhs)` 得到的是 `REF(i32)`（`&2` 造出来的引用类型），而规则说操作数允许"一层 `&T`"，所以要先把这一层剥掉再比：
+
+```cpp
+static semType* stripOneRef(semType* t) {
+    if (t != nullptr && t->kind_ == semType::kTypeKind::REF) return t->elem_;
+    return t;
+}
+
+// 复合赋值里：
+semType* ltype = infer(lhs);                       // 目标本身不剥：p 是 &mut i32 就该被拒绝
+semType* rtype = stripOneRef(infer(rhs));          // 操作数允许一层 &
+if (!isIntegerType(ltype)) { error(...); }
+if (!typeEqual(ltype, rtype)) { error(...); }
+```
+
+具体到你的 `binary`，有几个问题：
+
+1. **复合赋值集合少了 `&= |= ^=`**，而且 `& | ^` 允许 bool：正例 `b &= &false` 需要它；
+2. **操作数没剥一层引用**：`x -= &2`、`x *= &5`、`x &= &30` 都会被 `expect(rhs, ltype)` 拒掉；
+3. **`<<= >>=` 的 rhs 不要求和 lhs 同类型**：`x <<= &2u32` 里 lhs i32、rhs u32，right 是"任意整数（或一层 &整数）"，不是 equal；
+4. 建议 `isCompound = op.size() >= 2 && op.back() == '=' && op != "==" && op != "!=" && op != "<=" && op != ">="`，别手写列表；
+5. 普通算术/位运算/比较/逻辑（`+ - * / % & | ^ << >> < <= > >= == != && ||`）还没写——正例里 `(!a) as i32`、`(a < b) as i32` 就是因为内层返回 ERROR、cast 报 "neither int nor bool" 才失败的。
+
+**其他几个 bug（按严重程度）：**
+
+1. **`derefExpr` 的 dynamic_cast 写错**：
+   ```cpp
+   if (auto ref = dynamic_cast<refExpr*>(der); ref)   // der 是 derefExpr，永远 cast 不成 refExpr
+   ```
+   应该是 infer 操作数再看它的类型：
+   ```cpp
+   semType* t = infer(der->operand_);
+   if (t->kind_ == semType::kTypeKind::REF) return t->elem_;
+   // Box 的解引用等 Phase 5
+   error("attempted to deref a non-reference type");
+   return semantic::makeError();
+   ```
+   现在所有 `*p` 都会误报——`names-and-shadowing` 的 acc 正例就是被这个打挂的。
+
+2. **`loop` 分支 cast 成 `whileExpr*` 了**（复制粘贴），永远不会命中；改成 `loopExpr*`。
+
+3. **`unaryExpr` 没有 return**：`-a` 检查完 signed 后掉出分支，最后返回 ERROR；`!` 完全没处理。应该是：
+   ```cpp
+   semType* t = infer(una->operand_);
+   if (una->op_ == "-") { if (!isSignedType(t)) error; return t; }
+   if (una->op_ == "!") { if (!isIntegerType(t) && !isBoolType(t)) error; return t; }
+   error(...); return makeError();
+   ```
+
+4. **`if` 无条件要求 then 是 unit**：`if c { 1 } else { 2 }` 是合法的。Phase 2 至少改成：无 else → then 按 unit 查、返回 unit；有 else → `infer(then)`/`infer(else)`，相等就返回，不相等先报错（Phase 3 换成 expected/LUB）。
+
+5. **`return e` 没检查 e 和 `currentRet_`**：
+   ```cpp
+   if (ret->tail_) expect(ret->tail_, currentRet_);
+   else if (currentRet_ && !typeEqual(currentRet_, makeUnit())) error("missing return value");
+   return makeNever();
+   ```
+   `break` 的 tail 也至少 `infer` 一下（LUB 留 Phase 3）。
+
+6. 一个 Phase 3 的坑先提醒：`fn f() -> i32 { return 1; }` 的块没有 tail，`checkBlock` 现在返回 unit 并和 i32 比较会误报。Phase 3 要处理"块最后一条语句是 never（return/break/continue/loop）→ 块类型是 never"。
+
+当前六个 suite 掉到 **13 passed / 22 failed**，主要是上面 1、3、4 引入的误报。按顺序修：deref → unary → loop → if → binary（先剥引用/补复合，再补普通运算符），然后 `return`，应该能超过之前的 23，逼近 35。
+
+---
+
+## User
+
+你再看看。
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 13.2s)
+
+_Thinking:_
+
+The user says "你再看看" — review again. I need to read the current checker.cpp infer function (and maybe helpers) to see their fixes. Then build and run the Phase 2 suites, and report issues.
+
+Let me read the infer function and relevant helpers.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "sed -n '/semType\\* Checker::infer/,/^}/p' \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp\""
+}
+```
+
+**Output:**
+```
+semType* Checker::infer(Expr* expr) {
+    if (auto lit = dynamic_cast<intLitExpr*>(expr); lit) {
+        std::string suf = intSuffix(lit->value_);
+        return suf.empty() ? semantic::makeBuiltin("i32") : semantic::makeBuiltin(suf);
+    }
+    if (auto lit = dynamic_cast<boolLitExpr*>(expr); lit) {
+        return semantic::makeBuiltin("bool");
+    }
+    if (auto unit = dynamic_cast<unitExpr*>(expr); unit) {
+        return semantic::makeUnit();
+    }
+    if (auto block = dynamic_cast<blockExpr*>(expr); block) {
+        return checkBlock(block, nullptr);
+    }
+    if (auto path = dynamic_cast<pathExpr*>(expr); path) {
+        if (path->path_.size() == 1) {
+            std::string name = path->path_[0].name_;
+            return lookupValue(name);
+        }
+        else if (path->path_.size() == 2) {
+            std::string callee = path->path_[0].name_, name = path->path_[1].name_;
+            if (callee == "Self") {
+                if (currentStruct_ == "") {
+                    error("\"Self\" outside implement");
+                    return semantic::makeError();
+                }
+                auto sig = findConst(currentStruct_, name);
+                if (sig == nullptr) {
+                    error("can't resolve name in lookupValue : " + name);
+                    return semantic::makeError();
+                }
+                return sig->type_;
+            }
+            else {
+                auto sig = findConst(callee, name);
+                if (sig == nullptr) {
+                    error("can't resolve name in lookupValue : " + name);
+                    return semantic::makeError();
+                }
+                return sig->type_;
+            }
+        }
+        else {
+            error("length of a pathExpr appears to be longer than 2:");
+            return semantic::makeError();
+        }
+    }
+    if (auto call = dynamic_cast<callExpr*>(expr); call) {
+        auto path = dynamic_cast<pathExpr*>(call->callee_);
+        if (path == nullptr) {
+            error("callExpr callee is not a function");
+            return semantic::makeError();
+        }
+        if (path->path_.size() > 1) {
+            // This won't be dealt until stage 5
+            return semantic::makeError();
+        }
+        if (!path->path_[0].types_.empty()) {
+            error("callExpr single word path have types");
+            return semantic::makeError();
+        }
+        std::string callee = path->path_[0].name_;
+        if (scope_.find(callee)) {
+            error("called function name is shadowed by local variables");
+            return semantic::makeError();
+        }
+        if (table_.funcSig.find(callee) == table_.funcSig.end()) {
+            error("callExpr attempted to use an non-existing function");
+            return semantic::makeError();
+        }
+        auto &sig = table_.funcSig[callee];
+        if (sig.params_.size() != call->args_.size()) {
+            error("callExpr parameters number mismatch");
+            return semantic::makeError();
+        }
+        for (int i = 0; i < sig.params_.size(); i++) {
+            expect(call->args_[i], sig.params_[i]);
+        }
+        return sig.retType_;
+    }
+    if (auto una = dynamic_cast<unaryExpr*>(expr); una) {
+        semType* type = infer(una->operand_);
+        if (una->op_ == "-") { // I remember unaryExpr only have -x and !x?
+            if (!isSignedType(type)) {
+                error("unary minus attempted to negate an unsigned value");
+                return semantic::makeError();
+            }
+            return type;
+        }
+        if (una->op_ == "!") {
+            if (!isIntegerType(type) && !isBoolType(type)) {
+                error("unary negate attempted to negate a non-integer and non-boolean value");
+                return semantic::makeError();
+            }
+            return type;
+        }
+        error("unaryExpr with an operator neither - nor !");
+        return semantic::makeError();
+    }
+    if (auto fi = dynamic_cast<ifExpr*>(expr); fi) {
+        expect(fi->cond_, semantic::makeBuiltin("bool"));
+        if (fi->else_ != nullptr) {
+            semType* rhs = infer(fi->else_);
+            if (!semantic::typeEqual(infer(fi->then_), rhs)) {
+                error("ifExpr then and else have different type");
+                return semantic::makeError();
+            }
+            return rhs;
+        }
+        else {
+            if (!semantic::typeEqual(infer(fi->then_), semantic::makeUnit())) {
+                error("ifExpr then is not unit");
+                return semantic::makeError();
+            }
+            return semantic::makeUnit();
+        }
+    }
+    if (auto whi = dynamic_cast<whileExpr*>(expr); whi) {
+        expect(whi->cond_, semantic::makeBuiltin("bool"));
+        if (!semantic::typeEqual(infer(whi->block_), semantic::makeUnit())) {
+            error("whileExpr block is not unit");
+            return semantic::makeError();
+        }
+        return semantic::makeUnit();
+    }
+    if (auto loop = dynamic_cast<loopExpr*>(expr); loop) {
+        if (!semantic::typeEqual(infer(loop->block_), semantic::makeUnit())) {
+            error("loopExpr block is not unit");
+            return semantic::makeError();
+        }
+        return semantic::makeUnit();
+    }
+    if (auto bre = dynamic_cast<breakExpr*>(expr); bre) {
+        semType* tail = infer(bre->tail_);
+        if (!semantic::typeEqual(tail, semantic::makeUnit())) {
+            error("breakExpr tail is not unit");
+            return semantic::makeError();
+        }
+        return semantic::makeNever();
+    }
+    if (auto con = dynamic_cast<continueExpr*>(expr); con) {
+        return semantic::makeNever();
+    }
+    if (auto ret = dynamic_cast<returnExpr*>(expr); ret) {
+        if (ret->tail_) {
+            expect(ret->tail_, currentRet_);
+        }
+        else if (currentRet_ != nullptr && !semantic::typeEqual(currentRet_, semantic::makeUnit())) {
+            error("returned an unit in a function with a return type");
+        }
+        return semantic::makeNever();
+    }
+    if (auto cast = dynamic_cast<castExpr*>(expr); cast) {
+        semType* ltype = infer(cast->from_);
+        semType* rtype = transformType(cast->to_);
+        if ((!isIntegerType(ltype) && !isBoolType(ltype)) || 
+             !isIntegerType(rtype)){
+            error("castExpr lhs is neither int nor bool");
+            return semantic::makeError();
+        }
+        return rtype;
+    }
+    if (auto der = dynamic_cast<derefExpr*>(expr); der) {
+        if (auto ref = dynamic_cast<refExpr*>(der->operand_); ref) {
+            return infer(ref->operand_);
+        }
+        else {
+            error("attempted to deref a non-reference type");
+            return semantic::makeError();
+        }
+    }
+    if (auto ref = dynamic_cast<refExpr*>(expr); ref) {
+        return semantic::makeRef(infer(ref->operand_), ref->isMut_);
+    }
+    if (auto bin = dynamic_cast<binaryExpr*>(expr); bin) {
+        auto lhs = bin->lhs_, rhs = bin->rhs_;
+        semType *ltype = infer(lhs);
+        semType *rtype = digOneRef(infer(rhs));
+        std::string op = bin->op_;
+        if (op == "=") {
+            if (!isMutablePlaceable(lhs)) {
+                error("assignment lhs is not a mutable lvalue");
+                return semantic::makeError();
+            }
+            expect(rhs, infer(lhs));
+            return semantic::makeUnit();
+        }
+        auto inside = [&](std::string str, std::vector<std::string> all) {
+            for (auto now : all) {
+                if (now == str){
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (inside(op, {"+=", "-=", "*=", "/=", "%=", "<<=", ">>=", "&=", "|=", "^="})) {
+            if (!isMutablePlaceable(lhs)) {
+                error("arithequal lhs is not a mutable lvalue");
+                return semantic::makeError();
+            }
+            semType* ltype = infer(lhs);
+            if (!isIntegerType(ltype)) {
+                error("arithequal lhs is not an integer type");
+                return semantic::makeError();
+            }
+            expect(rhs, ltype);
+            return semantic::makeUnit();
+        }
+    }
+    return semantic::makeError();
+}
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 46.4s)
+
+_Thinking:_
+
+Current issues:
+
+1. **`digOneRef` used before definition?** Need to check it exists and defined. They use `digOneRef(infer(rhs))` at top of binary branch. Let me check it's defined (grep). If not, compile error. Let me grep.
+
+2. **binary branch computes `ltype`/`rtype` unconditionally at the top** — including for `=` and compound; then maybe unused (warnings). More importantly, for `=`: `expect(rhs, infer(lhs))` infers lhs again (minor) and rhs without stripping (correct). But `rtype` was computed with strip — unused for `=`; fine. However, computing `infer(rhs)` before checking lhs place can emit errors from rhs (fine).
+   - For compound assignments, they do `expect(rhs, ltype)` — NOT using the stripped `rtype`! Still uses expect (no strip) → `x -= &2` still fails. This is the main remaining bug. They compute `rtype = digOneRef(infer(rhs))` but then re-call expect on rhs without strip. For compound, need compare `rtype` vs `ltype` directly (and not call expect, to avoid un-stripped check). E.g.:
+     ```cpp
+     semType* lt = infer(lhs);  // don't strip dest
+     semType* rt = digOneRef(infer(rhs));
+     // for arithmetic/bitwise compound: require same type, allow bool for &|^
+     if (!typeEqual(lt, rt)) error;
+     ```
+     But note `expect(rhs, ltype)` inside compound will fail for refs. So change.
+   - Shifts `<<= >>=`: rhs can be any integer, not necessarily equal; `expect(rhs, ltype)` too strict? Actually `x <<= 2u32` (lhs i32, rhs u32) should be allowed. Their expect(rhs, ltype) would error. Also `x <<= &2u32` needs strip. So shift compound needs its own rule: lhs integer; rhs stripped must be integer.
+   - `&= |= ^=` on bool: their `isIntegerType(ltype)` rejects bool. Need allow bool for &|^; rhs strip must equal ltype (bool or int). Positive `b &= &false`.
+   - Arithmetic compound (`+= -= *= /= %=`) require integer lhs and same type rhs (stripped). Bool not allowed.
+
+3. **Non-compound binary operators still not implemented!** The `binary` branch ends after compound, returns makeError. So `a + b`, comparisons, shifts, `&& ||`, `& | ^` are missing. Wait, the suite failures will show. They said "你再看看" after probably not adding them yet. Need to point out.
+
+4. **deref branch**: now:
+   ```cpp
+   if (auto der = dynamic_cast<derefExpr*>(expr); der) {
+       if (auto ref = dynamic_cast<refExpr*>(der->operand_); ref) {
+           return infer(ref->operand_);
+       }
+       else {
+           error("attempted to deref a non-reference type");
+   ```
+   Still wrong: it only handles `*&x` (deref of a syntactic refExpr). For `*p` where p is a path to &T, it errors. Correct: infer(der->operand_) → if REF return elem; if BOX return elem (Phase 5). So still bug.
+
+5. **break branch**: 
+   ```cpp
+   semType* tail = infer(bre->tail_);
+   if (!typeEqual(tail, unit)) error("breakExpr tail is not unit");
+   ```
+   This rejects `break 42;` (tail i32 not unit)! That's wrong—break can carry a value (loop LUB). It also calls infer(nullptr) when `break;` (no tail) → infer(nullptr) → all dynamic_casts on nullptr return null → returns makeError silently (fine, no crash) but type ERROR ≠ unit → typeEqual(ERROR, unit) → ERROR returns true → no error. Hmm: typeEqual(ERROR, UNIT) returns true (ERROR check first) → no error. For `break 42;` tail i32 → error → false reject! Positive tests with `break 42` (loops) will fail. Should at minimum infer tail (if any) and return never; the unit requirement is wrong. Phase 3 will handle break LUB.
+   
+6. **return branch**: 
+   ```cpp
+   else if (currentRet_ != nullptr && !typeEqual(currentRet_, unit)) error("returned an unit...");
+   ```
+   `typeEqual(currentRet_, unit)` false for i32 → error → correct (missing return value). OK. But error message wording. Fine.
+   - Also `expect(ret->tail_, currentRet_)` good.
+
+7. **if branch**: now requires then/else same type; returns rhs. That's a stand-in for LUB; Phase 3. But `if` without else requires then unit — correct per spec. Note: `if` with else where branches differ but expected type would make them equal? Phase 3. Fine.
+   - But `infer(fi->then_)` then `infer(fi->else_)` — order irrelevant. 
+   - Missing expected propagation.
+   
+8. **while loop body unit**: correct per spec? "loop bodies ... require unit results". Yes.
+
+9. **loop body unit** and returns unit (Phase 3 break LUB).
+
+10. **cast after deref etc.** fine.
+
+11. **unary** fixed.
+
+12. **digOneRef** — check definition. Let me grep.
+
+Also note: `ltype`/`rtype` computed before op dispatch will double-infer operands for `=`, and for `lookupValue`-style errors could duplicate error messages? For `=` they call infer(lhs) at top (ltype) and again in expect(rhs, infer(lhs)) — if lhs is invalid, two errors. Minor.
+
+13. `inside` lambda fine.
+
+Let me check digOneRef definition and then run suites to see status.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "grep -n \"digOneRef\" \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp\" \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.h\"; echo ===; cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && cmake --build target/build -j 2>&1 | grep -E \"error|warning|Built target\" | head -5 && make test FILTER=official:semantic:names-and-shadowing,official:semantic:casts-and-literals,official:semantic:integer-arithmetic,official:semantic:shifts,official:semantic:compound-assignment,official:semantic:boolean-and-short-circuit STAGE=semantic 2>&1 | grep -E \"^\\s*[0-9]+\\)|passed|failed\" | head -25",
+  "timeout": 300000
+}
+```
+
+**Output:**
+```
+/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp:32:static semType* digOneRef(semType* type) {
+/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp:742:        semType *rtype = digOneRef(infer(rhs));
+===
+[100%] Built target rxcc
+. passed  F failed
+1) official:semantic:boolean-and-short-circuit/acc-observable-evaluation-of-each-logical-form.rx@semantic
+2) official:semantic:boolean-and-short-circuit/rej-lazy-operators-require-bool.rx@semantic
+3) official:semantic:boolean-and-short-circuit/rej-lazy-operators-have-no-reference-variants.rx@semantic
+4) official:semantic:boolean-and-short-circuit/rej-bitwise-operand-types-must-match.rx@semantic
+5) official:semantic:casts-and-literals/acc-operator-precedence-and-left-association.rx@semantic
+6) official:semantic:compound-assignment/acc-all-ten-compound-operators-plus-boolean-assignments.rx@semantic
+7) official:semantic:integer-arithmetic/acc-all-integer-arithmetic-bit-operations-and-comparisons-on-i32.rx@semantic
+8) official:semantic:integer-arithmetic/acc-all-integer-arithmetic-bit-operations-and-comparisons-on-u32.rx@semantic
+9) official:semantic:integer-arithmetic/acc-all-integer-arithmetic-bit-operations-and-comparisons-on-isize.rx@semantic
+10) official:semantic:integer-arithmetic/acc-all-integer-arithmetic-bit-operations-and-comparisons-on-usize.rx@semantic
+11) official:semantic:integer-arithmetic/rej-explicitly-different-arithmetic-operand-types.rx@semantic
+12) official:semantic:integer-arithmetic/rej-booleans-are-not-arithmetic-integers.rx@semantic
+13) official:semantic:names-and-shadowing/acc-shadowing-creates-new-storage-while-prior-references-remain-valid.rx@semantic
+14) official:semantic:shifts/acc-masked-dynamic-counts-and-signedness-of-i32-shifts.rx@semantic
+15) official:semantic:shifts/acc-masked-dynamic-counts-and-signedness-of-u32-shifts.rx@semantic
+16) official:semantic:shifts/acc-masked-dynamic-counts-and-signedness-of-isize-shifts.rx@semantic
+17) official:semantic:shifts/acc-masked-dynamic-counts-and-signedness-of-usize-shifts.rx@semantic
+18) official:semantic:shifts/acc-constant-folded-shifts-also-mask-the-count.rx@semantic
+19) official:semantic:shifts/rej-shift-count-must-be-integer.rx@semantic
+20) official:semantic:shifts/rej-shift-left-operand-must-be-integer.rx@semantic
+======================== 20 failed, 15 passed in 22.71s ========================
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 26.3s)
+
+_Thinking:_
+
+Status: 15 passed / 20 failed. Failures still mostly because:
+- Non-compound binary operators not implemented (arithmetic/bitwise/shifts/comparisons/logical) → positives with casts fail, negatives not caught.
+- deref still wrong for `*p` (path operand) → names-and-shadowing acc fails.
+- break tail unit check → loop positives (shifts use `loop`? no; but `acc` tests with break values maybe) — not in current failure list? `shifts` positives use? no. But `if` etc.
+- compound assignments still use expect(rhs, ltype) (no strip, no shift/bool rules) → compound acc fails.
+- `digOneRef` defined at line 32 (ok).
+
+Let me also check `digOneRef` definition:
+```cpp
+static semType* digOneRef(semType* type) {...}
+```
+Probably fine.
+
+So the review should focus on remaining bugs:
+1. deref still only handles `*&x`; must infer operand type.
+2. break tail unit check wrong.
+3. binary: only assignments handled; all other operators missing; compound wrong rules.
+4. `digOneRef` computed but unused for compound; use it.
+5. `ltype`/`rtype` computed at top for every binary, including `=`, then recomputed — double inference/errors; move into branches.
+6. Also non-compound operator implementation guidance with correct rules, including ref layer, bool ops, shifts rhs, comparisons.
+
+Let me detail the operator rules:
+
+For arithmetic/bitwise (`+ - * / % & | ^`):
+- `lt = infer(lhs)`, `rt = digOneRef(infer(rhs))`.
+- Both must be integer (bool allowed only for `& | ^`).
+- Must be same type (`typeEqual(lt, rt)`).
+- Return lt.
+- Note comparisons should strip refs too (both sides, requiring mut matching? Phase 4 for ref comparisons; tests now use ints/bools).
+- `bool` arithmetic (+ - * / % & | ^? bitwise &|^ allowed on bool; + - not).
+- Actually `& | ^` on bool are allowed in Rust (BitAnd etc.). The boolean-and-short-circuit acc test uses `(mark(9,false) & mark(10,true)) as i32` → bool bitand. So yes: `& | ^` accept bool as well as integer, both sides same.
+- For shifts: `lt = infer(lhs)` must be integer (not bool); `rt = digOneRef(infer(rhs))` must be integer; result lt; types needn't match.
+- Comparisons (`< <= > >=`): both sides same type, integer or bool (refs with matching mut in Phase 4); result bool.
+- Equality (`== !=`): exact same type (typeEqual, no strip; cross-type is UB); result bool. Also capability PartialEq later (Phase 6).
+- Logical (`&& ||`): both bool; result bool.
+
+For compound:
+- lhs must be mutable place; lt = infer(lhs).
+- `+= -= *= /= %=`: lt integer; rt (dig one ref) = lt.
+- `&= |= ^=`: lt integer or bool; rt = lt.
+- `<<= >>=`: lt integer; rt integer (any).
+- rhs not via expect (because of ref layer); compare types directly. Note: if rhs is a literal like `x += 1` where lt=i32 → infer(1)=i32 fine; `x += 1u32` → rt=u32 ≠ lt → error (matches rej test).
+- For `x -= &2`: digOneRef(REF i32) = i32 = lt. Good.
+
+Also `=` should not strip rhs; keep expect.
+
+Unary good now.
+
+If: fine for Phase 2, though expected propagation later. Note: if with else returns rhs; then must equal rhs (they check). `if c {1} else {2}` both i32 → returns i32. Fine.
+
+While: body unit; fine.
+
+Loop: body unit; returns unit. But `break 42` inside → break branch currently errors! Fix break branch to just `if (tail) infer(tail); return never;`.
+
+Return: fine.
+
+Deref fix:
+```cpp
+if (auto der = dynamic_cast<derefExpr*>(expr); der) {
+    semType* t = infer(der->operand_);
+    if (t->kind_ == REF) return t->elem_;
+    if (t->kind_ == BOX) return t->elem_;   // Phase 5; but deref Box in expression is Phase 4? tests use *lone[0] (Box) in arrays; that's Phase 5
+    error(...); return makeError();
+}
+```
+For Phase 2 names-and-shadowing `*r` where r: &i32 → REF → elem. Good.
+
+Also `infer` for `refExpr` operand being literal: makeRef(i32). Good.
+
+Also check `checkBlock` with return-valued functions: `fn mark(n: i32, v: bool) -> bool { println_i32(n); v }` has tail v → expect tail bool → fine.
+
+`fn main() { ... return; }` fine.
+
+Note: `currentRet_` not null during checkFunction.
+
+Also potential error: binary branch computes `ltype`/`rtype` before checking op; for `=` with lhs non-place (e.g., `1 = 2`), it infers lhs (intLit) fine; then errors. Fine. But for `a = b` where b undefined: rtype infer errors AND expect(rhs, lhs) infers again → duplicate error messages. Minor; move the pre-computation into branches.
+
+Now, should I count lines / write the fix? The user says "你再看看" — review. Last time they asked me to fix after review. I'll provide review with concrete code suggestions. Since they've been ping-ponging, maybe offer to apply. But stay review-focused. The response should be concise: list remaining bugs and the exact operator rules.
+
+Also note current status: 15/35 (was 13/35), still below the 23 before; because implementation incomplete. Not a problem.
+
+Let me write.
+
+这版修好了 unary/if/loop/return，但还有四个问题卡着：
+
+**1. `derefExpr` 还是错的**：
+
+```cpp
+if (auto ref = dynamic_cast<refExpr*>(der->operand_); ref)   // 只认 *&x 这种语法形状
+```
+
+`*p` 里 `der->operand_` 是 `pathExpr`，永远 cast 不成 refExpr → 直接报 "deref non-reference"。正确做法是**看操作数的类型**：
+
+```cpp
+semType* t = infer(der->operand_);
+if (t->kind_ == semType::kTypeKind::REF) return t->elem_;
+// Box<T> 的解引用 Phase 5 再补
+error("attempted to deref a non-reference type");
+return semantic::makeError();
+```
+
+`names-and-shadowing` 的 acc 正例就是被这个打挂的。
+
+**2. `break` 分支把"带值的 break"当错了**：
+
+```cpp
+semType* tail = infer(bre->tail_);
+if (!typeEqual(tail, unit)) error("breakExpr tail is not unit");
+```
+
+`break 42;` 是合法的（loop 的 break 值可以先不管类型，Phase 3 做 LUB）。现在应该是：
+
+```cpp
+if (bre->tail_) infer(bre->tail_);   // 只查里面的名字/类型错误
+return semantic::makeNever();
+```
+
+**3. 普通二元运算符还是没写**——`binary` 分支处理完 `=` 和复合赋值就掉到 `makeError`。正例 `(a + b) as i32`、`(a < b) as i32`、`(!a) as i32` 全失败，因为内层是 ERROR，cast 报 "neither int nor bool"。需要补：
+
+| 运算符 | 规则 |
+|---|---|
+| `+ - * / %` | 两边同一整数类型（rhs 先 `digOneRef`）；结果同类型 |
+| `& \| ^` | 同上，但**也允许 bool**（正例 `true & false`） |
+| `<< >>` | lhs 整数；rhs `digOneRef` 后任意整数（不需要同类型）；结果 lhs 类型 |
+| `< <= > >=` | 两边同类型（整数或 bool），rhs `digOneRef`；结果 bool |
+| `== !=` | `typeEqual(infer(lhs), infer(rhs))`（**不剥引用**）；结果 bool |
+| `&& \|\|` | 两边都是 bool；结果 bool |
+
+**4. 复合赋值的规则还是不对**：你在顶部算了 `rtype = digOneRef(infer(rhs))`，但复合分支里又用了 `expect(rhs, ltype)`（没剥引用）。而且没区分三类：
+
+```cpp
+semType* lt = infer(lhs);
+if (!isMutablePlaceable(lhs)) { error(...); return unit; }
+
+if (op == "+=" || op == "-=" || op == "*=" || op == "/=" || op == "%=") {
+    if (!isIntegerType(lt)) { error(...); return unit; }
+    if (!typeEqual(lt, digOneRef(infer(rhs)))) { error(...); return unit; }
+}
+else if (op == "&=" || op == "|=" || op == "^=") {
+    if (!isIntegerType(lt) && !isBoolType(lt)) { error(...); return unit; }
+    if (!typeEqual(lt, digOneRef(infer(rhs)))) { error(...); return unit; }
+}
+else { // <<= >>=
+    if (!isIntegerType(lt)) { error(...); return unit; }
+    if (!isIntegerType(digOneRef(infer(rhs)))) { error(...); return unit; }
+}
+return makeUnit();
+```
+
+这样 `x -= &2`（剥一层 → i32）、`x <<= &2u32`（rhs 任意整数）、`b &= &false`（bool）都能过。
+
+另一个小点：`binary` 开头无条件算了 `ltype`/`rtype`，`=` 分支里又 `infer(lhs)` 一次；把计算挪进各分支，避免重复推断和重复报错（比如 lhs 未定义会报两遍）。
+
+当前六个 suite 是 **15 passed / 20 failed**；把 1、2 修掉、3、4 补齐，应该能到 35/35。
+
+---
+
+## User
+
+现在呢？
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 18.2s)
+
+_Thinking:_
+
+The user asks "现在呢?" — review the current state after their latest edits. Let me read the infer function and run the suites again. I need to see the current code. Let me read the binary branch and deref/break, then build/test.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && sed -n '/if (auto der = dynamic_cast<derefExpr\\*>(expr)/,/^    }/p' compiler/src/semantic/checker.cpp; echo ===; sed -n '/if (auto bre = dynamic_cast<breakExpr\\*>(expr)/,/^    }/p' compiler/src/semantic/checker.cpp; echo ===; sed -n '/if (auto bin = dynamic_cast<binaryExpr\\*>(expr)/,/^    }/p' compiler/src/semantic/checker.cpp"
+}
+```
+
+**Output:**
+```
+    if (auto der = dynamic_cast<derefExpr*>(expr); der) {
+        semType* t = infer(der->operand_);
+        if (t->kind_ == semType::kTypeKind::REF) {
+            return t->elem_;
+        }
+        else {
+            error("attempted to deref a non-reference type");
+            return semantic::makeError();
+        }
+    }
+===
+    if (auto bre = dynamic_cast<breakExpr*>(expr); bre) {
+        if (bre->tail_) {
+            infer(bre->tail_);
+        }
+        return semantic::makeNever();
+    }
+===
+    if (auto bin = dynamic_cast<binaryExpr*>(expr); bin) {
+        auto lhs = bin->lhs_, rhs = bin->rhs_;
+        std::string op = bin->op_;
+        if (op == "=") {
+            if (!isMutablePlaceable(lhs)) {
+                error("assignment lhs is not a mutable lvalue");
+                return semantic::makeError();
+            }
+            expect(rhs, infer(lhs));
+            return semantic::makeUnit();
+        }
+        auto inside = [&](std::string str, std::vector<std::string> all) {
+            for (auto now : all) {
+                if (now == str){
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (inside(op, {"+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", "<", "<=", ">", ">=", "==", "!=", "&&", "||"})) {
+            semType* ltype = infer(lhs);
+            if (inside(op, {"+", "-", "*", "/", "%"})) {
+                if (!isIntegerType(ltype)) {
+                    error("arith lhs is not an integer type");
+                    return semantic::makeError();
+                }
+                if (!semantic::typeEqual(ltype, digOneRef(infer(rhs)))) {
+                    error("arith lhs and rhs have different types");
+                    return semantic::makeError();
+                }
+                return ltype;
+            }
+            if (inside(op, {"&", "|", "^"})) {
+                if (!isIntegerType(ltype) && !isBoolType(ltype)) {
+                    error("bitwise lhs is neither an integer nor a boolean type");
+                    return semantic::makeError();
+                }
+                if (!semantic::typeEqual(ltype, digOneRef(infer(rhs)))) {
+                    error("bitwise lhs and rhs have different types");
+                    return semantic::makeError();
+                }
+                return semantic::makeUnit();
+            }
+            if (inside(op, {"<<", ">>"})) {
+                if (!isIntegerType(ltype) && !isBoolType(ltype)) {
+                    error("shift lhs is neither an integer nor a boolean type");
+                    return semantic::makeError();
+                }
+                if (!isIntegerType(digOneRef(infer(rhs)))) {
+                    error("shift lhs and rhs have different types");
+                    return semantic::makeError();
+                }
+                return ltype;
+            }
+            if (inside(op, {"<", "<=", ">", ">="})) {
+                if (!semantic::typeEqual(ltype, digOneRef(infer(rhs)))) {
+                    error("comparison lhs and rhs have different types");
+                    return semantic::makeError();
+                }
+                if (!isIntegerType(ltype) && !isBoolType(ltype)) {
+                    error("arithequal lhs is neither an integer nor a boolean type");
+                    return semantic::makeError();
+                }
+                return semantic::makeBuiltin("bool");
+            }
+            if (inside(op, {"==", "!="})) {
+                if (!semantic::typeEqual(ltype, infer(rhs))) {
+                    error("(not)equal lhs and rhs have different types");
+                    return semantic::makeError();
+                }
+                return semantic::makeBuiltin("bool");
+            }
+            if (inside(op, {"&&", "||"})) {
+                if (!semantic::typeEqual(ltype, infer(rhs))) {
+                    error("and/or lhs and rhs have different types");
+                    return semantic::makeError();
+                }
+                if (!isBoolType(ltype)) {
+                    error("and/or lhs is not a boolean type");
+                    return semantic::makeError();
+                }
+                return semantic::makeBuiltin("bool");
+            }
+        }
+        if (inside(op, {"+=", "-=", "*=", "/=", "%=", "<<=", ">>=", "&=", "|=", "^="})) {
+            if (!isMutablePlaceable(lhs)) {
+                error("compound lhs is not a mutable lvalue");
+                return semantic::makeError();
+            }
+            semType* ltype = infer(lhs);
+            if (inside(op, {"+=", "-=", "*=", "/=", "%="})) {
+                if (!isIntegerType(ltype)) {
+                    error("arithequal lhs is not an integer type");
+                    return semantic::makeError();
+                }
+                if (!semantic::typeEqual(ltype, digOneRef(infer(rhs)))) {
+                    error("arithequal lhs and rhs have different types");
+                    return semantic::makeError();
+                }
+                return semantic::makeUnit();
+            }
+            if (inside(op, {"&=", "|=", "^="})) {
+                if (!isIntegerType(ltype) && !isBoolType(ltype)) {
+                    error("bitwiseequal lhs is neither an integer nor a boolean type");
+                    return semantic::makeError();
+                }
+                if (!semantic::typeEqual(ltype, digOneRef(infer(rhs)))) {
+                    error("bitwiseequal lhs and rhs have different types");
+                    return semantic::makeError();
+                }
+                return semantic::makeUnit();
+            }
+            if (inside(op, {"<<=", ">>="})) {
+                if (!isIntegerType(ltype) && !isBoolType(ltype)) {
+                    error("shiftequal lhs is neither an integer nor a boolean type");
+                    return semantic::makeError();
+                }
+                if (!isIntegerType(digOneRef(infer(rhs)))) {
+                    error("shiftequal lhs and rhs have different types");
+                    return semantic::makeError();
+                }
+                return semantic::makeUnit();
+            }
+        }
+    }
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 45.9s)
+
+_Thinking:_
+
+Review of the current implementation:
+
+Issues:
+1. **Bitwise `& | ^` returns `makeUnit()` instead of `ltype`!** Line in bitwise branch: `return semantic::makeUnit();`. That's wrong: `(true & false) as i32` → inner infer returns unit → cast errors? Actually cast: ltype = unit → not int/bool → error "castExpr lhs is neither int nor bool" → false reject positives. Must return ltype.
+
+2. **Shift lhs check allows bool**: `if (!isIntegerType(ltype) && !isBoolType(ltype))` for `<< >>` — shifts require integer lhs; bool should be rejected. Should be `!isIntegerType(ltype)`. The negative test `rej-shift-left-operand-must-be-integer` uses `false >> 1i32`; with bool allowed, no error at lhs; then rhs integer check passes → returns bool type → test expected exit 1, but exits 0 → fail. Fix: lhs integer only.
+   Also compound `<<= >>=` lhs check allows bool similarly → fix.
+
+3. **Comparison `< <= > >=` check order**: they compare `typeEqual(ltype, digOneRef(infer(rhs)))` before checking lhs is int/bool; for `1 < true` types differ → error anyway. Fine. But comparisons on bool are allowed? Spec: "两边同为整数/bool（各层 mut 匹配的引用也行）→ bool". Yes bool comparisons allowed (tests use `false < true`). Good.
+
+4. `== !=`: they don't check capability (Phase 6), fine.
+
+5. `&& ||`: they first typeEqual(ltype, rhs) then bool; for `1 && true` typeEqual int vs bool false → error "different types" — fine (still rejects).
+   - For `&true && true`: lhs infer = REF(bool), rhs bool; typeEqual false → error → good (test passes).
+   - For `1 && true`: error. Good.
+
+6. **Arithmetic/bitwise bool**: `& | ^` allow bool; correct.
+
+7. **Compound arithmetic**: fine.
+   - Compound bitwise: fine.
+   - Compound shifts: lhs check allows bool (wrong) and rhs check `isIntegerType(digOneRef(...))`; fix lhs to integer only.
+   - But note: **compound right operands**: `<<=`'s rhs can be any integer; okay.
+
+8. **Return in bitwise branch** wrong as noted.
+
+9. `rej-booleans-are-not-arithmetic-integers`: `true + false` → ltype bool; isIntegerType false → error. good.
+
+10. `rej-explicitly-different-arithmetic-operand-types`: `1i32 + 2u32` → types differ → error. good. But what about unsuffixed literal: `x + 1` where x u32 → infer(1) = i32 (no expected) → mismatch error, but valid program? In Rust/Rx, `let y: u32 = x + 1;` — expected doesn't penetrate binary (UB per spec). But `x + 1u32` fine. Tests may use `x + 1` where x i32 → i32 fine. OK.
+
+11. `ltype` for equality `==`: they don't strip refs; spec cross-type equality UB; fine. But Phase 4 scalar-reference-operators tests compare refs to refs; typeEqual handles REF compare. fine.
+
+12. **`if` returns `rhs` (else type) after infer then; good stand-in. But then `infer(fi->then_)` error can be ignored? fine.**
+
+13. **`checkBlock` divergence** still an issue for functions ending with return; Phase 3.
+
+14. **`digOneRef` definition** at line 32; fine.
+
+15. `unaryExpr` fixed.
+
+16. `deref` fixed for REF; Box later.
+
+17. `break` fixed.
+
+Let me build and run the Phase 2 suites to see current status. But I see the bitwise return unit bug will cause failures on `(true & false) as i32` and `acc-all-...` bitwise casts. Also shift bool lhs allows false negative. Let me run.
+
+Also check: `rej-lazy-operators-have-no-reference-variants`: `&true && true` → `&&` branch: ltype REF(bool), typeEqual(REF,bool) false → error good.
+
+Also `rej-no-integer-truthiness`: `if 1 {}` → expect(cond, bool): infer 1 → i32; typeEqual i32,bool false → error. good.
+
+`rej-bitwise-operand-types-must-match`: e.g. `1i32 & 1u32` → error. good.
+
+So remaining failures likely: bitwise return unit affects positives; shift bool; also `acc-all-...-comparisons` use `(!a) as i32`: unary `!` on i32 returns i32; cast to i32 fine.
+
+Let me run and see.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && cmake --build target/build -j 2>&1 | grep -E \"error|warning|Built target\" | head -3 && make test FILTER=official:semantic:names-and-shadowing,official:semantic:casts-and-literals,official:semantic:integer-arithmetic,official:semantic:shifts,official:semantic:compound-assignment,official:semantic:boolean-and-short-circuit STAGE=semantic 2>&1 | grep -E \"^\\s*[0-9]+\\)|passed|failed\" | head -25",
+  "timeout": 300000
+}
+```
+
+**Output:**
+```
+[100%] Built target rxcc
+. passed  F failed
+1) official:semantic:boolean-and-short-circuit/acc-observable-evaluation-of-each-logical-form.rx@semantic
+2) official:semantic:integer-arithmetic/acc-all-integer-arithmetic-bit-operations-and-comparisons-on-i32.rx@semantic
+3) official:semantic:integer-arithmetic/acc-all-integer-arithmetic-bit-operations-and-comparisons-on-u32.rx@semantic
+4) official:semantic:integer-arithmetic/acc-all-integer-arithmetic-bit-operations-and-comparisons-on-isize.rx@semantic
+5) official:semantic:integer-arithmetic/acc-all-integer-arithmetic-bit-operations-and-comparisons-on-usize.rx@semantic
+6) official:semantic:shifts/rej-shift-left-operand-must-be-integer.rx@semantic
+======================== 6 failed, 29 passed in 22.34s =========================
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 16.1s)
+
+_Thinking:_
+
+29 passed / 6 failed. The 6 failures are exactly:
+
+1. `boolean-and-short-circuit/acc-observable-evaluation-of-each-logical-form` — uses `(mark(9,false) & mark(10,true)) as i32` and `(true ^ false) as i32` → bitwise returns unit (bug #1) → cast error.
+2-5. Four `integer-arithmetic/acc-all-...` positives — use `(a & b) as i32`, `(a | b) as i32`, `(a ^ b) as i32` → same bitwise return unit bug.
+6. `shifts/rej-shift-left-operand-must-be-integer` — `false >> 1i32`; shift lhs allows bool (bug #2) → not rejected.
+
+So exactly the two bugs I spotted. Fix:
+- bitwise `& | ^` branch: `return ltype;` instead of `makeUnit()`.
+- shift `<< >>` lhs: require `isIntegerType(ltype)` only (not bool). Same for compound `<<= >>=` lhs.
+
+Everything else passes. After these two fixes, the six suites should be 35/35, completing Phase 2.
+
+Let me report concisely: only 2 bugs left, exact lines, then Phase 2 done. Maybe apply? The user asked "现在呢?" — review. I'll tell them the two fixes; they can apply quickly. Or should I just fix them? They've been asking me to review each round; these are tiny. The pattern: they ask "现在呢?" meaning "how is it now". I'll report the two issues precisely. Given the user's AI-rule concern, these are tiny. But maybe they prefer to fix. I'll state the fix clearly. Could also offer: "改完这两处就 35/35". Since they're trivial, maybe I should just edit them myself? The user asked "现在呢?" not "改改". I'll report; they can do it in seconds.
+
+Also note: after these, Phase 2 is done; next Phase 3 begins with expected/LUB/never. Summarize.
+
+Let me write the short answer.
+
+只剩 **2 个 bug、对应 6 个失败**，都在这两处：
+
+**1. 位运算 `& | ^` 返回错了类型**（5 个正例挂在这）：
+
+```cpp
+if (inside(op, {"&", "|", "^"})) {
+    ...
+    return semantic::makeUnit();   // ← 应该是 ltype
+}
+```
+
+`(true & false) as i32`、`(a & b) as i32` 内层变成 unit，cast 就报 "neither int nor bool"。改成 `return ltype;`。
+
+**2. `<< >>` 的 lhs 不允许 bool**（`rej-shift-left-operand-must-be-integer` 挂在这）：
+
+```cpp
+if (inside(op, {"<<", ">>"})) {
+    if (!isIntegerType(ltype) && !isBoolType(ltype)) {   // ← 去掉 !isBoolType(ltype)
+```
+
+复合赋值里的 `<<= >>=` 同样要从 `!isIntegerType(lt) && !isBoolType(lt)` 改成只判 `!isIntegerType(lt)`。位运算 `& | ^` 那边保留 bool 是对的（bool 支持位与/或/异或）。
+
+当前 **29 passed / 6 failed**，改完这两行应该就是 **35/35，Phase 2 完成**。然后进 Phase 3：`expect` 的完整穿透（if 分支、loop break、return）、`lub()`（if/数组/break 合并，忽略 never）、never 与不可达（含"块最后一条是 return/break/continue → 块类型 never"，解决 `fn f() -> i32 { return 1; }` 的误报）。
+
+---
+
+## User
+
+改完了，你看看。顺便，计算一下我这个 stage 写了多少行，再估算一下后面每个 stage 的行数。
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 18.9s)
+
+_Thinking:_
+
+The user says they fixed the two bugs. They ask me to review ("你看看"), and to compute how many lines they wrote in "this stage" (Phase 2), then estimate the lines for each remaining stage.
+
+I need to:
+1. Read/verify the two fixes (bitwise return ltype; shifts lhs integer only incl. compound).
+2. Build and run the Phase 2 suites to confirm 35/35.
+3. Count lines they wrote in Phase 2. How? Git diff since the last commit? Let me check git status/log. The last commit was fe27cd0 (CI). All semantic work since then is uncommitted, including collect + Phase 2. To count *Phase 2* specifically, I'd need a baseline — maybe I can compute the size of the check-phase code (from lookupValue/infer onward) vs collect. Or maybe they committed after collect? Let me check git log/status. If not committed, I can estimate Phase 2 by counting the added functions since collect: lookupValue, infer, checkItem/checkFunction/checkBlock/checkStatement, isPlaceable/isMutablePlaceable, expect, builtins registration, plus header declarations. I can count the line ranges in checker.cpp. Let me find where Phase 2 code starts (lookupValue probably after evaluateTypes) and count non-blank lines from there to end, minus error/checkCrate (which existed). Better: use git show fe27cd0:checker.cpp to diff? That commit predates the entirety of semantic (maybe checker was a stub). Let me check git show fe27cd0:compiler/src/semantic/checker.cpp size. Actually commit 628dd26 "upd: set the basis for semantic check" might have collect. Then fe27cd0 CI builder. The uncommitted diff includes all their recent semantic work + my edits, so not separable by stage easily.
+
+Practical approach: count the Phase-2-specific functions in current checker.cpp by line ranges:
+- static helpers digOneRef (and maybe intSuffix etc. are collect)
+- lookupValue, infer, expect, checkItem, checkFunction, checkBlock, checkStatement, isPlaceable, isMutablePlaceable; builtin registration lines.
+I can count non-blank lines of these functions from the file. Let me use a script: locate function definitions by name and count lines until closing brace (hard with nested braces). Simpler: Phase 2 code starts at `semType* Checker::lookupValue` (line ~700?) or actually isPlaceable/infer etc. are before/after? Let me grep line numbers of the check-phase functions, and count from the earliest (isPlaceable maybe) to end of file, excluding error/checkCrate maybe (small). Let me get line numbers.
+
+Actually from earlier greps: isPlaceable at 522? That was an older read. Current file is ~800+ lines. Let me grep current line numbers for all these functions and count.
+
+Then estimate per-stage line counts. I earlier estimated Phase 3 150-250, Phase 4 300-450, Phase 5 500-750, Phase 6 200-300. Now with actual Phase 2 size, I can calibrate. Let me count Phase 2: likely ~300-400 lines (non-blank maybe 260-330). Use that as calibration: Phase 3 similar or a bit less; Phase 4 ~1.2x; Phase 5 ~1.5-2x; Phase 6 ~0.5-0.7x.
+
+Let me first verify fixes and run tests, then count lines.
+
+Commands:
+1. grep the two spots.
+2. build + run six suites.
+3. Count lines: grep -n function starts; compute ranges. Let me look at the file layout: static helpers at top (intSuffix, isIntegerType, etc., digOneRef ~line 32), collect stuff, then lookupValue, infer, expect, checkItem, checkFunction, checkBlock, checkStatement, error, checkCrate. Also isPlaceable/isMutablePlaceable. Let me grep line numbers.
+
+Then estimate "stage" lines: Maybe the user means "this stage" = Phase 2 (the check phase basic). I'll compute the total non-blank lines of the Phase-2 functions and report e.g. "Phase 2 约 XXX 行（非空）". Also perhaps report total checker.cpp now.
+
+Let me run.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && sed -n '/inside(op, {\"&\", \"|\", \"^\"})/,/^            }/p' compiler/src/semantic/checker.cpp | head -18; echo ===; grep -n \"inside(op, {\\\"<<\\\", \\\">>\\\"})\\|inside(op, {\\\"<<=\\\", \\\">>=\\\"})\\|return semantic::makeUnit();\\|return ltype;\" compiler/src/semantic/checker.cpp | sed -n '1,40p'"
+}
+```
+
+**Output:**
+```
+            if (inside(op, {"&", "|", "^"})) {
+                if (!isIntegerType(ltype) && !isBoolType(ltype)) {
+                    error("bitwise lhs is neither an integer nor a boolean type");
+                    return semantic::makeError();
+                }
+                if (!semantic::typeEqual(ltype, digOneRef(infer(rhs)))) {
+                    error("bitwise lhs and rhs have different types");
+                    return semantic::makeError();
+                }
+                return ltype;
+            }
+===
+304:        return semantic::makeUnit();
+574:        return semantic::makeUnit();
+679:            return semantic::makeUnit();
+688:        return semantic::makeUnit();
+695:        return semantic::makeUnit();
+747:            return semantic::makeUnit();
+768:                return ltype;
+779:                return ltype;
+781:            if (inside(op, {"<<", ">>"})) {
+790:                return ltype;
+837:                return semantic::makeUnit();
+848:                return semantic::makeUnit();
+850:            if (inside(op, {"<<=", ">>="})) {
+859:                return semantic::makeUnit();
+
+```
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && grep -n \"Checker::lookupValue\\|Checker::infer\\|Checker::expect\\|Checker::checkItem\\|Checker::checkFunction\\|Checker::checkBlock\\|Checker::checkStatement\\|Checker::isPlaceable\\|Checker::isMutablePlaceable\\|Checker::error\\|Checker::checkCrate\\|^static semType\\* digOneRef\\|table_.funcSig\\[\\\"get_i32\\\"\\]\" compiler/src/semantic/checker.cpp; wc -l compiler/src/semantic/checker.cpp; grep -cv '^\\s*$' compiler/src/semantic/checker.cpp"
+}
+```
+
+**Output:**
+```
+32:static semType* digOneRef(semType* type) {
+358:    table_.funcSig["get_i32"].retType_ = semantic::makeBuiltin("i32");
+517:semType* Checker::lookupValue(std::string name) { // I think the spec said that using function as a value is an UB?
+529:bool Checker::isPlaceable(Expr* expr) {
+545:bool Checker::isMutablePlaceable(Expr* expr) {
+565:semType* Checker::infer(Expr* expr) {
+866:semType* Checker::expect(Expr* expr, semType* wish) {
+901:void Checker::checkItem(Item* item){
+917:void Checker::checkFunction(funcItem* func, const std::string& owner) {
+932:semType* Checker::checkBlock(blockExpr* block, semType* wish) {
+947:void Checker::checkStatement(Stmt* stmt) {
+959:void Checker::error(std::string message) {
+965:void Checker::checkCrate(Crate* crate) {
+982 compiler/src/semantic/checker.cpp
+956
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 41.7s)
+
+_Thinking:_
+
+Fixes look right: bitwise returns ltype; shifts branch? Let me check line 781-790 region to confirm the shift lhs check no longer includes bool. The grep didn't show the condition. Let me read lines 781-800 and 850-860. Also build/test.
+
+Then count Phase 2 lines: Phase-2 code from lookupValue (517) to checkStatement end (~957), excluding error (959-963) and checkCrate (965-982) which existed before. But builtin registration at 358 is part of phase 2. Plus header declarations added. Also digOneRef at 32. So phase-2 lines:
+- 356-362 builtins (~7 lines)
+- 32-36 digOneRef (~5)
+- 517-957 (lookupValue through checkStatement) = 441 lines raw, minus blank lines. Let me compute non-blank in that range.
+- checker.h additions: isPlaceable/isMutablePlaceable/lookupValue/expect/checkBlock/checkStatement/checkFunction/checkItem ~9 lines.
+So total ~380-420 non-blank? Let me compute precisely with awk/sed. I'll count non-blank lines in 517-957 plus digOneRef and builtins and header delta (header we know: previously had collect/evaluate* only; new decls ~8 lines).
+
+Let me compute with python or awk (bash discouraged but fine for counting). Use `sed -n '517,957p' file | grep -cv '^\s*$'`.
+
+Then estimate remaining stages. Let me calibrate:
+Phase 2 ≈ N lines. Phase 3 ≈ 0.5–0.7×N (LUB/expected/never); Phase 4 ≈ 1.0–1.3×N (places/coercions); Phase 5 ≈ 1.5–2×N (aggregates/methods/builtins); Phase 6 ≈ 0.5–0.7×N. I'll compute numbers based on actual N.
+
+Let me also check the shift condition.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && sed -n '781,800p;850,861p' compiler/src/semantic/checker.cpp; echo ===; cmake --build target/build -j 2>&1 | grep -E \"error|warning|Built target\" | head -3 && make test FILTER=official:semantic:names-and-shadowing,official:semantic:casts-and-literals,official:semantic:integer-arithmetic,official:semantic:shifts,official:semantic:compound-assignment,official:semantic:boolean-and-short-circuit STAGE=semantic 2>&1 | tail -3",
+  "timeout": 300000
+}
+```
+
+**Output:**
+```
+            if (inside(op, {"<<", ">>"})) {
+                if (!isIntegerType(ltype)) {
+                    error("shift lhs is neither an integer nor a boolean type");
+                    return semantic::makeError();
+                }
+                if (!isIntegerType(digOneRef(infer(rhs)))) {
+                    error("shift lhs and rhs have different types");
+                    return semantic::makeError();
+                }
+                return ltype;
+            }
+            if (inside(op, {"<", "<=", ">", ">="})) {
+                if (!semantic::typeEqual(ltype, digOneRef(infer(rhs)))) {
+                    error("comparison lhs and rhs have different types");
+                    return semantic::makeError();
+                }
+                if (!isIntegerType(ltype) && !isBoolType(ltype)) {
+                    error("arithequal lhs is neither an integer nor a boolean type");
+                    return semantic::makeError();
+                }
+            if (inside(op, {"<<=", ">>="})) {
+                if (!isIntegerType(ltype)) {
+                    error("shiftequal lhs is not an integer type");
+                    return semantic::makeError();
+                }
+                if (!isIntegerType(digOneRef(infer(rhs)))) {
+                    error("shiftequal lhs and rhs have different types");
+                    return semantic::makeError();
+                }
+                return semantic::makeUnit();
+            }
+        }
+===
+[100%] Built target rxcc
+official:semantic:shifts@semantic .......                                 [100%]
+
+============================= 35 passed in 22.44s ==============================
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 15.1s)
+
+_Thinking:_
+
+35 passed / 0 failed — Phase 2 complete! The fixes are correct.
+
+Now count Phase 2 lines. Let me compute:
+- Phase-2 functions in checker.cpp: lookupValue (517) through checkStatement end (~957). Let me get exact end line of checkStatement. Then non-blank count in 517..end-of-checkStatement.
+- digOneRef (32..~36)
+- builtins block (356..362)
+- header additions (isPlaceable, isMutablePlaceable, lookupValue, expect, checkFunction, checkBlock, checkStatement already existed? checkItem/checkBlock/checkStatement/isPlaceable/isMutablePlaceable/lookupValue/infer/expect/checkFunction were added in Phase 2; checkItem existed at phase 0? They added phase 0 skeleton: checkItem/checkFunction/checkBlock/checkStatement declarations. Phase 2 added lookupValue/isPlaceable/isMutablePlaceable/expect/infer declarations maybe. Hard to separate; approximate.
+
+Let me compute non-blank lines for 517-957 (or where checkStatement ends). Check line numbers: checkStatement starts 947; its end maybe ~957. Let me find the closing before `void Checker::error` at 959: so checkStatement ends at 957. So range 517-957 inclusive.
+
+Also include 32-36 (digOneRef) and builtins 356-362 (but builtins registration might be lines 358-362). Let me count those ranges non-blank.
+
+Then report phase-2 size ≈ sum. Let me compute via awk: `sed -n '517,957p' | grep -cv '^\s*$'` etc. Let me get exact ranges:
+- digOneRef: 32 to ? Read lines 32-36.
+- builtins: 357-362 maybe.
+- Phase-2 block: 517-957.
+
+Let me run counts. Then estimate remaining stages based on this calibration.
+
+Phase 2 actual ~ maybe 350-400 non-blank. Then estimates:
+- Phase 3: 150-250 (LUB+expected+never) → ~0.5x
+- Phase 4: 300-450 → ~1.0x
+- Phase 5: 500-750 → ~1.5-1.8x
+- Phase 6: 200-300 → ~0.6-0.8x
+Total remaining ~1150-1750 lines.
+
+Let me compute exact counts.
+
+35/35，Phase 2 完成。算一下行数：
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic\" && echo \"digOneRef(32-36): $(sed -n '32,36p' checker.cpp | grep -cv '^\\s*$')\"; echo \"builtins(357-362): $(sed -n '357,362p' checker.cpp | grep -cv '^\\s*$')\"; echo \"phase2 core(517-957): $(sed -n '517,957p' checker.cpp | grep -cv '^\\s*$')\"; echo \"header additions: $(grep -c 'checkItem\\|checkFunction\\|checkBlock\\|checkStatement\\|isPlaceable\\|isMutablePlaceable\\|lookupValue\\|semType\\* infer\\|semType\\* expect' checker.h)\"; echo \"file total: $(wc -l < checker.cpp) lines, $(grep -cv '^\\s*$' checker.cpp) non-blank\""
+}
+```
+
+**Output:**
+```
+digOneRef(32-36): 5
+builtins(357-362): 6
+phase2 core(517-957): 433
+header additions: 10
+file total: 982 lines, 956 non-blank
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 16.9s)
+
+_Thinking:_
+
+Phase 2 count:
+- digOneRef 5
+- builtins 6
+- core 433 (lookupValue + isPlaceable/isMutablePlaceable + infer + expect + checkItem/checkFunction/checkBlock/checkStatement)
+- header ~10
+Total ≈ 454 lines (non-blank). Note some of those functions were written in "step 0" (checkItem/checkFunction/checkBlock/checkStatement skeleton) — included. So Phase 2 ≈ 450 lines spread over a couple of sessions. That's a useful calibration: my earlier estimate was 350-500, spot on.
+
+Now estimate remaining stages based on calibration:
+- Phase 3 (expected/LUB/never): ~150-250 → call it 200 (≈0.45×)
+- Phase 4 (refs/mutability/coercion): ~300-450 → ~380 (≈0.85×)
+- Phase 5 (aggregates/methods/builtins): ~500-750 → ~600 (≈1.35×)
+- Phase 6 (derive/layout/entry): ~200-300 → ~250 (≈0.55×)
+Total remaining ≈ 1300-1750, midpoint ~1430.
+
+Final checker.cpp ≈ 982 + 1400 ≈ 2400 lines (with blanks), consistent with earlier estimate 2000-2700.
+
+Also mention that Phase 5 may be more if they implement method lookup naively with duplication; suggest helpers to keep down.
+
+Answer review: fixes are correct, 35/35. Also note the only remaining Phase 2 nit: error message "shift lhs is neither an integer nor a boolean type" now stale (it requires integer only) — cosmetic. And "arithequal" message reused for comparisons — cosmetic. Not worth changing.
+
+Maybe mention: there's a latent issue for later: `checkBlock` divergence (functions ending with return) — Phase 3; also `if` branch LUB. Fine.
+
+Now write the response:
+1. Review result: correct, 35/35.
+2. Line counts: Phase 2 ≈ 454 non-blank (core 433 + helpers + header). File now 982 lines (956 non-blank). Cumulative since collect? Maybe mention collect+eval was ~500 lines.
+3. Estimates for stages 3-6 with ranges and midpoint; total remaining ~1300-1800; final ~2300-2800 lines.
+4. Caution: Phase 5 biggest; helpers reduce.
+
+Let me present a table.
+
+修得对：位运算返回 `ltype`，`<< >>`/`<<= >>=` 的 lhs 只允许整数。六个 suite **35/35 全绿，Phase 2 完成**。
+
+**Phase 2 行数统计**（非空行）：
+
+| 部分 | 行数 |
+|---|---|
+| `digOneRef` + 内置函数注册 | 11 |
+| `lookupValue`、`isPlaceable`/`isMutablePlaceable` | ~60 |
+| `infer`（全部表达式分支） | ~300 |
+| `expect`、`checkBlock`、`checkStatement`、`checkFunction`、`checkItem` | ~75 |
+| checker.h 声明 | ~10 |
+| **Phase 2 合计** | **≈ 455 行** |
+
+当前 `checker.cpp`：**982 行**（956 非空），其中 collect + 常量求值约 500 行。
+
+**后续各 stage 估算**（用 Phase 2 的 455 行做标定）：
+
+| Stage | 内容 | 预估非空行 |
+|---|---|---|
+| Phase 3 | expected 穿透、`lub()`、never/不可达 | 180–250 |
+| Phase 4 | place/mutability 完整版、coercion、借用检查 | 320–450 |
+| Phase 5 | 字段/索引/数组/结构体、方法查找、Box/Vec 内建 | 500–700 |
+| Phase 6 | derive 能力表、递归布局、main 入口、impl 收尾 | 200–300 |
+| **剩余合计** | | **≈ 1200–1700** |
+
+最终 `checker.cpp` 大概 **2200–2700 行**。Phase 5 是最大头，写的时候把 `lookupField`、`findMethod`、`checkCall`、`coerceTo`、`lub` 抽成 helper，能省掉 200–300 行重复。
+
+接下来进 Phase 3。建议顺序：
+
+1. **先把 never 打通**：`checkBlock` 里"最后一条语句是 return/break/continue/loop → 块类型 never"，`typeEqual` 或比较处把 NEVER 当兼容——解决 `fn f() -> i32 { return 1; }`；
+2. **`lub(a, b)`**：忽略 NEVER，相等保持，否则能单向调整就换目标，否则报错；
+3. **`expect` 穿透**：if 两分支、loop 的所有 break 值、`return`；
+4. **if/loop 的结果类型**：有 else 的 if 用 expected 或 LUB；loop 收集 break 值做 LUB，无 break 值 → `()`。
+
+然后跑 `expected-types`、`blocks-if-and-never`、`loops-and-jumps`、`loop-state-merges`、`runtime-value-merges` 验收。
+
+---
+
+## User
+
+好的，我们进入 phase 3 吧，先给我简单讲讲我要做什么，以及顺序。
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 34.0s)
+
+_Thinking:_
+
+The user wants to start Phase 3. They ask for a simple explanation of what to do and in what order. I should give a concise, prioritized plan, building on the todo doc Phase 3: expected types, LUB, never, unreachable.
+
+Context of their current implementation:
+- `expect(expr, wish)`: handles null wish → infer; intLit expected; block passes wish to tail; else infer + typeEqual.
+- `infer(if)`: cond bool; if else present → infer then & else, require equal, return else type; no else → require then unit, return unit.
+- `infer(loop)`: body checked against unit, returns unit, doesn't collect break values.
+- `infer(break)`: infer tail, returns NEVER.
+- `infer(return)`: expect tail vs currentRet_, returns NEVER.
+- `checkBlock`: tail ? expect(tail, wish) : unit; then compares ret to wish (typeEqual), returns makeError on mismatch.
+- `typeEqual` treats kinds: NEVER not compatible with others (kinds differ → false), UNIT only with UNIT.
+- No unreachable tracking.
+
+Phase 3 tasks in order:
+
+1. **Never 打通**:
+   - Define helper `bool isNever(semType*)`.
+   - In type compatibility spots, treat NEVER as compatible with any expected (coercion). Where? `checkBlock`'s final compare, `expect`'s typeEqual fallback, LUB.
+   - `checkBlock`: if no tail but last statement is an expression whose type is NEVER (return/break/continue/loop), the block's type is NEVER. Need `checkStatement` to report the type of the last statement (currently void). Options: change `checkStatement` to return semType* (the type of the expression statement, or unit for let), then in checkBlock track `lastType`; if no tail and lastType is NEVER → result NEVER. Then compare against expected with never-compatible.
+   - Similarly a block with tail of type NEVER stays NEVER.
+   - `if` without else: then block type must be unit OR never (spec: loop bodies and if-without-else require unit results; but if the body diverges, `if c { return 1; }` is valid as a statement). Actually the requirement "if without else requires unit result" plus never compatibility means then block can be `!`. So check `typeEqual(then, unit) || isNever(then)`.
+   - `while` body: same: body type must be unit or never? Spec says loop bodies require unit results; but `while c { return 1; }` valid? In Rust yes (body diverges). Actually `while c { return 1; }` — the block has type `!`; while expects () but ! coerces. So allow NEVER.
+   - `loop` body: same (body can diverge: `loop { return 1; }`).
+   - Function body block: `fn f() -> i32 { return 1; }` → block no tail, last stmt return (NEVER) → block NEVER → compatible with i32.
+
+2. **Expected-type propagation (expect)**:
+   - `expect(ifExpr, wish)`:
+     - cond bool.
+     - if has else: both branches checked via expect(branch, wish) (then_ is block; else_ can be block or ifExpr). If wish null → infer both and LUB.
+     - if no else: then checked against unit (wish must be unit or null); result unit.
+   - `expect(loopExpr, wish)`: body checked; breaks' values checked against wish (or collected if wish null) → result wish or LUB of break types; no break values → unit.
+   - `expect(breakExpr, wish)`: break tail checked against the loop's expected type. This requires a **loop context stack**: `std::vector<semType*> loopExpected_` or a stack of break-type accumulators. Since break expressions are encountered deep inside body checking, the loop handler must push context before checking its body.
+   - `expect(returnExpr, ...)`: return tail already checked against currentRet_; fine (expected for return is the function return type, not the outer wish).
+   - `expect(blockExpr, wish)` already does.
+   - `expect(parenthesized?)` — parens not in AST (transparent).
+   - `expect` for literal: done.
+   - Non-propagating forms (binary, unary, borrow) fall back to infer+typeEqual; spec says propagation doesn't go through them (UB if needed).
+
+3. **LUB (`lub(Type*, Type*)`)**:
+   - Ignore NEVER: if one is NEVER return the other (and if both never → never).
+   - If typeEqual → same.
+   - Else Phase 3 minimal: if one can coerce to the other (only never for now; Phase 4 adds references/deref coercions) → use it; otherwise error (UB in tests except maybe arrays of refs in Phase 4; spec says no common target is UB, tests exclude).
+   - For Phase 3, implement with never only; Phase 4 extends with ref coercions (`&mut T` → `&T`).
+   - Use for: if with else without expected; array literal elements; loop break values.
+   - Source order, per spec.
+
+4. **Loop break collection**:
+   - Loop handler pushes a context: if expected type is given, all breaks expect that; else collect break types (in source order) and LUB them.
+   - Need nested loops handled (breaks target innermost loop; the AST has no labels, so a stack works).
+   - `break` with no tail → type unit; with tail → its type. If loop has expected wish, expect(breakTail, wish); else record.
+   - After body check, loop type = wish (if given) or LUB of breaks (never results ignored; if no breaks → unit; if all breaks never → never? Spec: "If all results are never, the result type is never" for LUB. For loop with only `break` (unit) → unit. If loop body diverges and no breaks → loop type never? Spec says "无 break 值的 loop 是 ()" per todo; hmm, but Rust loop{} without break is `!`. The spec/todo (3.5) says "无 break 值的 loop 是 ()" — from the todo: "loop 体是...；break 的值按 LUB → 该类型；无 break 值 → ()". Hmm, that contradicts Rust (`loop {}` is `!`). Let me check spec types/never: not fetched. The todo says loop with no break → (). But also `fn f() -> i32 { loop {} }` should compile? If loop type is (), then no. In Rust it's `!`. Let me check the spec page maybe: I recall "无 break 值的 loop 是 ()" might mean "loop with `break;` (no value)" → (). Hmm. Actually "无 break 值" = "no break value" could mean breaks without values (bare `break;`) → (). Need care. Let me check the spec's never page via webfetch? Could do, but the user asked for a plan. I can say: if the loop has no reachable break, type is NEVER (diverges); if only bare `break;`, type is unit; otherwise LUB of break values. Let me verify with spec quickly? The todo says:
+     - "loop: 体是...；break 的值按 LUB → 该类型；无 break 值 → ()"
+     - "while 体、无 else 的 if、无 break 值的 loop 是 ()"
+     Hmm, "无 break 值的 loop 是 ()" likely means loop with bare breaks/no value → (). But a `loop {}` with no break at all diverges. The tests in loops-and-jumps likely cover `loop { break; }` and `loop {}`. Let me fetch the never spec page to be accurate before advising. The user asked for a simple plan; I can check quickly with webfetch to avoid giving wrong guidance. Let me fetch types/never.html.
+
+Let me fetch https://acmclasscourse-2025.github.io/rx-compiler-specification/types/never.html to get exact rules.
+
+5. **Unreachable code**: still check names/types; only place-mutability violations in unreachable code are UB (not tested). So don't skip checking after never; just keep checking. Optionally track reachability for place checks, but tests exclude; no need.
+
+6. **Tests**: expected-types, blocks-if-and-never, loops-and-jumps, loop-state-merges, runtime-value-merges.
+
+Let me fetch the never spec page to get loop/if/block rules right.
+
+**Tool: webfetch**
+
+**Input:**
+```json
+{
+  "format": "markdown",
+  "url": "https://acmclasscourse-2025.github.io/rx-compiler-specification/types/never.html"
+}
+```
+
+**Output:**
+```
+ Never type - Rx Compiler Specification                    
+
+    
+
+-   Auto
+-   Light
+-   Rust
+-   Coal
+-   Navy
+-   Ayu
+
+# Rx Compiler Specification
+
+[](../print.html "Print this book")[](https://github.com/ACMClassCourse-2025/rx-compiler-specification "Git repository")
+
+# [Never type](#never-type)
+
+The never type, conventionally written `!`, describes expressions that do not complete normally; such expressions are said to *diverge*. It is used internally; `!` is not a valid source type annotation.
+
+`return`, `break`, and `continue` expressions have the never type: they transfer control instead of producing a value where they appear. A [block expression](../expressions/block-expr.html) without a tail expression whose execution paths all exit early through these transfers or by evaluating diverging expressions likewise has the never type. If a block has a tail expression, that expression determines the block’s type even if prior statements diverge.
+
+The never type can coerce to any expected result type in the supported [coercion contexts](../types.html#conversions-and-coercions). Without an expected type, never results do not constrain the other results’ common type; if all results are never, that common type is never. This permits an if branch to return early while another branch yields a value, including a reference or container. The unit type `()` and the never type `!` are distinct: an expression evaluating to `()` completes normally, whereas an expression of the never type does not.
+
+```rust
+fn choose_or_return(flag: bool) -> i32 {
+    let n: i32 = if flag { return 7; } else { 3 };
+    n + 1
+}
+```
+
+A diverging function body satisfies any declared return type, such as `fn forever() -> i32 { loop {} }`. A call to that function has its declared type `i32`. Never behavior is determined locally within each function body.
+
+## [Loop expressions](#loop-expressions)
+
+A `loop` expression has the never type if no `break` expression targets it. A `break` inside a nested loop targets that nested loop, so `loop { loop { break; } }` still has the never type.
+
+If any `break` expressions target the loop, their values follow the [common result rules](../types.html#least-upper-bound-coercions), using the loop’s expected type when supplied; `break;` supplies `()`. If every break operand has the never type, the loop also has the never type. A break expression participates in type inference even if it is unreachable: `loop { if false { break 1i32; } }` has type `i32`.
+
+These rules apply to `loop`. A `while` expression has type `()`, even when its condition is always true.
+
+## [Unreachable code](#unreachable-code)
+
+Unreachable code still requires the usual semantic checks, including name resolution, type checking, and place-mutability checking. Cases explicitly classified as undefined behavior do not require a diagnostic.
+
+For programs within the test guarantees, generated code must respect control-flow transfers. A `return` exits the current function, a `break` exits its target loop, and a `continue` proceeds to the next iteration. Code bypassed by these transfers must not execute.
+
+Place-mutability violations in unreachable code exhibit undefined behavior under the [test guarantees](../undefined-behavior.html#test-guarantees). This includes ordinary and compound assignment to immutable places, mutable borrowing of an immutable place, and method or indexing adjustments that require unavailable mutable access. The rule covers local variables, struct fields, indexed elements, and dereferenced places. No diagnostic is required for these violations. For example:
+
+```rust
+fn example() {
+    let value = 1;
+    let shared = &value;
+    return;
+    value = 2; // undefined behavior: immutable local assignment after return
+    let borrowed = &mut *shared; // undefined behavior: mutable borrow after return
+    *shared = 3; // undefined behavior: write through a shared reference after return
+}
+```
+
+This exclusion applies specifically to place mutability. Name resolution errors, type mismatch errors, and assignment destinations that are not place expressions remain required compile errors even in unreachable code.
+
+The compiler implementation is not required to represent the never type explicitly in its AST or IR, nor is it required to solve the halting problem or prove termination.
+
+[](../types/unit.html "Previous chapter")[](../expressions.html "Next chapter")
+
+[](../types/unit.html "Previous chapter")[](../expressions.html "Next chapter")
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 36.4s)
+
+_Thinking:_
+
+Now I have exact rules. Let me formulate the Phase 3 plan.
+
+Key rules from spec:
+
+**Never:**
+- `return`, `break`, `continue` → `!`.
+- A block **without a tail** whose execution paths all exit early through these transfers (or diverge) → `!`.
+  - "If a block has a tail expression, that expression determines the block's type even if prior statements diverge." So a block with a tail is the tail's type regardless.
+  - For a block without tail: if control can reach the end normally → `()`. If all paths diverge → `!`. How to implement simply? Track whether the block's statements end with an expression of type `!` (the last statement is an exprStmt whose expr type is `!`), i.e., `return ...;`/`break;`/`continue;`/`loop{};` as last statement → block `!`. More generally, an `if` statement whose both branches diverge has type `!`? But `if c { return 1; }` without else has type `()` (since else path falls through) — right. `if c { return 1; } else { return 2; }` has type `!`. Our `infer(if)` with branches: if both branch types are NEVER → result NEVER. That's LUB-ish (all never → never). So if we make infer(if) produce NEVER when both branches NEVER, then a block ending with such an if stmt (exprStmt) can be NEVER.
+  - Note: expression statements' types: `exprStmt` discards value; to know if it diverges, use infer(expr) type. So change `checkStatement` to return `semType*` (unit for let; expr type for exprStmt), and checkBlock: if no tail, result = (last stmt type is NEVER ? NEVER : UNIT). Actually what if an earlier statement diverges but the last doesn't? E.g., `{ return; let x = 1; }` — execution paths: the function exits; the block never completes. Rust: unreachable code after return still type-checks; block type? For `fn f() -> i32 { return 1; let x = 2; }` — Rust accepts (warning unreachable); block type is `!`? Actually since statements after return are unreachable, the block's normal completion is impossible → type `!`. Hmm. But "whose execution paths all exit early" — the only execution path exits at return, so `!`. So strictly we should track reachability: if any statement diverges, everything after is unreachable, and if the block has no tail, the block type is `!` (because the only reachable path diverges). But this requires reachability tracking.
+  - Simplification for tests: treat block without tail as NEVER if **any** statement in it has type NEVER? That's wrong for `{ if c { return 1; } ; 2 }`? has no tail? Let's think. E.g. `{ if c { return; } }` — if c false, block completes normally → type (). The if statement type is unit (no else), not never. So "any stmt never" is wrong if a never-typed stmt is conditional. But if a statement is unconditionally never (return/break/continue/loop{}), then subsequent code unreachable and block is never. A statement's inferred type is NEVER only if the expression truly diverges unconditionally (return/break/continue/loop with no breaks/if with both branches never). So: if the **last executed reachable statement** has type NEVER, block type is NEVER. Simpler: iterate stmts; track `reachable` (init true); for each stmt: check it; if stmt type NEVER, set reachable=false for subsequent (but still check them). At end, if no tail and !reachable → NEVER else UNIT. But wait: if a stmt type is NEVER because it's `loop {}` (diverges), then yes. If `return;`, yes. Good.
+  - However, statements after divergence are still checked (name/type), per spec. So keep checking.
+  - Blocks **with tail**: type = tail's type, even if earlier statements diverge. (Spec explicit.) Our checkBlock already returns tail type. Good.
+- Never coerces to any expected type in coercion contexts.
+- Without expected type, never results don't constrain LUB; if all results never → never.
+- Function body: diverging body satisfies any declared return type. So checkBlock must accept NEVER vs wish.
+- `loop`: never if no break targets it. If any breaks: common result of break values (LUB/expected); `break;` gives `()`. If every break operand has never type, loop is never. Break participates even if unreachable (so must collect break types regardless of reachability).
+- `while`: always type `()`.
+- Unreachable: still check names/types; place-mut violations in unreachable are UB (tests exclude).
+
+**Expected-type propagation sites** (from types.html):
+- Annotated let initializer; const initializer; assignment RHS; call args; function tail/return; struct field initializers; array literal elements when expected array type (Phase 5).
+- Propagates through parentheses (transparent), block tail, both branches of if, all break values of loop.
+- Does NOT pass through binary/unary/borrow.
+
+**LUB**: used for if with else (no expected), array elements, loop break values.
+
+Now, the order:
+
+1. **Never plumbing** (foundation):
+   - `isNever(t)` helper.
+   - `compatible(actual, expected)` = typeEqual || isNever(actual) — use in checkBlock/expect/other coercions. But careful: `typeEqual` currently treats ERROR as true, NEVER only with NEVER. Add helper `coerceTo` later; for now `matches(t, wish) = isNever(t) || typeEqual(t, wish)`.
+   - `checkStatement` returns type (change signature), `checkBlock` tracks reachability → returns NEVER when no tail and last reachable stmt never.
+   - `infer(if)` with both branches never → NEVER; without else → unit (unless then never? no: if c { return; } can complete when c false → unit).
+   - `infer(loop)` returns NEVER if no break targets it; else break LUB (needs loop context).
+   - `infer(while)` unit.
+   - `infer(return/break/continue)` never (already).
+   - Ensure `checkBlock`'s final wish comparison uses never-compatible.
+   - This fixes `fn f() -> i32 { return 1; }`, `fn forever() -> i32 { loop {} }`, etc.
+
+2. **Loop break context**:
+   - Add a stack/member: `std::vector<LoopCtx>` where LoopCtx { semType* expected; bool sawBreak; std::vector<semType*> breakTypes; bool anyNonNever? } or simpler: each loop pushes a struct with expected (nullable) and a vector of break value types.
+   - `infer(break)`: if stack empty → error "break outside loop"; else if tail: t = expect(tail, ctx.expected) (or infer if no expected); push t into ctx.breaks. No tail → push unit.
+   - After checking loop body: if ctx.breaks empty → NEVER; else if expected != null → expected; else LUB of break types (ignore never; all never → NEVER; bare break unit).
+   - Nested loops: stack naturally handles.
+   - Break values participate even if unreachable: since we check statements regardless of reachability, breaks are still collected. Good (spec says `loop { if false { break 1i32; } }` has type i32).
+   - Note: we must still check break inside unreachable code; our checker does.
+
+3. **LUB**:
+   - `semType* lub(semType* a, semType* b)`:
+     - if typeEqual → a
+     - if a never → b (but if both never → never; handle order: if isNever(a) && isNever(b) return a; if isNever(a) return b; if isNever(b) return a)
+     - Phase 3: if one can coerce to the other? Only never now, and maybe UNIT? No. Phase 4 adds ref adjustments. For now, if not equal → error (UB in tests).
+     - Source order matters: implement as `lubAccumulate(current, next)`: if next can adjust to current keep current; else if current can adjust to next (and all earlier could) then next; else UB. For Phase 3 with never only, just ignore never.
+   - Use in: `infer(if)` when no expected and both branches, array literals (Phase 5), loop breaks.
+
+4. **expect propagation**:
+   - `expect(ifExpr, wish)`: cond bool; if else: `expect(then_, wish)` and `expect(else_, wish)` if wish non-null; if wish null → infer both + LUB. No else: then must be unit or never (i.e., expect(then_, unit) with never compatibility); result unit (even if then never? `if c { return 1; }` completes when c false → unit).
+   - `expect(loopExpr, wish)`: push loop ctx with expected=wish; check body; compute result; pop. If wish given, break values expect wish.
+   - `expect(blockExpr, wish)` already.
+   - `expect(breakExpr, wish)`: break value expected is the loop's expectation, not the outer wish; handle via loop ctx (ignore wish passed in).
+   - `expect(returnExpr, wish)`: expect tail vs currentRet_ (ignore wish).
+   - Return wish for others; fallback infer+compat.
+   - Important: `expect` should also handle never: if expr's type is never (e.g., `return` used as an initializer: `let x: i32 = return 1;`) — fallback infer returns NEVER → compatible. So in fallback use `matches`.
+
+5. **Unreachable**:
+   - Keep checking; no special handling needed for tests. Optionally track `reachable` to not enforce place-mut (UB) — but tests exclude; simplest: keep all checks.
+
+Tests: expected-types, blocks-if-and-never, loops-and-jumps, loop-state-merges, runtime-value-merges.
+
+Also note interactions with current code:
+- `infer(if)` currently requires then==else and returns else; replace with LUB/expected logic.
+- `infer(loop)` body currently checked against unit; but spec: loop body need not be unit? "loop bodies ... require unit results" from types.html? The coercion section said "loop bodies and an `if` without `else` require unit results". Hmm: for `loop { break 42; }`, body block's statements: `break 42;` is exprStmt type never; body has no tail → block type never (with unreachable tracking) → is never compatible with unit requirement? Wait "loop bodies require unit results" — but `loop { break 42; }` body block type is never (last stmt break), and never coerces to unit, so ok. `loop { 1 }` body type i32 → error. So check body against unit with never compatibility.
+- `while` body similarly.
+- `if` without else body against unit + never compatibility.
+- function body against ret with never compatibility.
+
+Also `checkBlock` expected=wish and tail absent: currently returns unit and compares; new: compute never if diverging; compare with never-compatible.
+
+Also `break` in `checkBlock` tail position: e.g., `loop { break 42; }` — the block's last statement is exprStmt(break) → type never; no tail → block never. Good.
+
+Now line estimates? Not asked this time; they asked "简单讲讲我要做什么，以及顺序". So provide a concise plan with order and key rules. Maybe mention the required member (loop context stack) and signature change (checkStatement returns type).
+
+Let me write it in a compact, ordered way:
+
+Step 1: 基础设施
+- `bool isNever(semType*)`
+- `bool matches(actual, expected)` = isNever(actual) || typeEqual(...)
+- `checkStatement` 改成返回 semType*（let → unit；exprStmt → infer 结果），`checkBlock` 记录 lastType/reachable；无 tail 且最后可达语句是 never → 块类型 never；有 tail → tail 类型（即使前面发散）。
+- 所有"必须 unit"的位置改成 `matches(t, unit)`（if without else, while body, loop body）。
+
+Step 2: loop 上下文 + break
+- member `std::vector<LoopCtx> loops_`；LoopCtx { semType* expected; std::vector<semType*> breaks; }.
+- infer/expect(loop): push ctx, check body against unit (matches), pop, compute: no breaks → NEVER; expected → expected; else LUB(breaks). Break with tail: if ctx.expected → expect(tail, expected) else infer(tail); push type; no tail → unit. break outside loop → error.
+- nested loops work (stack). Breaks in unreachable code still recorded (since we keep checking).
+
+Step 3: LUB
+- `lub(a,b)` ignoring never; both never → never; equal → a; else (Phase 3) error (Phase 4 adds ref coercions). Source order accumulate.
+- use in if-with-else (wish null), loop breaks.
+
+Step 4: expect 穿透
+- if: cond bool; else branch → expect both with wish or LUB; no else → matches(then, unit) → unit.
+- loop → as above.
+- block already.
+- call args (done), return (done), let annotation (done via expect), assignment rhs (done).
+- Parentheses are transparent in AST.
+- Do NOT propagate through binary/unary/borrow (spec UB); keep fallback.
+
+Step 5: unreachable
+- already checking everything; don't skip. Only place-mut violations in unreachable are UB → no handling needed. But note: current code checks assignments in unreachable too, which is stricter than required (safe: UB not tested, being stricter could reject a positive? Tests won't include; okay).
+
+Tests and expected progress.
+
+Also mention `if` with else where one branch never: `let n: i32 = if flag { return 7; } else { 3 };` — with expected i32: expect(then block, i32) → tail `return 7;`? Wait `if flag { return 7; }` then_ is a block containing `return 7;` as ExprStmt, no tail → block type NEVER (with new rule) → matches i32 → ok. Good; this is the example from spec.
+
+Also `if` without else used as value → unit.
+
+Also note: `infer(if)` current has then==else check; will be replaced.
+
+Also mention expected propagation into `if` branches when wish provided: `expect(then_, wish)` where then_ is blockExpr; and else_ may be ifExpr/block.
+
+One more: expected propagation through `loop` breaks: when the loop expression has an expected type from context (e.g., `let x: u32 = loop { break 1; };`), each break's value is checked against u32. Implementation: LoopCtx.expected = wish.
+
+Keep the answer simple as requested ("简单讲讲"), maybe ~50 lines. Use a numbered order. Avoid too much code; small snippets for signatures/structs.
+
+Let me write.
+
+Phase 3 就三件事：**把 `!` 打通 → 收集 loop 的 break → 写 LUB + expected 穿透**。按这个顺序做：
+
+**第 1 步：never 基础设施（先让 `return` 不误报）**
+
+- 加 `bool isNever(semType* t)` 和 `bool matches(semType* actual, semType* expected)`（= `isNever(actual) || typeEqual(actual, expected)`）；
+- **`checkStatement` 改成返回 `semType*`**：`let` 返回 unit，`exprStmt` 返回 `infer(expr)` 的结果；
+- `checkBlock` 里记一个 `bool reachable = true` 和 `semType* lastType`：每条语句后 `lastType = t`，`if (isNever(t)) reachable = false`（注意：**后面的语句仍然要查**，只是不再影响块类型）；
+  - 有 tail → 块类型 = tail 的类型（即使前面发散，spec 明确说了）；
+  - 无 tail → `reachable ? unit : never`；
+  - 最后和 wish 比较用 `matches`。
+- 所有"要求 unit"的地方改成 `matches(t, unit)`：无 else 的 if、while 体、loop 体、函数体（`fn f() -> i32 { return 1; }` 和 `fn forever() -> i32 { loop {} }` 就靠这个过）。
+
+**第 2 步：loop 上下文 + break**
+
+加一个成员（栈，天然支持嵌套 loop）：
+
+```cpp
+struct LoopCtx {
+    semType* expected = nullptr;      // loop 表达式自身有没有 expected
+    std::vector<semType*> breaks;     // 每个 break 值的类型（按源码顺序）
+};
+std::vector<LoopCtx> loops_;
+```
+
+- `infer/expect(loopExpr)`：`loops_.push_back({wish, {}})` → 按 unit 检查 body → `pop` → 算 loop 类型：
+  - **没有任何 break 指向它 → never**（spec：`loop { loop { break; } }` 外层仍是 never）；
+  - 有 expected → expected；
+  - 否则 `lub` 所有 break 值；`break;` 记 unit；所有 break 值都是 never → never；
+- `break` 分支：tail 存在时，`loops_.back().expected` 非空就 `expect(tail, expected)`，否则 `infer(tail)`，把结果 push 进 `breaks`；没有 tail push unit；`loops_` 为空 → "break outside loop" 报错。返回 `makeNever()`；
+- **不可达代码里的 break 也要记**（spec：`loop { if false { break 1i32; } }` 类型是 i32）——你现在所有语句都照常查，天然满足。
+
+**第 3 步：LUB**
+
+```cpp
+semType* lub(semType* a, semType* b);   // 按源码顺序 accumulate
+```
+
+Phase 3 的规则先做最小版：
+
+- 两者都是 never → never；一个 never → 返回另一个；
+- `typeEqual` → 返回 a；
+- 否则 Phase 3 先报错（"no common type"）。Phase 4 再补 `&mut T → &T` 这类可调整规则；真正"无公共目标"是 UB，测试不会有。
+
+用在：`if` 有 else 且没有 expected、数组字面量（Phase 5）、loop 的 break 合并。
+
+**第 4 步：`expect` 穿透**
+
+- `expect(ifExpr, wish)`：cond 必须 bool；
+  - 有 else：`wish` 非空 → `expect(then_, wish)` + `expect(else_, wish)`；`wish` 为空 → 分别 `infer` 再 `lub`；
+  - 无 else：`matches(then_, unit)`，结果 unit（`if c { return 1; }` 是 unit，因为 c 为 false 时正常走完）；
+  - spec 的例子 `let n: i32 = if flag { return 7; } else { 3 };` 就是靠 then 块是 never、`matches(never, i32)` 过的；
+- `expect(loopExpr, wish)`：走第 2 步，`wish` 作为 break 的 expected；
+- `expect(blockExpr, wish)` 已经有了；
+- `expect(returnExpr, ...)` 已经按 `currentRet_` 查了，忽略外层 wish；
+- 其余（二元/一元/借用）**不穿透**，保持 `infer + matches`（spec 说需要穿透才能定类型的写法是 UB）。
+
+**第 5 步：不可达**
+
+不用专门做什么：你照常查所有语句，名字/类型错误都会报；只有"不可达里的 place-mut 违规"是 UB（测试不出现），所以不用为它加开关。**不要**为了优化跳过不可达语句，否则 `return 1; let y = z;` 这种负例就漏了。
+
+完成后跑：
+
+```sh
+make test FILTER=official:semantic:expected-types,official:semantic:blocks-if-and-never,official:semantic:loops-and-jumps,official:semantic:loop-state-merges,official:semantic:runtime-value-merges STAGE=semantic
+```
+
+预计新增 180–250 行。
+
+---
+
+## User
+
+我第一步写完了，你看看。以及第二步 loop 上下文这个该怎么做？比如我 infer loopExpr 的时候后，你说“没有任何 break 指向它”，这个该怎么收集呢？
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 16.4s)
+
+_Thinking:_
+
+The user finished step 1 (never infrastructure). They ask me to review, and explain how step 2 loop context works, specifically how to collect breaks targeting a loop when infer(loopExpr) runs.
+
+I need to read the current code to review step 1:
+- isNever/matches helpers
+- checkStatement returning type
+- checkBlock reachability
+- infer(if/loop/while/return etc.) updated?
+
+Let me read the relevant parts. Then explain the loop context design in detail (stack, push before body, break records into top, pop after, compute result). Also address the specific question: "infer loopExpr 的时候，没有任何 break 指向它，这个该怎么收集呢？" — Because inspection is dynamic during checking: when you check the body, you encounter break expressions nested arbitrarily deep (inside if/blocks/other loops). You push a context before checking the body; every `break` adds to the *innermost* context (loops_.back()). Nested loops push their own contexts, so breaks go to the innermost loop, which naturally handles "break targets nearest loop". After body checking, pop and inspect the vector: empty → never.
+
+Also note: breaks inside nested loops are recorded to the nested loop's ctx; when nested loop finishes, its type is computed; outer break collection unaffected. `loop { loop { break; } }` outer has no breaks → never.
+
+Also note: breaks in unreachable code still recorded because we check all statements.
+
+Also: `break` value typing with expected: the loop's expected comes from `expect(loopExpr, wish)` or null from infer; context holds it. If expected non-null, break tail uses expect(tail, expected); else infer. Record the *actual* type (for no-expected LUB).
+
+Also, maybe the user's infer(loop) body check currently requires body unit; the loop body should be checked with unit compatibility; pushes ctx.
+
+Let me read the code first.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && grep -n \"isNever\\|matches\\|LoopCtx\\|loops_\\|checkStatement\\|reachable\\|lastType\" compiler/src/semantic/checker.cpp compiler/src/semantic/checker.h | head -30; echo ===; sed -n '/semType\\* Checker::checkBlock/,/^}/p' compiler/src/semantic/checker.cpp; echo ===; sed -n '/void Checker::checkStatement/,/^}/p' compiler/src/semantic/checker.cpp; echo ===; sed -n '/bool isNever/,/^}/p; /bool matches/,/^}/p' compiler/src/semantic/checker.cpp"
+}
+```
+
+**Output:**
+```
+compiler/src/semantic/checker.cpp:32:static bool isNever(semType* type){
+compiler/src/semantic/checker.cpp:36:static bool matches(semType* type, semType* expected) {
+compiler/src/semantic/checker.cpp:37:    return isNever(type) || semantic::typeEqual(type, expected);
+compiler/src/semantic/checker.cpp:683:            if (!matches(infer(fi->then_), semantic::makeUnit())) {
+compiler/src/semantic/checker.cpp:692:        if (!matches(infer(whi->block_), semantic::makeUnit())) {
+compiler/src/semantic/checker.cpp:699:        if (!matches(infer(loop->block_), semantic::makeUnit())) {
+compiler/src/semantic/checker.cpp:718:        else if (currentRet_ != nullptr && !matches(currentRet_, semantic::makeUnit())) {
+compiler/src/semantic/checker.cpp:942:    bool reachable = true;
+compiler/src/semantic/checker.cpp:945:        last = checkStatement(stmt);
+compiler/src/semantic/checker.cpp:946:        if (isNever(last)) {
+compiler/src/semantic/checker.cpp:947:            reachable = false;
+compiler/src/semantic/checker.cpp:951:                   (reachable ? semantic::makeUnit() : semantic::makeNever())); // as mentioned in spec, our wish can inflitrate into block's tail
+compiler/src/semantic/checker.cpp:952:    if (wish != nullptr && !matches(ret, wish)) {
+compiler/src/semantic/checker.cpp:961:semType* Checker::checkStatement(Stmt* stmt) {
+compiler/src/semantic/checker.h:22:    semType* checkStatement(Stmt* stmt);
+compiler/src/semantic/checker.h:33:    std::vector<loopInfo> loops_;
+===
+semType* Checker::checkBlock(blockExpr* block, semType* wish) {
+    scope_.levelUp();
+    bool reachable = true;
+    semType* last;
+    for (auto stmt : block->stmts_) {
+        last = checkStatement(stmt);
+        if (isNever(last)) {
+            reachable = false;
+        }
+    }
+    semType* ret = (block->tail_ ? expect(block->tail_, wish) : 
+                   (reachable ? semantic::makeUnit() : semantic::makeNever())); // as mentioned in spec, our wish can inflitrate into block's tail
+    if (wish != nullptr && !matches(ret, wish)) {
+        error("blockExpr's tail_ has a different semType with our wish");
+        scope_.levelDown();
+        return semantic::makeError();
+    }
+    scope_.levelDown();
+    return ret;
+}
+===
+===
+static bool isNever(semType* type){
+    return type != nullptr && type->kind_ == semType::kTypeKind::NEVER;
+}
+static bool matches(semType* type, semType* expected) {
+    return isNever(type) || semantic::typeEqual(type, expected);
+}
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 13.1s)
+
+_Thinking:_
+
+Interesting: checkStatement's definition wasn't printed by the sed range (maybe it's after 961 and my sed pattern failed due to formatting? Let me read directly lines 955-980). Also the header mentions `std::vector<loopInfo> loops_;` — they already defined a loopInfo struct? Let me read checker.h and checker.cpp around loopInfo. Let me grep loopInfo.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && grep -n \"loopInfo\" -A6 -B2 compiler/src/semantic/checker.h compiler/src/semantic/checker.cpp | head -40; echo ===; sed -n '955,985p' compiler/src/semantic/checker.cpp; echo ===; sed -n '670,730p' compiler/src/semantic/checker.cpp"
+}
+```
+
+**Output:**
+```
+compiler/src/semantic/checker.h-31-    globalTable table_;
+compiler/src/semantic/checker.h-32-    scopeStack scope_;
+compiler/src/semantic/checker.h:33:    std::vector<loopInfo> loops_;
+compiler/src/semantic/checker.h-34-    semType* currentRet_ = nullptr;
+compiler/src/semantic/checker.h-35-    std::string currentStruct_;
+compiler/src/semantic/checker.h-36-    bool reject_ = false;
+compiler/src/semantic/checker.h-37-};
+===
+        return semantic::makeError();
+    }
+    scope_.levelDown();
+    return ret;
+}
+
+semType* Checker::checkStatement(Stmt* stmt) {
+    if (auto let = dynamic_cast<letStmt*>(stmt); let) {
+        semType* curType = let->type_ ? transformType(let->type_) : nullptr;
+        semType* init = expect(let->init_, curType);
+        scope_.push(let->name_, localShadowing(init, let->isMut_));
+        return semantic::makeUnit();
+    }
+    if (auto expr = dynamic_cast<exprStmt*>(stmt); expr) {
+        return infer(expr->expr_);
+    }
+    return;
+}
+
+void Checker::error(std::string message) {
+    std::cerr << "error occurred!\n" << message << std::endl;
+    reject_ = true;
+    return;
+}
+
+void Checker::checkCrate(Crate* crate) {
+    collect(crate);
+    if (reject_) {
+        return;
+    }
+    evaluateConstants(crate);
+===
+        return semantic::makeError();
+    }
+    if (auto fi = dynamic_cast<ifExpr*>(expr); fi) {
+        expect(fi->cond_, semantic::makeBuiltin("bool"));
+        if (fi->else_ != nullptr) {
+            semType* rhs = infer(fi->else_);
+            if (!semantic::typeEqual(infer(fi->then_), rhs)) {
+                error("ifExpr then and else have different type");
+                return semantic::makeError();
+            }
+            return rhs;
+        }
+        else {
+            if (!matches(infer(fi->then_), semantic::makeUnit())) {
+                error("ifExpr then is not unit");
+                return semantic::makeError();
+            }
+            return semantic::makeUnit();
+        }
+    }
+    if (auto whi = dynamic_cast<whileExpr*>(expr); whi) {
+        expect(whi->cond_, semantic::makeBuiltin("bool"));
+        if (!matches(infer(whi->block_), semantic::makeUnit())) {
+            error("whileExpr block is not unit");
+            return semantic::makeError();
+        }
+        return semantic::makeUnit();
+    }
+    if (auto loop = dynamic_cast<loopExpr*>(expr); loop) {
+        if (!matches(infer(loop->block_), semantic::makeUnit())) {
+            error("loopExpr block is not unit");
+            return semantic::makeError();
+        }
+        return semantic::makeUnit();
+    }
+    if (auto bre = dynamic_cast<breakExpr*>(expr); bre) {
+        if (bre->tail_) {
+            infer(bre->tail_);
+        }
+        return semantic::makeNever();
+    }
+    if (auto con = dynamic_cast<continueExpr*>(expr); con) {
+        return semantic::makeNever();
+    }
+    if (auto ret = dynamic_cast<returnExpr*>(expr); ret) {
+        if (ret->tail_) {
+            expect(ret->tail_, currentRet_);
+        }
+        else if (currentRet_ != nullptr && !matches(currentRet_, semantic::makeUnit())) {
+            error("returned an unit in a function with a return type");
+        }
+        return semantic::makeNever();
+    }
+    if (auto cast = dynamic_cast<castExpr*>(expr); cast) {
+        semType* ltype = infer(cast->from_);
+        semType* rtype = transformType(cast->to_);
+        if ((!isIntegerType(ltype) && !isBoolType(ltype)) || 
+             !isIntegerType(rtype)){
+            error("castExpr lhs is neither int nor bool");
+            return semantic::makeError();
+        }
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 22.4s)
+
+_Thinking:_
+
+Key findings:
+
+1. `checker.h` references `std::vector<loopInfo> loops_;` but `loopInfo` is not defined anywhere (grep only found the usage). So the project shouldn't compile! Unless defined elsewhere? grep found only the header line. Let me verify build. This is likely their WIP for step 2 (they asked how to do it). The header has a use of undefined type → compile error. They said step 1 done; maybe they added loops_ prematurely. Need to point out: either define `struct loopInfo { ... };` before Checker or remove until step 2.
+
+2. `checkStatement` returns `semType*`; at the end `return;` (no value) → warning/UB. Should return `makeUnit()` or makeError. Since all Stmt kinds are let/exprStmt, the final return is unreachable in practice; still fix to `return semantic::makeUnit();`.
+
+3. `checkBlock`: 
+```cpp
+bool reachable = true;
+semType* last;   // uninitialized if stmts empty
+for (...) { last = checkStatement(stmt); if (isNever(last)) reachable = false; }
+```
+- If block has no statements (empty block), `last` uninitialized but not read after (only `reachable` used). Fine, but initialize to unit.
+- `last` unused after loop except assignment; actually not used at all after the loop (only reachable). Compiler warning "set but not used"? It's used in `isNever(last)` inside loop. Fine.
+- The logic: if ANY statement is never, reachable=false. But consider `{ if c { return; } let x = 1; }`: the if statement type is unit (no else), not never, so reachable stays true. Good.
+- Consider `{ return; let x = 1; }`: return stmt type never → reachable=false; then subsequent let still checked (good); block type never. Correct.
+- Consider `{ loop {} }`: loop type currently unit (not never yet) — step 2 will return never for no-break loops, fixing this.
+- With tail: ret = tail type regardless of reachable; correct per spec.
+- "wish != nullptr && !matches(ret, wish)" — matches never → ok. Good.
+- BUT: if tail exists and is never, ret=never; matches true. Good.
+- Potential issue: `last` is unused beyond isNever in loop; fine.
+- Another subtlety: statements after a never are still checked; good.
+- The check uses `isNever(last)` where last may be ERROR; fine.
+
+4. `infer(if)`: still old logic: with else requires then==else and returns else. Missing never/LUB/expected. Step 3 will handle; for step 1, at least one branch never case: `if flag { return 7; } else { 3 }` → then block type? checkBlock: stmts=[return], no tail, reachable=false → never. infer(then)=never; infer(else)=i32; typeEqual(never, i32) false → error. So the spec example still fails until step 3. That's expected; step 1 only sets infrastructure, but they might expect some improvement. Note.
+
+5. `infer(loop)`: still returns unit, doesn't use loopInfo. They asked how to implement step 2. Good—explain.
+
+6. `infer(break)`: currently infers tail without expected and returns never; no loop stack. Step 2.
+
+7. `matches(currentRet_, unit)` in return branch: `matches` checks if first arg is never → here first is currentRet_, not the value. For checking "return; in non-unit function", should be `!matches(makeUnit(), currentRet_)`? Actually the condition wants: if return has no value and currentRet_ is not unit (and not never? currentRet_ can't be never; source annotations can't be !). `typeEqual(currentRet_, unit)` is fine. Using `matches(currentRet_, unit)` would return true if currentRet_ is never (impossible) — harmless. But semantically `matches` is for actual→expected; reversed usage is confusing. Minor.
+
+8. `isNever`/`matches` defined at line 32-38, fine.
+
+9. Need to check compile: loopInfo undefined → build fails. Let me build to confirm. If it fails, that's the first thing to report.
+
+Also, does `std::vector` include exist in checker.h? symbol.h includes <vector>, so fine.
+
+Let me build.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && cmake --build target/build -j 2>&1 | grep -E \"error|warning|Built target\" | head -8",
+  "timeout": 180000
+}
+```
+
+**Output:**
+```
+/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp:971:5: error: return-statement with no value, in function returning ‘semType*’ {aka ‘semantic::Type*’} [-fpermissive]
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 16.7s)
+
+_Thinking:_
+
+Two compile blockers:
+1. `return;` in checkStatement.
+2. `loopInfo` undefined? The compiler error list shows only the first error; GCC may stop or list more. Let me see full build output. `loopInfo` may be defined somewhere I missed (maybe in checker.h above line 31? grep only showed usage). Let me check the full header.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && cat compiler/src/semantic/checker.h; echo ===; cmake --build target/build -j 2>&1 | grep -E \"error\" | head -10",
+  "timeout": 180000
+}
+```
+
+**Output:**
+```
+#pragma once
+#include "symbol.h"
+#include "type.h"
+#include "../ast/ast.h"
+
+struct Checker {
+    void checkCrate(Crate* rt);
+
+    Constant calculateConst(ConstValue* value, std::string owner);
+    Constant manifestConst(std::string owner, std::string name);
+    constSignature* findConst(const std::string& owner, const std::string& name);
+    bool checkConstInit(const ConstValue* value, semType* expected, const std::string& owner);
+    void collect(Crate* crate);
+    void evaluateConstants(Crate* crate);
+    semType* transformType(Type* t);
+    void evaluateTypes(Crate* crate);
+
+
+    void checkItem(Item* item);
+    void checkFunction(funcItem* func, const std::string& owner);
+    semType* checkBlock(blockExpr* block, semType* wish);
+    semType* checkStatement(Stmt* stmt);
+    bool isPlaceable(Expr* expr);
+    bool isMutablePlaceable(Expr* expr);
+    semType* lookupValue(std::string name);
+    semType* infer(Expr* expr);
+    semType* expect(Expr* expr, semType* wish);
+
+    void error(std::string message);
+
+    globalTable table_;
+    scopeStack scope_;
+    std::vector<loopInfo> loops_;
+    semType* currentRet_ = nullptr;
+    std::string currentStruct_;
+    bool reject_ = false;
+};===
+/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp:971:5: error: return-statement with no value, in function returning ‘semType*’ {aka ‘semantic::Type*’} [-fpermissive]
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 14.8s)
+
+_Thinking:_
+
+Interesting: GCC didn't report `loopInfo` undefined? Because `-fpermissive`? No—`std::vector<loopInfo>` with unknown type should error "loopInfo was not declared". Maybe the build stopped at the first error? GCC usually reports multiple. Or loopInfo is defined in symbol.h? Let me grep the whole semantic dir for loopInfo.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "grep -rn \"loopInfo\" \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/\" | head"
+}
+```
+
+**Output:**
+```
+/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.h:33:    std::vector<loopInfo> loops_;
+/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/symbol.h:47:struct loopInfo {
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 14.5s)
+
+_Thinking:_
+
+`loopInfo` is defined in symbol.h line 47. Let me read it to see what they planned.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "sed -n '40,70p' \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/symbol.h\""
+}
+```
+
+**Output:**
+```
+    std::map<std::string, funcSignature> funcSig;
+    std::map<std::string, structSignature> structSig;
+    std::map<std::string, constSignature> constSig;
+    std::map<std::string, std::map<std::string, funcSignature>> methods;
+    std::map<std::string, std::map<std::string, constSignature>> associatedConsts;
+};
+
+struct loopInfo {
+    semType* expected_ = nullptr;
+    std::vector<semType*> breaks_;
+};
+
+struct localShadowing {
+    semType* type_;
+    bool isMut_;
+    localShadowing(semType* type = nullptr, bool isMut = false) : type_(type), isMut_(isMut) {}
+};
+
+struct stackShadowing {
+    std::string name_;
+    localShadowing shadow_;
+    int depth_;
+    stackShadowing(std::string name, localShadowing shadow, int depth = 0) : name_(name), shadow_(shadow), depth_(depth) {}
+};
+
+struct scopeStack {
+    std::map<std::string, std::stack<localShadowing>> memory_;
+    std::stack<stackShadowing> stk_;
+    int currentDepth = 0;
+    void levelUp() {
+        currentDepth++;
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 29.6s)
+
+_Thinking:_
+
+They already defined `loopInfo { expected_, breaks_ }` and added `loops_` member. So they're ready for step 2; only the `return;` in checkStatement blocks the build.
+
+Now compose the review of step 1 + explain the loop context implementation in detail.
+
+Review points:
+
+1. **Compile error**: `checkStatement` ends with `return;` in a `semType*` function. Change to `return semantic::makeUnit();` (or makeError). This is the only error; build stops.
+
+2. `checkBlock` logic looks right, but:
+   - Initialize `last` (e.g., `semType* last = semantic::makeUnit();`) to avoid potential uninitialized use warnings (currently only used inside loop; fine, but clean).
+   - `reachable` set false when any statement is NEVER; correct approach since only unconditional divergence yields NEVER.
+   - With tail, type = tail regardless of reachable — correct.
+   - Compare wish with `matches` — correct.
+   - Note: the `last` variable name / unused after loop; fine.
+
+3. `infer(if)` still old logic; step 3 will change. But there's a subtle step-1 issue: `if flag { return 7; } else { 3 }` currently errors (never vs i32). That's step 3; not a step-1 bug.
+   For step 2, loops need break collection; for step 3, if/LUB.
+
+4. `infer(loop)` still returns unit and doesn't use loops_; this is step 2 (they asked).
+
+5. `return;` branch uses `matches(currentRet_, unit)` — reversed args (matches(actual, expected)); should be `typeEqual(currentRet_, unit)` or `!matches(makeUnit(), currentRet_)`. With currentRet_ never impossible; harmless but fix for clarity.
+   Actually the check: `else if (currentRet_ != nullptr && !matches(currentRet_, makeUnit()))` — currentRet_ i32: matches(i32, unit) = typeEqual false → error. currentRet_ never (impossible). Fine. But semantic intent: if the return has no value, unit must match currentRet_. Correct is `!matches(makeUnit(), currentRet_)`; since only never differs, both behave same for non-never currentRet_. Minor.
+
+6. `checkStatement` let: returns unit; exprStmt returns expr type. Good. But note: `let` with init never (e.g., `let x = return 1;`) — returns unit; block reachability: init never means the let stmt diverges; should the block be considered unreachable after? In Rust, `let x = return 1;` diverges; subsequent code unreachable; block type never. Their checkStatement returns unit for let regardless of init type. Spec: a block without tail whose execution paths all exit early through transfers; here the let initializer diverges → statement diverges → block diverges. To be precise, for let, the statement type should be the init type if never? Hmm: `let x = return 1;` — the statement itself diverges. Rust: block type `!`. So checkStatement for let should return isNever(init) ? init : unit. Minor edge; tests may include `let x = return 1;`? Possibly not. Mention as nuance.
+   Also `let x = loop {};` — loop type never; let diverges; should propagate. Same.
+
+7. `isNever`/`matches` fine.
+
+Now explain step 2 loop context:
+
+Design:
+- `loops_` is a stack of `loopInfo { semType* expected_; std::vector<semType*> breaks_; }` (already defined).
+- `infer(loopExpr)`:
+  ```cpp
+  // determine expected: infer has none; expect(loopExpr, wish) should pass wish. 
+  // Option: have a helper `checkLoop(loopExpr*, semType* wish)` used by both infer (wish=null) and expect (wish).
+  loops_.push_back(loopInfo{wish, {}});
+  semType* body = checkBlock(loop->block_, /* expected? */ semantic::makeUnit());
+  // body must be unit or never: matches(body, unit)
+  loopInfo info = loops_.back();
+  loops_.pop_back();
+  if (info.breaks_.empty()) return makeNever();
+  if (wish) return wish;
+  semType* result = info.breaks_[0]; // LUB accumulate, but first could be never; skip nevers
+  for each break type: result = lub(result, t)
+  return result; 
+  ```
+  Careful: what expected should the loop body block have? The body block itself is a block expression checked against `()`. Break expressions inside have their own expected (loop's). The body block's tail: `loop { 1 }` → body tail 1 → block type i32 → must be unit/never → error. So checkBlock(body, unit) — with `matches` inside checkBlock's wish comparison, never ok. Good.
+  Note: checkBlock's `wish` for body should be unit; break values are handled by break branch separately, not via block expectation.
+- `infer(break)`:
+  ```cpp
+  if (loops_.empty()) { error("break outside loop"); return makeNever(); }
+  loopInfo& ctx = loops_.back();
+  semType* t = semantic::makeUnit();
+  if (bre->tail_) {
+      t = ctx.expected_ ? expect(bre->tail_, ctx.expected_) : infer(bre->tail_);
+  } else if (ctx.expected_ && !matches(makeUnit(), ctx.expected_)) {
+      error("break without value in a loop expecting a value");
+  }
+  ctx.breaks_.push_back(t);
+  return makeNever();
+  ```
+  Note: Nested loops: breaks target innermost = loops_.back(); nested loop's own break gets recorded there; when nested loop pops, its type computed. Breaks in the outer loop body (outside nested) record to outer. `loop { loop { break; } }`: inner loop has break → type unit; outer has no breaks → never. Correct.
+- `expect(loopExpr, wish)`: currently expect falls back to infer; need special case before fallback:
+  ```cpp
+  if (auto* lp = dynamic_cast<loopExpr*>(expr)) return checkLoop(lp, wish);
+  ```
+  Or put loop handling in infer and have expect detect loop. Cleaner: a `checkLoop(loopExpr*, semType* wish)` helper called from both. In infer: `return checkLoop(lp, nullptr);` In expect: if loop → `return checkLoop(lp, wish);` (and if wish provided, also maybe return wish; break values checked against wish).
+  Also `break` expected: if ctx.expected_ non-null, all break values expect it, so loop type = expected_ (return wish). If wish null, LUB.
+- LUB needed for multiple break values; step 3. For step 2, could temporarily require all break types equal or implement minimal LUB now. They can implement `lub` as part of step 3.
+- Important: break values in unreachable code are recorded because checking continues regardless of reachability. Good.
+- "没有任何 break 指向它" is determined by `info.breaks_.empty()` after checking the whole body. The collection happens dynamically because break expressions are visited during `checkBlock`; the stack ensures they go to the correct loop. No AST pre-scan needed. That directly answers the user's question.
+- Also: `break` inside nested function? Functions can't be nested in Rx, so no issue.
+- Note: `break` in a `while`? While has no break values? Spec: break inside while targets the while loop; but `while` expression type is `()` regardless. Break values in while? Rust allows `break` (no value) in while; `break 5` in while is an error ("break with value outside loop"? Actually break with value in while is not allowed in Rust since while has no break type). Spec: "These rules apply to `loop`. A `while` expression has type `()`, even when its condition is always true." So breaks inside while: allowed (no value), but a value break should error? Tests maybe. Our loopInfo stack currently only for loopExpr; while body check would encounter break with loops_ empty if we don't push for while → error "break outside loop" (wrong). Should push a context for while too (with expected = unit for breaks? break with value in while → error). So: push loopInfo{makeUnit(), {}} for while body, and after, ignore breaks (while type unit). Also break value in while should error: in break branch, if ctx is a while context (expected unit) and tail exists → expect(tail, unit) → i32 vs unit error. Good. But if while expected unit, `break;` fine. So push for while with expected=unit, and don't compute type from breaks.
+  Same for nested `loop` inside while etc.
+  Alternatively mark loopInfo for while. Simplest: push for while too with expected_ = unit and discard breaks.
+  Note: `continue` doesn't care.
+- Also `break` inside a `loop` body that's in a `while`? Stack handles.
+
+Also mention: loop body checking via checkBlock(body_, unit) will mark block never when last stmt is break; matches(never, unit) true. Good.
+
+And `infer(loop)` currently checks body against unit directly with `matches`; step 2 replaces.
+
+The user asks "这个该怎么收集呢？" — emphasize: no separate collection pass; push context before checking body, break pushes to top; pop after; empty = no break.
+
+Also warn: `loops_` must be balanced even on error paths (checkBlock early return for wish mismatch returns before levelDown? They fixed levelDown? In current checkBlock error path: `scope_.levelDown(); return makeError;` yes. For loop context, if body checking returns early? checkBlock doesn't abort; loop helper pops after. Since checkBlock returns normally. Fine. But if `checkBlock` errors, it returns makeError; still pop.
+
+Let me write the answer:
+1. Compile blocker: `return;` in checkStatement → return unit. Mention it's the only error.
+2. Step 1 review: good; nuances (let with never init; infer(if) still old, step 3; checkBlock last init).
+3. Step 2 concrete implementation with code sketch: helper `checkLoop`, break branch, while context, note nested loops and unreachable breaks.
+4. Mention LUB dependency: for multiple break values, either implement `lub` now or require equal temporarily; step 3.
+
+Keep concise but detailed enough. Also answer their specific question explicitly: collection is dynamic via stack; breaks encountered while checking body push into loops_.back(); after body, empty means none.
+
+Let me write.
+
+先修一个编译错误，然后讲 loop 收集。
+
+**`checkStatement` 末尾 `return;` 在返回 `semType*` 的函数里是非法的**（当前唯一编译错误）：
+
+```cpp
+if (auto expr = dynamic_cast<exprStmt*>(stmt); expr) {
+    return infer(expr->expr_);
+}
+return semantic::makeUnit();   // ← 这里
+```
+
+Step 1 其余部分没问题：`isNever`/`matches`、`checkBlock` 的 reachable 逻辑（只有**无条件发散**的语句才是 never，所以“最后一条可达语句 never → 块 never”是对的）、有 tail 时块类型由 tail 决定，都符合 spec。两个小细节：
+
+- `semType* last;` 建议初始化成 unit，空块时不会有未初始化读；
+- `checkStatement` 的 `let` 目前永远返回 unit；严格说 `let x = return 1;` 这种初始化式发散，语句本身也发散。可以改成 `return isNever(init) ? init : makeUnit();`（测试未必考，但逻辑更对）。
+
+---
+
+**Step 2：break 怎么收集？**
+
+核心思想：**不需要提前扫描 AST**。`break` 是在你检查 loop 体时"路过"的，用**栈**动态收集：
+
+1. 进入 `loop` 表达式时，往 `loops_` **push** 一个 `loopInfo{wish, {}}`；
+2. 然后正常 `checkBlock` 它的循环体。体里遇到任何 `break`（不管嵌在 if/块/别的 loop 里），都往**栈顶**那个 `loopInfo.breaks_` 里塞类型——嵌套 loop 会 push 自己的上下文，所以 break 天然指向最近的 loop；
+3. 检查完体，**pop** 出这个 `loopInfo`；此时 `breaks_` 是空 → 没有任何 break 指向它 → 类型 never；非空 → 用 expected 或 LUB 合并。
+
+具体代码形状：
+
+```cpp
+semType* Checker::checkLoop(loopExpr* loop, semType* wish) {
+    loops_.push_back(loopInfo{wish, {}});
+    semType* body = checkBlock(loop->block_, semantic::makeUnit());  // 体要求 unit/never
+    loopInfo info = loops_.back();
+    loops_.pop_back();
+
+    if (!matches(body, semantic::makeUnit())) error("loop body is not unit");
+    if (info.breaks_.empty()) return semantic::makeNever();
+    if (wish != nullptr) return wish;
+    // 否则对 info.breaks_ 做 LUB（Step 3）；暂时可以先要求全部相等
+    semType* result = info.breaks_[0];   // 注意 never 要先跳过，全 never 则 never
+    for (size_t i = 1; i < info.breaks_.size(); ++i) {
+        result = lub(result, info.breaks_[i]);   // Step 3
+    }
+    return result;
+}
+```
+
+`infer` 里 `loopExpr` 分支改成 `return checkLoop(loop, nullptr);`；`expect` 里要先识别 `loopExpr`：`if (auto* lp = dynamic_cast<loopExpr*>(expr)) return checkLoop(lp, wish);`（这才能把 expected 传给 break 值）。
+
+`break` 分支改成：
+
+```cpp
+if (auto* bre = dynamic_cast<breakExpr*>(expr); bre) {
+    if (loops_.empty()) { error("break outside loop"); return semantic::makeNever(); }
+    loopInfo& ctx = loops_.back();
+    semType* t = semantic::makeUnit();
+    if (bre->tail_) {
+        t = (ctx.expected_ != nullptr) ? expect(bre->tail_, ctx.expected_) : infer(bre->tail_);
+    }
+    ctx.breaks_.push_back(t);    // 不可达里的 break 也会被记，正好符合 spec
+    return semantic::makeNever();
+}
+```
+
+两个容易漏的点：
+
+- **`while` 也要 push 上下文**（expected 用 unit），否则 while 体里的 `break;` 会被报 "break outside loop"。while 自己的类型永远是 `()`，pop 后忽略 breaks；但 `break 5` 在 while 里应该报错——因为 expected 是 unit，`expect(tail, unit)` 会拒掉；
+- **嵌套**：`loop { loop { break; } }` —— 内层 push 后 break 进内层，内层 pop 时有一个 unit break → 内层类型 unit；外层没有 break → never。符合 spec。
+
+LUB 可以先留到 Step 3；在它之前，如果多个 break 值类型不同，暂时报错也行（多数用例是单 break 或同类型）。
+
+---
+
+## User
+
+为什么 checkLoop wish != nullptr 时直接返回 wish? 以及，checkLoop 里面那个 matches 应该是不必要的吧，我 checkBlock 里面 check 了这个事情。以及，为什么 block = checkBlock(loop->block_, makeUnit()) ? 不是可以 break 42 之类的吗？
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 24.6s)
+
+_Thinking:_
+
+The user asks three questions about my checkLoop sketch:
+
+1. Why does `checkLoop` return `wish` directly when wish != nullptr?
+2. Isn't the `matches(body, unit)` in checkLoop redundant because checkBlock already checks it?
+3. Why `checkBlock(loop->block_, makeUnit())`? Doesn't `break 42` produce a value?
+
+Let me answer each carefully.
+
+**Q1: Why return wish when wish != nullptr?**
+
+Because when the loop has an expected type (e.g., `let x: u32 = loop { break 1; };`), all break values are checked against wish (via `ctx.expected_` → `expect(tail, wish)`), so if they type-check, the loop's type is that expected type. There's no need to LUB the break types: the expected type is the common target fixed by context. Returning `wish` is correct **provided** every break value was checked against wish. But careful:
+- Break with no value supplies `()`; if wish is not unit, `break;` must be an error. In my sketch's break branch, if `bre->tail_` is null, I don't check against expected! I only set t=unit and push. That's a gap: should check `matches(unit, ctx.expected_)` and error if not. So returning wish is correct only if the break branch enforces no-value breaks against expected too.
+- Also if there are breaks of type NEVER (e.g., `loop { break return 1; }`?) all break values never → spec says loop also has never type, even with expected? Spec: "If every break operand has the never type, the loop also has the never type." Hmm, but also "using the loop's expected type when supplied". So if expected is supplied and all break operands are never: loop type should be never? Let's parse: "If any break expressions target the loop, their values follow the common result rules, using the loop's expected type when supplied; break; supplies (). If every break operand has the never type, the loop also has the never type." So yes — if all break operands are `!`, loop is `!`, even with expected. But in a coercion context, `!` coerces to expected anyway, and the loop expression's type being `!` vs expected doesn't matter much for the surrounding check (matches(never, wish) true; if we return wish, also fine). For LUB/if merging, never is ignored. So returning wish when expected is provided is practically safe? Consider `let x: u32 = loop { break return; };` — break operand is `return` (type never). Loop type should be never; returning u32 would mean the surrounding gets u32 but the loop never completes, so it's fine semantically (unreachable). Probably harmless. But strictly, spec says never. Simpler: when wish != null, after checking, if all break types are never → return never; else return wish. Edge case; mention.
+- Another subtlety: what if there are no break values but breaks with unit and wish is unit? return wish = unit, fine.
+
+But more importantly: does expected propagate to break values? The spec says loop break values participate with expected type when supplied. So yes.
+
+Alternative design: don't special-case expected; always LUB break types but use expected as the coerce target when checking breaks. If expected is supplied, each break's actual type checked-compatible; LUB would return the first non-never break type which may be a *subtype* (e.g., expected `&i32`, break `&mut i32` coerces to `&i32`; loop type should be `&i32` = expected, not `&mut i32`). So returning `wish` is correct in general when expected exists, because the expected type is the fixed target — that's the whole point of one-to-one coercion. Without expected, LUB over break types.
+
+**Q2: Is `matches(body, unit)` in checkLoop redundant?**
+
+Yes, mostly: `checkBlock(block, unit)` itself compares the block's resulting type against wish with `matches`, and returns makeError on mismatch (with error already emitted). So the extra `if (!matches(body, unit)) error(...)` would double-report. In the current checkBlock implementation:
+```cpp
+semType* ret = ...;
+if (wish != nullptr && !matches(ret, wish)) { error(...); return makeError(); }
+```
+So checkLoop's own matches check is redundant and would emit a second error for the same problem. Remove it. However, careful: since checkBlock returns makeError() on mismatch, and checkLoop proceeds to use `body` only for... nothing (it uses breaks). Actually the body type isn't used for loop typing (break types are). So we can ignore body entirely: `checkBlock(loop->block_, semantic::makeUnit());` then pop. Yes, redundant check is unnecessary. My sketch included it for clarity, but it double-errors. Agree with the user: remove.
+
+**Q3: Why checkBlock(block_, unit)? Doesn't `break 42` produce a value?**
+
+The loop body is a **block**, and the block's own type (tail expression) must be unit (or never). `break 42;` is an **expression statement** inside the block (with semicolon). Its value is not the block's value: `break` transfers control. In a block like `{ break 42; }`, there's no tail; the last statement is `break 42;` whose type is never; the block type is never (per step-1 reachability), so `matches(never, unit)` passes. The `42` is the loop's break value, captured via `loops_` context, not the body block's type.
+
+Contrast: `loop { 42 }` — body block's tail is `42` (no semicolon, last expression) → block type i32 → not unit → error (spec: loop bodies require unit result). So checking the body against unit is right.
+
+Also the "expected" for the body should be unit, not the loop's expected type. The loop's expected type applies to break operands, not the body block tail.
+
+Additional nuances to mention:
+- In break branch, if `ctx.expected_` is non-null:
+  - `break;` (no value) → must match expected (unit only unless expected... expected could be unit; if expected non-unit, error).
+  - `break e` → expect(e, expected).
+- If expected non-null and all break types never → spec says loop never; can return never. Optional nuance.
+- Nested loops and while contexts as before.
+- `continue` doesn't add break.
+
+Also note: `checkLoop` must pop the context even if checkBlock errors; checkBlock doesn't early-return except through returns; it always returns (error or not), so pop after is fine. If exceptions thrown (none), RAII not needed.
+
+Let me also reconsider whether the loop body should be checked with `wish = unit`. Yes.
+
+One more subtlety: `loop { if c { break 1; } }` body block: stmts = [if stmt], if type unit (no else) → reachable true → body type unit → matches unit. Break 1 recorded with expected (if any) or inferred. Good.
+
+Let me answer concisely with these three points, and correct the sketch:
+- Return wish only after ensuring break/no-break-value checks; mention the all-never nuance.
+- Remove redundant matches (checkBlock handles).
+- Explain body unit vs break value distinction.
+
+三个问题都问到点上了。
+
+**1. `wish != nullptr` 时为什么直接返回 wish**
+
+因为 expected 是一个**固定的目标类型**：`let x: u32 = loop { break 1; };` 里每个 break 的值已经在 break 分支被 `expect(tail, wish)` 检查成 u32 了，循环的结果自然就是 u32，不需要再对 break 类型做 LUB（one-to-one coercion 的语义）。只有**没有 expected**时，才需要用 break 值的 LUB 去"推"出 loop 的类型。
+
+但有两个前提，我的草图漏了：
+
+- `break;`（无值）也必须满足 expected：如果 `ctx.expected_` 不是 unit，`break;` 要报错。也就是 break 分支里 no-tail 时也要 `matches(makeUnit(), ctx.expected_)`；
+- spec 还有一句："If every break operand has the never type, the loop also has the never type." 所以严格实现是：expected 存在时，如果所有 break 值都是 never，返回 never；否则返回 wish。不过 never 在后续 `matches` 里本来就兼容，实际影响很小，可以先不管。
+
+**2. `checkLoop` 里的 `matches(body, unit)` 确实多余**
+
+`checkBlock(block, unit)` 内部已经做了：
+```cpp
+if (wish != nullptr && !matches(ret, wish)) { error(...); return makeError(); }
+```
+你再判一次只会对同一个问题报两条错。直接忽略 body 的返回值，pop 上下文即可。循环类型只看 `breaks_`。
+
+**3. 为什么体按 unit 检查？`break 42` 不是很正常吗？**
+
+两个层次别混了：
+
+- **loop 体是一个 block**，block 自身的类型（有 tail 时）必须是 unit 或 never。`loop { 42 }` 的 tail 是 42 → 体类型 i32 → 错；`loop { 42; }` 有分号 → 是语句，体无 tail、最后一条可达语句类型 unit → 体类型 unit → 可以。
+- `break 42;` 里 `42` **不是 block 的值**：`break` 本身类型是 never，42 是"交给 loop 的 break 值"，通过 `loops_` 栈单独记录。`{ break 42; }` 没有 tail，最后一条语句（break）是 never → 块类型 never → `matches(never, unit)` 通过。
+
+所以体的 expected 是 **unit**，loop 的 expected（wish）只作用在 **break 的操作数**上，二者不同。
+
+修正后的形状：
+
+```cpp
+semType* Checker::checkLoop(loopExpr* loop, semType* wish) {
+    loops_.push_back(loopInfo{wish, {}});
+    checkBlock(loop->block_, semantic::makeUnit());   // 内部已比较 unit/never，不用再看返回值
+    loopInfo info = loops_.back();
+    loops_.pop_back();
+
+    if (info.breaks_.empty()) return semantic::makeNever();
+    if (wish != nullptr) return wish;
+    // 否则 LUB(info.breaks_)，跳过 never；全 never → never
+}
+```
+
+break 分支补上无值检查：
+
+```cpp
+if (bre->tail_) {
+    t = ctx.expected_ ? expect(bre->tail_, ctx.expected_) : infer(bre->tail_);
+}
+else if (ctx.expected_ && !matches(semantic::makeUnit(), ctx.expected_)) {
+    error("break without a value in a loop expecting one");
+}
+ctx.breaks_.push_back(t);
+return semantic::makeNever();
+```
+
+---
+
+## User
+
+我写了，然后把 while 也补了，你看看。
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 14.0s)
+
+_Thinking:_
+
+The user says they wrote step 2 (loop context) and also added while context. Need to review the current code: loopInfo usage, checkLoop helper, infer(loop), expect(loop), break branch, while handling. Let me read the relevant sections. Also build and run the Phase 2/3 suites to see status.
+
+Let me grep for checkLoop, loops_, loopInfo usage, and read infer loop/while/break + expect.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && grep -n \"checkLoop\\|loops_\\|loopInfo\" compiler/src/semantic/checker.cpp compiler/src/semantic/checker.h; echo ===; sed -n '/semType\\* Checker::checkLoop/,/^}/p' compiler/src/semantic/checker.cpp; echo ===; sed -n '/if (auto whi = dynamic_cast<whileExpr/,/^    }/p; /if (auto loop = dynamic_cast<loopExpr/,/^    }/p; /if (auto bre = dynamic_cast<breakExpr/,/^    }/p' compiler/src/semantic/checker.cpp"
+}
+```
+
+**Output:**
+```
+compiler/src/semantic/checker.cpp:697:        loops_.push_back(loopInfo{semantic::makeUnit(), {}});
+compiler/src/semantic/checker.cpp:699:        loopInfo info = loops_.back();
+compiler/src/semantic/checker.cpp:700:        loops_.pop_back();
+compiler/src/semantic/checker.cpp:712:        return checkLoop(loop, nullptr);
+compiler/src/semantic/checker.cpp:715:        if (loops_.empty()) {
+compiler/src/semantic/checker.cpp:719:        loopInfo &top = loops_.back();
+compiler/src/semantic/checker.cpp:918:        return checkLoop(loop, wish);
+compiler/src/semantic/checker.cpp:980:semType* Checker::checkLoop(loopExpr* loop, semType* wish) {
+compiler/src/semantic/checker.cpp:981:    loops_.push_back(loopInfo{wish, {}});
+compiler/src/semantic/checker.cpp:983:    loopInfo info = loops_.back();
+compiler/src/semantic/checker.cpp:984:    loops_.pop_back();
+compiler/src/semantic/checker.h:23:    semType* checkLoop(loopExpr* loop, semType* wish);
+compiler/src/semantic/checker.h:34:    std::vector<loopInfo> loops_;
+===
+semType* Checker::checkLoop(loopExpr* loop, semType* wish) {
+    loops_.push_back(loopInfo{wish, {}});
+    semType* block = checkBlock(loop->block_, semantic::makeUnit());
+    loopInfo info = loops_.back();
+    loops_.pop_back();
+    if (info.breaks_.empty()) {
+        return semantic::makeNever();
+    }
+    if (wish != nullptr) {
+        return wish;
+    }
+    return info.breaks_[0]; // lub is on stage 3
+}
+===
+    if (auto whi = dynamic_cast<whileExpr*>(expr); whi) {
+        expect(whi->cond_, semantic::makeBuiltin("bool"));
+        if (!matches(infer(whi->block_), semantic::makeUnit())) {
+            error("whileExpr block is not unit");
+            return semantic::makeError();
+        }
+        
+        loops_.push_back(loopInfo{semantic::makeUnit(), {}});
+        semType* block = checkBlock(whi->block_, semantic::makeUnit());
+        loopInfo info = loops_.back();
+        loops_.pop_back();
+        if (info.breaks_.empty()) {
+            return semantic::makeNever();
+        }
+        for (auto bre : info.breaks_) {
+            if (!matches(bre, semantic::makeUnit())) {
+                error("break have a non-unit value");
+            }
+        }
+        return semantic::makeUnit();
+    }
+    if (auto loop = dynamic_cast<loopExpr*>(expr); loop) {
+        return checkLoop(loop, nullptr);
+    }
+    if (auto bre = dynamic_cast<breakExpr*>(expr); bre) {
+        if (loops_.empty()) {
+            error("break outside loop");
+            return semantic::makeError();
+        }
+        loopInfo &top = loops_.back();
+        if (!bre->tail_ && top.expected_ && !matches(semantic::makeUnit(), top.expected_)) {
+            error("break without a value in a loop which expects one");
+        }
+        semType* type = (bre->tail_ ? (top.expected_ == nullptr ? expect(bre->tail_, top.expected_) : infer(bre->tail_)) : semantic::makeUnit());
+        top.breaks_.push_back(type);
+        return semantic::makeNever();
+    }
+    if (auto loop = dynamic_cast<loopExpr*>(expr); loop) {
+        return checkLoop(loop, wish);
+    }
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 25.3s)
+
+_Thinking:_
+
+Let me review:
+
+**break branch:**
+```cpp
+semType* type = (bre->tail_ ? (top.expected_ == nullptr ? expect(bre->tail_, top.expected_) : infer(bre->tail_)) : semantic::makeUnit());
+```
+The ternary is INVERTED! Should be: if expected_ != nullptr → expect(tail, expected_); else → infer(tail). They wrote `top.expected_ == nullptr ? expect(...) : infer(...)` — exactly backwards. As written:
+- When expected_ == nullptr: `expect(tail, nullptr)` → expect sees wish==nullptr → infer(tail). So actually works by accident! Because expect(x, nullptr) = infer(x).
+- When expected_ != nullptr: `infer(tail)` — does NOT check against expected! So `let x: u32 = loop { break true; };` would accept? infer(true)=bool, pushed; checkLoop returns wish u32; no check of break against u32. BUG. Should be `top.expected_ == nullptr ? infer(...) : expect(..., top.expected_)`.
+So the ternary is inverted but half-works due to expect(nullptr). Fix.
+
+**while branch:**
+```cpp
+expect(cond, bool);
+if (!matches(infer(whi->block_), unit)) { error; return makeError; }   // ← infers the block once WITHOUT loop context
+loops_.push_back(loopInfo{unit, {}});
+semType* block = checkBlock(whi->block_, unit);                        // ← checks the SAME block AGAIN with context
+loopInfo info = ...;
+if (info.breaks_.empty()) return makeNever();                          // ← WRONG: while type is always unit, per spec
+for breaks: if (!matches(bre, unit)) error;
+return makeUnit();
+```
+Problems:
+1. **Double-checking the body**: `infer(whi->block_)` runs before pushing context; any `break;` inside would then hit `loops_.empty()` → "break outside loop" error! And then it checks the block again with context. Even without breaks, the block is checked twice: duplicate errors, duplicate scope side effects? checkBlock pushes/pops scope; infer(block) → checkBlock(block, nullptr) pushes/pops; then checkBlock again. Also `let` declarations in the body would be duplicated but scoped, harmless; but names looked up twice, errors duplicated.
+   Fix: remove the first `infer(whi->block_)` check; push context first, then `checkBlock(whi->block_, unit)`.
+2. **`while` returns NEVER when no breaks** — spec says while always has type `()`. Fix: always return unit; ignore breaks emptiness (but still collect to detect break values). Actually breaks in while: `break;` allowed; `break 5` must error (their loop over breaks checks matches unit → error). But note: with expected=unit, break with value should also be checked in break branch: `expect(tail, unit)` → i32 vs unit → error; then breaks_ contains i32 and the loop over info.breaks_ also errors (duplicate). Keep one. Simpler: push ctx with expected=unit; break branch checks; after, just return unit. Remove the `for` loop (duplicate errors).
+   Also `break` in while: allowed. `continue` fine.
+3. `semType* block` unused.
+
+**checkLoop:** returns `info.breaks_[0]` if no wish — no LUB yet (stage 3), fine. But for multiple breaks of differing types it returns first; tests for Phase 3 need LUB; they know. Also body variable unused (warning). Note: if breaks_[0] is never and another is i32, returns never; LUB stage 3 fixes.
+
+**infer(loop)** and **expect(loop)**: check lines 712 and 918. In expect, they added loop special case at 918 presumably:
+```cpp
+if (auto loop = dynamic_cast<loopExpr*>(expr); loop) {
+    return checkLoop(loop, wish);
+}
+```
+That's at the end of expect? The grep shows it after break branch? Wait, sed output mixes: at the end of the third excerpt we see:
+```
+    if (auto loop = dynamic_cast<loopExpr*>(expr); loop) {
+        return checkLoop(loop, wish);
+    }
+```
+That's likely in `expect`. Need to verify placement (before the fallback infer+typeEqual). Probably fine.
+
+**while break context**: the while branch pushes context only after the first infer — fix ordering.
+
+**Nested while/loop in expect/infer**: while handled in infer; if `while` appears in expect(wish), falls back to infer → fine (result unit).
+
+**checkLoop pops context but if checkBlock errors?** checkBlock returns normally, fine.
+
+**Also**: while body check via checkBlock(unit) will error on non-unit tail; good.
+
+Now build/test. But first check compile: `semType* block` unused → warning only. Let me build and run loops suites + phase2 regression.
+
+Let me also check expect placement and infer order. Let me view lines 900-930 and 690-720.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && sed -n '905,940p' compiler/src/semantic/checker.cpp; echo ===; sed -n '690,725p' compiler/src/semantic/checker.cpp; echo ===; cmake --build target/build -j 2>&1 | grep -E \"error|warning|Built target\" | head -6",
+  "timeout": 180000
+}
+```
+
+**Output:**
+```
+        else {
+            semType* cur = semantic::makeBuiltin(suf);
+            if (!semantic::typeEqual(cur, wish)) {
+                error("wish an suffixed integer to be another type");
+                return semantic::makeError();
+            }
+            return wish;
+        }
+    }
+    if (auto block = dynamic_cast<blockExpr*>(expr); block) {
+        return checkBlock(block, wish);
+    }
+    if (auto loop = dynamic_cast<loopExpr*>(expr); loop) {
+        return checkLoop(loop, wish);
+    }
+    semType* type = infer(expr);
+    if (!semantic::typeEqual(type, wish)) {
+        error("expect type mismatch");
+        return semantic::makeError();
+    }
+    return wish;
+}
+
+void Checker::checkItem(Item* item){
+    if (auto func= dynamic_cast<funcItem*>(item); func) {
+        checkFunction(func, "");
+    }
+    else if (auto impl = dynamic_cast<ImplItem*>(item); impl) {
+        if (impl->type_->kind_ != Type::kTypeKind::STRUCT) {
+            return;
+        }
+        for (Item* down : impl->items_) {
+            if (auto func = dynamic_cast<funcItem*>(down); func){
+                checkFunction(func, impl->type_->name_);
+            }
+        }
+===
+    if (auto whi = dynamic_cast<whileExpr*>(expr); whi) {
+        expect(whi->cond_, semantic::makeBuiltin("bool"));
+        if (!matches(infer(whi->block_), semantic::makeUnit())) {
+            error("whileExpr block is not unit");
+            return semantic::makeError();
+        }
+        
+        loops_.push_back(loopInfo{semantic::makeUnit(), {}});
+        semType* block = checkBlock(whi->block_, semantic::makeUnit());
+        loopInfo info = loops_.back();
+        loops_.pop_back();
+        if (info.breaks_.empty()) {
+            return semantic::makeNever();
+        }
+        for (auto bre : info.breaks_) {
+            if (!matches(bre, semantic::makeUnit())) {
+                error("break have a non-unit value");
+            }
+        }
+        return semantic::makeUnit();
+    }
+    if (auto loop = dynamic_cast<loopExpr*>(expr); loop) {
+        return checkLoop(loop, nullptr);
+    }
+    if (auto bre = dynamic_cast<breakExpr*>(expr); bre) {
+        if (loops_.empty()) {
+            error("break outside loop");
+            return semantic::makeError();
+        }
+        loopInfo &top = loops_.back();
+        if (!bre->tail_ && top.expected_ && !matches(semantic::makeUnit(), top.expected_)) {
+            error("break without a value in a loop which expects one");
+        }
+        semType* type = (bre->tail_ ? (top.expected_ == nullptr ? expect(bre->tail_, top.expected_) : infer(bre->tail_)) : semantic::makeUnit());
+        top.breaks_.push_back(type);
+        return semantic::makeNever();
+===
+[100%] Built target rxcc
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 20.2s)
+
+_Thinking:_
+
+Now I have the full picture. Issues:
+
+1. **break ternary inverted** (as analyzed):
+```cpp
+semType* type = (bre->tail_ ? (top.expected_ == nullptr ? expect(bre->tail_, top.expected_) : infer(bre->tail_)) : unit);
+```
+When expected_ != nullptr, it calls infer (no expected check). Fix: `top.expected_ == nullptr ? infer(...) : expect(..., top.expected_)`.
+
+2. **while double-checks body** and returns never when no breaks:
+- `infer(whi->block_)` before pushing context → breaks inside get "break outside loop" (loops_ empty!). E.g., `while c { break; }` → error + then second check with context. Duplicate/incorrect.
+- Remove the first check.
+- While type must always be `()`; remove `if (info.breaks_.empty()) return makeNever();` and just return unit. Keep the break value check? If break branch with expected=unit already checks `break 5` via expect/infer — wait with the fixed ternary, expected != nullptr → expect(tail, unit) → error for break 5; and pushes i32. The post-loop `for (auto bre : info.breaks_) if (!matches(bre, unit)) error` would duplicate. Remove the for loop too.
+- Also `semType* block` unused; just call checkBlock.
+
+3. **expect(loop) placement fine** (before fallback).
+
+4. **checkLoop returns breaks_[0]**; fine for now. `semType* block` unused — call without assignment or cast to void.
+
+5. **checkLoop body check**: `checkBlock(loop->block_, unit)` — correct. But note: for `loop { break 42; }`, checkBlock's scope handling: break inside expression statement; `infer(break)` records; returns never; block reachable=false; no tail → never; matches unit. Good.
+
+6. **return `wish` when breaks non-empty**: as discussed, fine if break branch checks expected.
+
+7. Another subtle bug: in the while branch, if there are no breaks, returning never was wrong. Fixed by always unit.
+
+8. Also for `while`, spec: while type is unit; the loop context for breaks should be pushed with expected unit. Yes.
+
+9. Also check: `while` body with `break 5` — break branch (expected unit) → expect(5, unit) → typeEqual i32/unit false → error. Good.
+
+10. Another issue: `break` branch when `top.expected_ != nullptr` and tail exists → expect(tail, expected) returns expected type (e.g., u32) — pushes u32; checkLoop with wish returns wish anyway. Fine.
+
+11. What about `break` outside loop inside `while` condition? Conditions are expressions; break in condition? Grammar allows break in condition? `while break {}`? weird; not tested.
+
+Now, the user asked "你看看" — review. Let me also run the loop-related suites after identifying bugs? They're not fixed yet; current tests could show. But comment errors suffice. Maybe build passed; run the phase2 suites + loops to quantify. Let me run loops-and-jumps, blocks-if-and-never, expected-types quickly to see status. But since step 2 isn't complete (LUB missing), many failures expected. The review is the priority.
+
+Let me structure the response:
+1. break ternary inverted — with exact fix.
+2. while: remove first infer/unit check; push context first; always return unit; remove the duplicate for-loop check.
+3. minor: unused `block` variable; maybe checkLoop return first break (LUB later).
+4. Confirm expect(loop) placement good; checkLoop pops correctly.
+
+Also mention: current while returning never on empty breaks would make `fn f() { while false {} }` type never; `matches` would treat it as compatible with anything (never), which might hide errors but spec says unit. Fix.
+
+Let me also mention the double-check issue causes `while c { break; }` to report "break outside loop" — concrete.
+
+Should I apply the fixes? They asked "你看看" (review). I'll give exact diffs. Keep concise.
+
+这版有两个真 bug，都在 while/break：
+
+**1. `break` 的三元表达式写反了**：
+
+```cpp
+semType* type = (bre->tail_ ? (top.expected_ == nullptr ? expect(bre->tail_, top.expected_) : infer(bre->tail_)) : unit);
+```
+
+expected 存在时走的是 `infer`，等于**根本没按 loop 的 expected 检查**。应该：
+
+```cpp
+semType* type = bre->tail_
+    ? (top.expected_ == nullptr ? infer(bre->tail_) : expect(bre->tail_, top.expected_))
+    : semantic::makeUnit();
+```
+
+现在之所以有些用例能过，是因为 `expected_ == nullptr` 那支调了 `expect(tail, nullptr)`，而 `expect` 对 wish==nullptr 就是 `infer`——纯属巧合。
+
+**2. while 把 body 检查了两遍，而且类型返回错**：
+
+```cpp
+if (!matches(infer(whi->block_), unit)) { ... }        // ← 第一次，此时 loops_ 还没 push
+loops_.push_back(loopInfo{unit, {}});
+semType* block = checkBlock(whi->block_, unit);        // ← 第二次
+...
+if (info.breaks_.empty()) return semantic::makeNever(); // ← while 永远不是 never
+```
+
+- 第一次 `infer(body)` 时没 push 上下文，`while c { break; }` 里的 break 会报 **"break outside loop"**；
+- body 被检查两遍，错误会重复；
+- spec 明确："A `while` expression has type `()`, even when its condition is always true." 所以 `breaks_.empty()` 时返回 never 是错的。
+
+改成：
+
+```cpp
+if (auto whi = dynamic_cast<whileExpr*>(expr); whi) {
+    expect(whi->cond_, semantic::makeBuiltin("bool"));
+    loops_.push_back(loopInfo{semantic::makeUnit(), {}});
+    checkBlock(whi->block_, semantic::makeUnit());   // 体要求 unit/never
+    loops_.pop_back();                               // breaks_ 里若有非 unit 值，break 分支已经报过错
+    return semantic::makeUnit();
+}
+```
+
+（后面的 `for (auto bre : info.breaks_)` 也不用留：`break 5` 在 break 分支里 `expect(tail, unit)` 已经报过一次，再报就是重复。）
+
+其他：
+
+- `checkLoop` 里 `semType* block = checkBlock(...)` 的 `block` 没用，改成直接调用；
+- `checkLoop` 在多 break 时返回 `breaks_[0]` 没问题（LUB 是 Step 3），但注意第一个 break 可能是 never（比如 `break return;`），Step 3 写 LUB 时要跳过 never；
+- `expect` 里 `loopExpr` 的分支放的位置对（在 fallback `infer` 之前），`infer` 里 `loopExpr → checkLoop(loop, nullptr)` 也对。
+
+修完 while 这两处，`loops-and-jumps` 里 `while c { break; }`、`loop { break 42; }` 才不会互相误伤。
+
+---
+
+## User
+
+修了修了，你看看，下一步呢？
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 19.8s)
+
+_Thinking:_
+
+The user fixed the issues. Let me review the current code (while branch, break ternary, checkLoop) and build/run relevant suites. Then tell them next step (Step 3: LUB + expect propagation + if merging), since Phase 3 continues.
+
+Let me read the current while/break/checkLoop and build/test loops suites.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && sed -n '/if (auto whi = dynamic_cast<whileExpr/,/^    }/p; /if (auto bre = dynamic_cast<breakExpr/,/^    }/p; /semType\\* Checker::checkLoop/,/^}/p' compiler/src/semantic/checker.cpp; echo ===; cmake --build target/build -j 2>&1 | grep -E \"error|warning|Built target\" | head -5",
+  "timeout": 180000
+}
+```
+
+**Output:**
+```
+    if (auto whi = dynamic_cast<whileExpr*>(expr); whi) {
+        expect(whi->cond_, semantic::makeBuiltin("bool"));
+        loops_.push_back(loopInfo{semantic::makeUnit(), {}});
+        checkBlock(whi->block_, semantic::makeUnit());
+        loops_.pop_back();
+        return semantic::makeUnit();
+    }
+    if (auto bre = dynamic_cast<breakExpr*>(expr); bre) {
+        if (loops_.empty()) {
+            error("break outside loop");
+            return semantic::makeError();
+        }
+        loopInfo &top = loops_.back();
+        if (!bre->tail_ && top.expected_ && !matches(semantic::makeUnit(), top.expected_)) {
+            error("break without a value in a loop which expects one");
+        }
+        semType* type = (bre->tail_ ? (top.expected_ != nullptr ? expect(bre->tail_, top.expected_) : infer(bre->tail_)) : semantic::makeUnit());
+        top.breaks_.push_back(type);
+        return semantic::makeNever();
+    }
+semType* Checker::checkLoop(loopExpr* loop, semType* wish) {
+    loops_.push_back(loopInfo{wish, {}});
+    checkBlock(loop->block_, semantic::makeUnit());
+    loopInfo info = loops_.back();
+    loops_.pop_back();
+    if (info.breaks_.empty()) {
+        return semantic::makeNever();
+    }
+    if (wish != nullptr) {
+        return wish;
+    }
+    return info.breaks_[0]; // lub is on stage 3
+}
+===
+[100%] Built target rxcc
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 36.5s)
+
+_Thinking:_
+
+Fixes look correct:
+- while: push context, check body once, pop, return unit.
+- break ternary fixed: expected ? expect : infer.
+- checkLoop good.
+
+Now run the loop-related suites + phase 2 regression to quantify. Then explain next step (Step 3: LUB + if merging + expect propagation).
+
+Let me run the Phase 3 suites: expected-types, blocks-if-and-never, loops-and-jumps, loop-state-merges, runtime-value-merges, plus Phase 2 suites to ensure no regressions. That may take ~30s. Let me run.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && make test FILTER=official:semantic:expected-types,official:semantic:blocks-if-and-never,official:semantic:loops-and-jumps,official:semantic:loop-state-merges,official:semantic:runtime-value-merges STAGE=semantic 2>&1 | grep -E \"^\\s*[0-9]+\\)|passed|failed\" | head -30",
+  "timeout": 300000
+}
+```
+
+**Output:**
+```
+. passed  F failed
+1) official:semantic:blocks-if-and-never/acc-both-parser-representations-of-tails-and-return-as-never.rx@semantic
+2) official:semantic:blocks-if-and-never/rej-a-non-final-block-statement-without-semicolon-must-be-unit.rx@semantic
+3) official:semantic:expected-types/acc-no-inference-through-operators-or-borrows-is-required.rx@semantic
+4) official:semantic:expected-types/rej-a-fixed-array-target-rejects-a-mismatched-element.rx@semantic
+5) official:semantic:loops-and-jumps/rej-continue-outside-a-loop.rx@semantic
+6) official:semantic:runtime-value-merges/acc-input-dependent-reference-aggregate-and-owner-results.rx@semantic
+======================== 6 failed, 15 passed in 22.56s =========================
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 17.3s)
+
+_Thinking:_
+
+Current Phase-3 suite status: 15 passed / 6 failed. Let me inspect the 6 failures:
+
+1. `blocks-if-and-never/acc-both-parser-representations-of-tails-and-return-as-never.rx` — likely `if` with then/else where one is never; needs if LUB with never compatibility (Step 3). Also `{ x+1 }` blocks, return as never.
+2. `blocks-if-and-never/rej-a-non-final-block-statement-without-semicolon-must-be-unit.rx` — a non-final block statement without semicolon must be unit: e.g., `{ if true { 1 } else { 2 } 3 }`? Parser/AST: expressionWithBlock as non-tail statement with no semicolon must be unit. AST builder drops that distinction? The blockExpr stmts_ includes exprStmt for non-final expressionWithBlock; infer(if) returns i32 → should error because statement-with-block without semicolon must be unit. Our AST loses whether semicolon was present! Hmm, AST `exprStmt` has no `hasSemi_` flag. Wait — ast_builder: visitBlockExpression turns the LAST expressionWithBlock without semicolon into tail; non-last expressionWithBlock statements always become exprStmt regardless of semicolon. The spec says non-final block statement without semicolon must be unit. Since AST doesn't record semicolon presence, we can't distinguish. But maybe the AST builder's rule: for last only; for non-last, if expressionWithBlock without SEMI, spec requires unit; if with SEMI, any. The AST lost the SEMI info. Hmm, but maybe the parser's statement rule (`expressionWithBlock SEMI?`) — AST builder doesn't store SEMI. So this negative test can't be caught without AST change. Let me look at the test to see the construct. Maybe it's about a block tail vs statement? Let me cat the file.
+3. `expected-types/acc-no-inference-through-operators-or-borrows-is-required.rx` — wait, "acc" positive: no inference through operators required, e.g., `let n: i32 = 1 + 2;` valid by defaulting; `let r: &u32 = &1u32;` valid; maybe uses `let bad...`? Let me check.
+4. `expected-types/rej-a-fixed-array-target-rejects-a-mismatched-element.rx` — array literal expected type (Phase 5 arrays? but expected-types suite) — needs arrayExpr handling + expected propagation; Phase 5? The suite is Phase 3 but arrays not implemented → infer array returns ERROR, which is compatible → not rejected. Need minimal arrayExpr handling in expect to reject mismatch. Hmm.
+5. `loops-and-jumps/rej-continue-outside-a-loop.rx` — continue outside loop must error; our continue branch always returns never without checking loops_. Easy fix.
+6. `runtime-value-merges/acc-input-dependent-reference-aggregate-and-owner-results.rx` — needs arrays/structs/refs presumably; Phase 4/5.
+
+Let me look at the actual failing test sources to determine what's needed:
+- blocks acc
+- blocks rej non-final
+- expected acc no-inference
+- expected rej fixed array
+- runtime-value-merges acc
+
+Let me cat them. Then give next steps: Step 3 (LUB + if never + expect propagation) plus small fixes (continue check). Also possibly need minimal array expression handling for the expected-types test — but arrays are Phase 5; maybe the test uses array literal with expected type; we could defer that one failure to Phase 5. Let me check.
+
+Let me read the failing files.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic\" && for f in blocks-if-and-never/acc-both-parser-representations-of-tails-and-return-as-never.rx blocks-if-and-never/rej-a-non-final-block-statement-without-semicolon-must-be-unit.rx expected-types/acc-no-inference-through-operators-or-borrows-is-required.rx expected-types/rej-a-fixed-array-target-rejects-a-mismatched-element.rx loops-and-jumps/rej-continue-outside-a-loop.rx runtime-value-merges/acc-input-dependent-reference-aggregate-and-owner-results.rx; do echo \"=== $f\"; cat \"$f\"; done"
+}
+```
+
+**Output:**
+```
+=== blocks-if-and-never/acc-both-parser-representations-of-tails-and-return-as-never.rx
+use rx::core::*;
+
+fn f(x: i32) -> i32 {
+    let v = if x < 0 {
+        return 90;
+    } else if x == 0 {
+        7
+    } else {
+        { x + 1 }
+    };
+    { v * 2 }
+}
+fn main() {
+    let x = get_i32();
+    println_i32(f(x));
+    if true {
+    } else {
+    }
+    -1;
+    if true {
+        10
+    } else {
+        20
+    };
+    let y = if true { 10 } else { 20 } - 1;
+    println_i32(y);
+}
+=== blocks-if-and-never/rej-a-non-final-block-statement-without-semicolon-must-be-unit.rx
+use rx::core::*;
+
+fn main() {
+    {
+        1
+    }
+    println_i32(2);
+}
+=== expected-types/acc-no-inference-through-operators-or-borrows-is-required.rx
+use rx::core::*;
+
+struct S {
+    x: u32,
+}
+fn f(x: u32) -> u32 {
+    x
+}
+fn tail() -> usize {
+    { (17) }
+}
+fn ret() -> isize {
+    return 19;
+}
+fn main() {
+    let mut x: u32 = if true { { 3 } } else { 4 };
+    x = (5);
+    let a: [u32; 2] = [6, 7];
+    let b: [u32; 2] = [8; 2];
+    let v: u32 = loop {
+        break { 9 };
+    };
+    let s = S { x: 10 };
+    let p = Box::<u32>::new(11);
+    println_i32(x as i32);
+    println_i32(a[1] as i32);
+    println_i32(b[0] as i32);
+    println_i32(v as i32);
+    println_i32(s.x as i32);
+    println_i32(*p as i32);
+    println_i32(f(12) as i32);
+    println_i32(tail() as i32);
+    println_i32(ret() as i32);
+}
+=== expected-types/rej-a-fixed-array-target-rejects-a-mismatched-element.rx
+use rx::core::*;
+
+fn main() {
+    let x: [u32; 2] = [1u32, 2i32];
+}
+=== loops-and-jumps/rej-continue-outside-a-loop.rx
+use rx::core::*;
+
+fn main() {
+    continue;
+}
+=== runtime-value-merges/acc-input-dependent-reference-aggregate-and-owner-results.rx
+use rx::core::*;
+
+#[derive(Clone, Copy)]
+struct Packet {
+    data: [i32; 3],
+    flag: bool,
+}
+fn packet(seed: i32) -> Packet {
+    Packet { data: [seed, seed + 1, seed + 2], flag: seed > 0 }
+}
+fn vector(seed: i32) -> Vec<i32> {
+    let mut values = Vec::<i32>::new();
+    values.push(seed);
+    values.push(seed + 1);
+    values
+}
+fn main() {
+    let selector = get_i32();
+    let seed = get_i32();
+    let first = (selector & 1) != 0;
+    let second = (selector & 2) != 0;
+    let mut a = seed;
+    let b = seed + 10;
+    let r = if first { &mut a } else { &b };
+    println_i32(*r);
+    let mut c = seed + 20;
+    let reverse = if first { &b } else { &mut c };
+    println_i32(*reverse);
+    let mut step = 0;
+    let from_loop = loop {
+        if second {
+            break &b;
+        }
+        step += 1;
+        if step == 2 {
+            break &mut a;
+        }
+    };
+    println_i32(*from_loop);
+
+    let mut left = seed + 30;
+    let mut right = seed + 40;
+    let target = if first { &mut left } else { &mut right };
+    *target += 3;
+    println_i32(left);
+    println_i32(right);
+
+    let mut chosen = if first { packet(seed) } else { packet(seed + 1) };
+    let saved = chosen;
+    chosen.data[1] += 5;
+    println_i32(saved.data[1]);
+    println_i32(chosen.data[1]);
+    println_i32(chosen.flag as i32);
+    let mut array = loop {
+        if second {
+            break [seed, seed + 1];
+        }
+        break [seed + 2, seed + 3];
+    };
+    let saved_array = array;
+    array[0] += 7;
+    println_i32(saved_array[0]);
+    println_i32(array[0]);
+
+    let owned = if first {
+        Box::<i32>::new(seed + 50)
+    } else {
+        Box::<i32>::new(seed + 60)
+    };
+    println_i32(*owned);
+    let mut values = loop {
+        if second {
+            break vector(seed);
+        }
+        break vector(seed + 5);
+    };
+    println_i32(values.remove(0));
+    println_i32(values[0]);
+}
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 32.9s)
+
+_Thinking:_
+
+Now let me analyze each failure and what's needed:
+
+1. **blocks acc**: `let v = if x < 0 { return 90; } else if x == 0 { 7 } else { { x + 1 } };` — infer(if) with else chain: outer if: then block `{return 90;}` → never; else is ifExpr → infer. Current infer(if): requires typeEqual(infer(then), infer(else)) → never vs i32 fails. Need LUB/never handling (Step 3). Also `if true {10} else {20} - 1;` and statement boundary — AST splits, already fine. So fix via Step 3 if merging.
+
+2. **rej-non-final block statement without semicolon**:
+```rust
+fn main() {
+    {
+        1
+    }
+    println_i32(2);
+}
+```
+The block `{1}` is a non-final statement **without semicolon**; spec says an expressionWithBlock used as a statement (discarding value) without semicolon requires unit or never. Here it's i32 → error. AST builder: in visitBlockExpression, for non-last statements `expressionWithBlock SEMI?` → it pushes exprStmt without recording whether SEMI present. So the AST loses this info. Options:
+- Modify ast.h: add `bool hasSemi_` to exprStmt, set in visitStatement/visitBlockExpression. But they said don't modify AST? We can modify AST if needed. Note AST acceptance done; modifying AST is allowed but risk. Alternatively, in checkBlock, we can inspect... no info. Hmm.
+- Wait: maybe the AST builder already encodes it differently? In visitBlockExpression:
+  ```cpp
+  if (auto blk = stmt->expressionWithBlock(); blk) {
+      if (ctx->statementExpression() == nullptr && stmt->SEMI() == nullptr) last_value = true;
+  }
+  ```
+  Only for the LAST statement it turns into tail if no semi and no following statementExpression. For non-last expressionWithBlock statements, they're all pushed as exprStmt regardless of SEMI. So indeed info lost: `{1}; println...` (with semicolon) is legal (value discarded), `{1} println...` (no semicolon) is illegal unless unit/never. The test targets this. To catch it, need to know SEMI presence. Could add a field to exprStmt (`bool semi_` or `bool hasSemi_`) and set it in AST builder. That's an AST change; optional. Since AST is "done" and accepted, but accuracy matters for this test. Alternatively, derive from a rule: any exprStmt whose expression is an `expressionWithBlock` node (block/if/while/loop) and which is NOT the last statement... but both with and without semicolon can be non-last; can't distinguish. So yes, needs AST change.
+  - However, maybe we can skip this test for now (one negative) and revisit. But it's part of Phase 3 suite; better to add the flag. Changing ast.h is small and AST builder: in visitBlockExpression when pushing non-last stmt, set `exprStmt->hasSemi_ = (stmt->SEMI() != nullptr)`; also for non-expressionWithBlock (statementExpression SEMI required). For the last statement handled as stmt (not tail) similarly. In visitStatement, `expressionWithBlock SEMI?` → set flag. Then checkStatement for exprStmt: if `expr->expr_` is a block-form expression (blockExpr/ifExpr/whileExpr/loopExpr) and `!hasSemi_` and not last... wait, non-final means it wasn't turned into tail. Actually in the AST, a block-form exprStmt without semi only exists when it's a non-final statement or last-with-following-statementExpression. For ALL such exprStmt, the spec requires its type be unit or never. With a semicolon, any type is allowed. So check: if exprStmt's expr is a "block expression" (Block/If/While/Loop) and hasSemi_ == false → matches(type, unit) required. That's precise.
+  - Alternatively, since the AST builder only creates a bare (no-semi) block-expression statement when the type must be unit, we could check in the builder and... no, builder lacks types.
+  - So add `bool hasSemi_ = true;` to exprStmt; set in builder. Wait, AST builder needs modification in multiple places (visitStatement, visitBlockExpression). Let me look at how statements are built. visitStatement returns exprStmt for expressionWithBlock and statementExpression. In visitBlockExpression, for each stmt non-last: `now->stmts_.push_back(anyStmt(visit(stmt)))`; visitStatement knows `ctx->expressionWithBlock()` and `ctx->SEMI()`? The statement context has SEMI() accessor. So in visitStatement: set `now->hasSemi_ = (ctx->SEMI() != nullptr);` for expressionWithBlock; for statementExpression SEMI is required (always true). That's enough — visitBlockExpression just uses visit(stmt) which carries the flag. For the last-statement special handling, when it creates tail (no semi) no exprStmt; when it pushes stmt, visit gives flag. 
+  - But wait: `statement: expressionWithBlock SEMI? | statementExpression SEMI`. For expressionWithBlock variant, `ctx->SEMI()` exists. Good. For statementExpression, SEMI always present; set true.
+  - This is an AST change; mention it.
+
+3. **expected acc**: uses arrays, repeated arrays, struct init, Box::new, method calls (push/remove), deref of Box. Many are Phase 5. The failure could be due to one of these erroring (e.g., `Box::<u32>::new(11)` infer returns makeError silently; `*p` deref: infer(p) = makeError (call 2-seg path returns ERROR) → deref error "non-reference" → false reject). So this acc needs Phase 5 (Box/deref/struct/array). Actually `let p = Box::<u32>::new(11); println_i32(*p as i32);` — deref(ERROR) errors. Also arrays: `let a: [u32; 2] = [6,7];` — expect(arrayExpr, [u32;2]) falls to infer(arrayExpr)=ERROR → typeEqual(ERROR, array) true → passes (no error). Struct init infer=ERROR → s.x field → ERROR; passes. `Vec::<i32>::new()` etc. — 2-seg call returns makeError silently. So the only hard error is deref of a makeError (non-ref) → false reject. Could avoid by making deref tolerate ERROR type (return makeError silently if operand type is ERROR). That's a general principle: when infer returns ERROR (already reported or unimplemented), don't cascade. Add guards: in deref, if t->kind_ == ERROR return makeError() silently. Similarly in unary/cast/binary checks: isIntegerType(ERROR) false → error "not integer" → cascade. They already have matches for some. To avoid cascades, add a guard at the start of infer: if expr is null? Hmm. General helper: `if (!t) return solve`. For each operator, check `t->kind_ == ERROR` early and return ERROR without new error. This will make unimplemented expressions not cause cascading false positives. Important for gradual development. But for negative tests, ERROR masking could hide real errors... ERROR only arises from unimplemented nodes or already-reported errors; fine.
+  - So add helper `static bool isError(semType*)` and early-exit checks in unary/binary/cast/deref/if cond? If cond inference errors, expect reports? expect fallback typeEqual(ERROR,wish) → true (their typeEqual returns true if ERROR). So fine.
+  - For deref: if operand type ERROR → return ERROR silently.
+  - For binary: if ltype or rtype ERROR → return ERROR silently (after inferring both to report name errors).
+  - For cast: if ltype ERROR → return rtype? Or ERROR; avoid error.
+  - For field/index/structInit (unimplemented) they return ERROR already silently.
+  This might make `expected acc` pass even without Phase 5 (because unimplemented parts are ERROR-compatible). Good.
+
+4. **rej fixed array target**: `let x: [u32; 2] = [1u32, 2i32];` — need array literal expected checking: `expect(arrayExpr, [u32;2])` should check element count and types. Arrays are Phase 5 per todo, but this negative test is in expected-types (Phase 3). Minimal: add arrayExpr handling in expect: if wish is ARRAY, expect length match and each element expect(elem type). Also repeatedArray similarly maybe. Could implement now (small) or defer. Since it's in Phase 3 suite, implement minimal array literal handling:
+  - `expect(arrayExpr e, wish)`: if wish->kind_ == ARRAY: if e->args_.size() != wish->arrayLength_ → error; for each arg expect(arg, wish->elem_); return wish. If wish not array → infer + compare.
+  - `infer(arrayExpr)`: LUB of elements (Step 3); length = args.size. This is needed for `let a = [1,2]` too; but arrays suite is Phase 5. For expected-types, adding expect for array is enough for the negative; but the acc test also uses arrays with expected, which would then be checked (fine). Without infer(array), `let a = [...]` no expected → ERROR (passes positives silently).
+  - So implement expect array only; maybe infer array LUB later with Phase 3 arrays? Todo says arrays Phase 5, but LUB lists arrays. Phase 3 includes LUB for arrays; but actual array literal handling could be Phase 5. For this one negative, expect array suffices.
+
+5. **continue outside loop**: add check `if (loops_.empty()) error("continue outside loop")` in continue branch; return never. Easy.
+
+6. **runtime-value-merges acc**: uses structs, arrays, Box, Vec methods, refs, if with &mut/& — Phase 4/5. Will pass later. Leave.
+
+So next steps for the user:
+- Finish Step 3: LUB + if/expect propagation (fixes blocks acc).
+- Add continue-outside-loop check.
+- Add ERROR-propagation guards (deref/binary/cast/unary) to avoid cascade; this helps expected acc.
+- Minimal array expected handling in expect (for the rej test).
+- AST change for `hasSemi_` on exprStmt (for the non-final block statement test) — or defer this one test.
+- The runtime-value-merges acc stays failing until Phase 4/5.
+
+Now, the user asked "下一步呢？" — they want the next step. I should report the review (fixes are correct), suite status 15/6, and list what remains, prioritizing:
+1. LUB + if merging + expect propagation (core Step 3).
+2. continue outside loop (1 line).
+3. ERROR guards.
+4. array expected minimal.
+5. exprStmt semicolon flag (AST change) — optional/defer.
+6. runtime-value-merges will wait for Phase 4/5.
+
+Let me also compute next implementation details for if/LUB/expect:
+- `lub(a,b)` ignoring never; both never → never; equal → a; else if either ERROR → ERROR? For now: if ERROR return ERROR. Otherwise Phase 3 error (UB tests exclude except references in Phase 4).
+- infer(if) with else: `semType* a = infer(then); b = infer(else); result = lub(a,b);` No expected in infer (wish null). But when called from expect, use checkIf with wish.
+- expect(if): cond bool; if else: if wish → expect(then,wish), expect(else,wish), return wish; else → lub(infer both). No else: matches(then, unit) (never ok), return unit.
+- LUB for block tails? checkBlock with wish handles; without wish, tail type.
+- Loop breaks: use lub accumulate, skipping never (all never → never).
+- `checkLoop` no-wish: result = LUB(breaks); implement with lub that ignores never.
+- Array literal infer: maybe implement now? LUB of elements + length; the todo says arrays Phase 5 but the LUB spec includes it. For expected-types acc, not needed if ERROR. For runtime-value-merges, later. Could defer.
+- Also `if` with expected but no else: wish must be unit? If wish non-null and expression is if without else: result unit; if wish not unit → mismatch error. Implement.
+
+Also note `let x: u32 = if true { { 3 } } else { 4 };` — expect(if, u32) → both branches expect u32: then is block `{ {3} }` → checkBlock with wish u32 → tail inner block → expect(inner block, u32) → tail 3 → u32. Good (block expected propagation works).
+- `let v: u32 = loop { break { 9 }; };` — expect(loop, u32): checkLoop push expected u32; break tail is block `{9}` → expect(block, u32) → checkBlock with wish u32 → tail 9 → u32. Good.
+- The acc also has `fn ret() -> isize { return 19; }` — expect(19, isize): literal unsuffixed + integer wish → isize. Good.
+- `fn tail() -> usize { { (17) } }` — tail block with wish usize; inner paren transparent → literal 17 gets usize. Good.
+
+So Step 3's if/expect propagation + LUB should fix blocks acc and much of expected acc, except the array/Box/struct parts which are ERROR-compatible (except deref cascade).
+
+The deref cascade: `*p` where p = Box call → infer(call 2-seg) = ERROR (silent). deref: t=ERROR; kind != REF → error "non-reference" → false reject. Add guard.
+
+Similarly `s.x` fieldExpr: infer currently not implemented → ERROR (silent); `.x` on struct init path? fieldExpr branch missing → ERROR; no error. `a[1]` index → ERROR. So only deref's explicit error is the problem. And cast: `... as i32` with ERROR operand → errors. E.g., `println_i32(a[1] as i32)` → cast(ERROR) → error. So need ERROR guards in cast, and deref. Also `x as i32` where x = if... etc fine.
+
+Guard approach: at each op, if any operand type is ERROR, return makeError silently (errors already reported or feature unimplemented). For cast: if ltype ERROR → return rtype (or ERROR); no new error. For deref: if t ERROR → return ERROR. For binary: if lt/rt ERROR → return ERROR. For unary: if type ERROR → return ERROR. For if: branches ERROR? lub handles ERROR → ERROR. For matches, typeEqual(ERROR, x) true, so fine.
+
+This guard is essential for incremental progress; worth telling.
+
+Now write the response: confirm fixes; report suites; then "下一步" list with specifics. Keep it organized and not too long.
+
+Also mention line estimate? Not asked.
+
+Let me write.
+
+改得对：`while` 现在只检查一次 body 且返回 unit，`break` 的 expected 分支也正了。当前 Phase 3 五个 suite：**15 passed / 6 failed**。六个失败逐个看，正好就是接下来要做的事：
+
+**1. `blocks-if-and-never/acc-...` — 需要 if 的 LUB/never 合并（Step 3 核心）**
+
+```rust
+let v = if x < 0 { return 90; } else if x == 0 { 7 } else { { x + 1 } };
+```
+then 块是 never，else 是 i32，现在的 `infer(if)` 用 `typeEqual` 直接拒了。要改成 `lub(never, i32) = i32`。
+
+**2. `loops-and-jumps/rej-continue-outside-a-loop` — 一行事**
+
+`continue` 分支加：
+```cpp
+if (loops_.empty()) { error("continue outside loop"); return semantic::makeError(); }
+```
+
+**3. `expected-types/acc-...` — 主要是 ERROR 级联误报**
+
+这个正例用到数组、struct、Box、方法，很多 `infer` 还没实现、返回 ERROR；但你们在 `deref`/`cast` 里对 ERROR 又报了"不是引用/不是整数"，误伤。做法：**所有运算符类分支遇到 ERROR 直接静默返回 ERROR**（说明前面已经报过或功能未实现），例如：
+
+```cpp
+if (auto* der = ...; der) {
+    semType* t = infer(der->operand_);
+    if (t->kind_ == semType::kTypeKind::ERROR) return semantic::makeError();
+    ...
+}
+// cast / unary / binary 同理，先判断操作数是不是 ERROR
+```
+这样这个 acc 剩下的部分（数组/Box/struct）会被 ERROR 兜住，等 Phase 5 再真正检查。
+
+**4. `expected-types/rej-a-fixed-array-target-rejects-a-mismatched-element` — 最小数组 expected**
+
+`let x: [u32; 2] = [1u32, 2i32];` 需要 `expect(arrayExpr, wish)`：wish 是 ARRAY 时，检查元素个数 == `arrayLength_`，并逐个 `expect(elem, wish->elem_)`。数组的完整 infer 可以留 Phase 5，这一步只加 expect 分支就够这个负例。
+
+**5. `blocks-if-and-never/rej-a-non-final-block-statement-without-semicolon-must-be-unit` — 需要 AST 补一个标志**
+
+```rust
+{ { 1 } println_i32(2); }
+```
+非末尾、无分号的 block 语句必须 unit/never。但 AST 的 `exprStmt` 没记录有没有分号，语义阶段判断不了。最小改法：`ast.h` 给 `exprStmt` 加 `bool hasSemi_ = true;`，`visitStatement` 里 `now->hasSemi_ = (ctx->SEMI() != nullptr);`（statementExpression 那支恒 true）。然后 `checkStatement` 里：如果 `exprStmt->expr_` 是 block/if/while/loop 且 `!hasSemi_`，要求 `matches(t, unit)`。
+
+**6. `runtime-value-merges/acc-...` — 先放着**
+
+它用到了 `&mut` 的 if 合并、loop 的 `&b`/`&mut a` LUB、struct/数组/Box/Vec 方法，这些是 Phase 4/5；等那边写完后自然会过，现在别为它改。
+
+**建议顺序**：先写 Step 3 的 `lub` + `infer/expect(if)` + `checkLoop` 的 break LUB（解决 1 和 blocks 相关），顺手补 2、3、4；第 5 个需要动 AST，可以放在 Phase 3 收尾时做。
+
+---
+
+## User
+
+告诉我 LUB 怎么写吧。
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 31.6s)
+
+_Thinking:_
+
+The user asks: "告诉我 LUB 怎么写吧" — explain how to write LUB (least upper bound / common type) according to the Rx spec.
+
+I need to give a precise implementation guide based on the spec rules. Let me recall the spec (types.html#least-upper-bound-coercions):
+
+"With an expected type, these same expressions use one-to-one coercions to that fixed target. ... For an unknown target, first determine each result's type independently, using i32 for unsuffixed integers that have no expected integer type. The current LUB target is not an expected type for another result. Consider results in source order and ignore never results, which can fit any target. Start with the first remaining result's type as the current target T. For each next result of type U:
+1. If U can coerce to T, keep T.
+2. Otherwise, if T can coerce to U and every earlier result can be adjusted to U, use U as the new target and adjust those results too.
+3. If not, the behavior is undefined. No search for a third common type is required.
+If all results are never, the result type is never."
+
+Coercion types (one-to-one / implicit adjustments) from types.html#coercion-types:
+| Source | Target | Adjustment |
+| T → T | keep |
+| &mut T → &T | shared |
+| &S or &mut S → &T | builtin deref steps then borrow |
+| &mut S → &mut T | builtin deref steps then mutable borrow |
+| Never → any | no value |
+
+Builtin deref steps: &U → U, &mut U → U, Box<U> → U, repeated until target referent matches exactly. A mutable target requires outer &mut and no shared reference along the path. Vec no deref.
+
+So for LUB, we need a `canCoerceTo(U, T)` helper implementing the coercion table (for Phase 3, at minimum never and exact equality; Phase 4 adds reference coercions). But since the user asks now in Phase 3, and the failing tests include reference LUB (`if first { &mut a } else { &b }`, `break &b`/`&mut a`), we might implement the full coercion now or a simplified version. Let me describe both: minimal now + full later, but structure the function so it can be extended.
+
+Implementation approach:
+
+```cpp
+// 1) 判断 U 能否隐式调整到 T（spec coercion table）
+bool Checker::coercesTo(semType* u, semType* t) {
+    if (isNever(u)) return true;
+    if (typeEqual(u, t)) return true;
+    if (u->kind_ == REF && t->kind_ == REF) {
+        // &mut T -> &T (shared target): same referent (after deref adjustments?) 
+        // &S / &mut S -> &T: follow builtin derefs from S to T, then borrow
+        // &mut S -> &mut T: follow derefs to mutable T place
+        ...
+    }
+    return false;
+}
+```
+
+For Phase 3, maybe implement full reference coercion now to avoid rework; the user has Phase 4 coming, but LUB with references appears in runtime-value-merges (Phase 3 suite) as shown. Actually `runtime-value-merges` lives in Phase 3 per todo ("runtime-value-merges"). The test uses `if first { &mut a } else { &b }` → LUB(&mut i32, &i32) = &i32; and `if first { &b } else { &mut c }` = LUB(&i32, &mut i32) = &i32 (the second adjusts to first). So LUB needs &mut→& adjustment now. Also `loop { break &b; ... break &mut a; }` → &i32. And `if first { &mut left } else { &mut right }` → &mut i32. So yes, implement reference coercion at least the `&mut T → &T` and deref chain cases. The deref-chain cases (&Box<T> → &T) appear in reference-coercions suite (Phase 4), but LUB may encounter them in runtime-value-merges? Not in this test. But the spec's LUB uses the same coercion rules, so implement fully or at least basic.
+
+Let me give a design:
+
+**Step 1: `canCoerce(u, t)`** (one-to-one coercion):
+- never → any: true.
+- typeEqual: true.
+- REF→REF cases:
+  - Let `uRef` and `tRef`.
+  - If t is `&T` (shared):
+    - If u is `&mut U`: u can coerce to `&U` (shared), then possibly deref chain from U to T. Actually spec lists:
+      - `&mut T` → `&T`: borrow same value through shared reference (same referent).
+      - `&S` or `&mut S` → `&T`: follow builtin dereferences from S to T, then borrow it.
+    - So: starting from u's referent U (whether shared or mut), follow builtin derefs (REF/BOX) any number of times to reach some S; then `&T` target requires S == T (referent match exactly). For `&mut U` with no derefs and T==U → covered by rule 1 (&mut T→&T). For &S where S=Box<T> → &Box<T> → &T (deref Box once). For &mut Box<T> → &T shared (deref, shared target).
+    - Mutability on path: shared target requires no mutability constraint? Spec: "A mutable target requires an outer &mut and no shared reference along the path." For shared target, path can pass through shared refs? "Follow builtin dereferences from S to a T place, then borrow it" — builtin deref steps include &U→U (shared) and &mut U→U and Box<U>→U. So a shared ref can be followed? For shared target, yes: e.g., `&&i32` → `&i32`? Outer is & (shared), S = &i32, deref once → i32, then borrow → &i32. Yes allowed.
+  - If t is `&mut T`:
+    - u must be `&mut S` (outer mutable), and no shared reference along the deref path to T; follow derefs from S to T; T referent exact.
+- Box/Vec: not implicit (Box<T> cannot coerce to T or &T by itself; only &Box<T>→&T via deref chain). So no direct BOX→anything without reference.
+- Arrays/etc.: only identical.
+
+**Step 2: `lub` accumulate in source order**:
+```cpp
+semType* lub(std::vector<semType*> types) {   // or fold
+    semType* target = nullptr;
+    for (auto* t : types) {
+        if (isNever(t)) continue;
+        if (target == nullptr) { target = t; continue; }
+        if (canCoerce(t, target)) continue;
+        if (canCoerce(target, t)) { 
+            // also every earlier result can adjust to t — but earlier ones were coerced to old target; 
+            // need to verify all earlier can coerce to t; keep a list? 
+            target = t; 
+            continue;
+        }
+        error("no common type"); return makeError();
+    }
+    return target ? target : makeNever();
+}
+```
+Spec rule 2: "if T can coerce to U and every earlier result can be adjusted to U, use U". Since we already discarded earlier results after coercion, we need to keep the original list and re-check earlier results against the new target. Implementation: collect all non-never types in a vector; then iterate; when promoting target to U, verify all previous elements can coerce to U; if yes, target = U; else UB.
+
+But note: "若 T 能调整到 U 且先前结果也能" — previous results could already adjust to old T; need direct check to U. Keep originals.
+
+Simpler for typical tests: the promotion case occurs e.g. `[&123, &mut 1]`? First &i32 (shared), second &mut i32: canCoerce(&mut i32, &i32) true → keep target &i32. The promotion case: first &mut i32 then &i32? canCoerce(&i32, &mut i32) false; canCoerce(&mut i32, &i32) true → but rule 1 checks U→T: U=&i32, T=&mut i32: false; rule 2: T→U = &mut→& = true, and earlier results (just T) can adjust to U (&mut→& true) → target becomes &i32. So promotion occurs. With only two elements, "every earlier" is just the current target, which coerces by rule 2 premise. With more elements, need to check all.
+
+Implementation with vector:
+```cpp
+semType* lub(const std::vector<semType*>& types) {
+    std::vector<semType*> seen;
+    semType* target = nullptr;
+    for (auto* u : types) {
+        if (isNever(u)) continue;
+        if (isError(u)) return u; // avoid cascade
+        if (target == nullptr) { target = u; seen.push_back(u); continue; }
+        if (canCoerce(u, target)) { seen.push_back(u); continue; }
+        if (canCoerce(target, u)) {
+            bool all = true;
+            for (auto* s : seen) if (!canCoerce(s, u)) { all = false; break; }
+            if (all) { target = u; seen.push_back(u); continue; }
+        }
+        error("no common type"); return makeError();
+    }
+    return target == nullptr ? makeNever() : target;
+}
+```
+Note: when target is promoted, earlier coerced results need adjustment (Phase 4 does actual coercion for codegen; semantic just type). We don't change AST types (no ty_ field). Fine.
+
+Also: expected type case does NOT use LUB; use one-to-one expect at each site. If expected supplied, result is expected.
+
+`canCoerce` details (semType):
+```cpp
+bool Checker::canCoerce(semType* from, semType* to) {
+    if (isNever(from)) return true;
+    if (typeEqual(from, to)) return true;
+    if (from->kind_ == REF && to->kind_ == REF) {
+        semType* fromElem = from->elem_;
+        bool fromMut = from->isMut_;
+        bool toMut = to->isMut_;
+        if (toMut && !fromMut) return false;   // shared cannot become mutable
+        // follow builtin derefs from fromElem toward to->elem_
+        semType* cur = fromElem;
+        bool pathHasShared = !fromMut;   // outer shared ref counts as shared for mutable target? For shared target no constraint.
+        while (true) {
+            if (typeEqual(cur, to->elem_)) return true;   // wait: for &mut T -> &T, referent equal case
+            // step deref
+            if (cur->kind_ == REF) { if (!cur->isMut_) pathHasShared = true; cur = cur->elem_; }
+            else if (cur->kind_ == BOX) { cur = cur->elem_; }
+            else return false;
+            if (toMut && pathHasShared) return false;
+        }
+    }
+    return false;
+}
+```
+Hmm, careful with the first case: `&mut T → &T` (same referent, sharing). The loop checks `typeEqual(cur, to->elem_)` at start with cur=fromElem → T==T → true (mutability of outer handled by toMut check; for shared target allowed). For `&mut &mut i32` → `&i32`? fromElem=&mut i32, to elem=i32; deref step: cur REF mut → cur=i32; check equal → true; for shared target no constraint. Spec says `&mut &mut i32` can coerce to `&i32`? Hmm, "&S or &mut S → &T: follow builtin dereferences from S to a T place, then borrow it" — yes. For mutable target `&mut S → &mut T`: e.g., `&mut Box<i32>` → `&mut i32`: outer mut; deref Box → i32; no shared on path → ok. `&mut &i32` → `&mut i32`? Deref through shared ref (`&U→U`) puts a shared reference along the path; target mutable requires no shared reference along path → false. Our pathHasShared update handles: cur=&i32 (shared) → pathHasShared=true → after deref, toMut → false. Good.
+  
+Also note: `&mut T → &T` at top: fromMut true, toMut false; loop fromElem==toElem → true.
+  
+Box handling: only through references; `Box<T>` → `T` not allowed. Fine.
+
+Vec: no deref: cur VEC ≠ elem → return false.
+
+Other types: false.
+
+This is essentially the Phase 4 coercion function; good to implement now since LUB needs it.
+
+**Where LUB is used:**
+- if with else without expected: lub(then, else).
+- array literal elements (Phase 5): lub over elements.
+- loop break values: lub over break types (skip never; all never → never).
+- Maybe expected coercion at sites (Phase 4 `coerceTo`): if expected, before `typeEqual`, allow `canCoerce(actual, expected)`? One-to-one coercion sites: assignment RHS, call args, return, struct fields, let init, etc. In Phase 4, replace `matches` usage with `matchesOrCoerces`. For now, LUB uses canCoerce; expected sites still exact/never. Mention.
+
+**Return of LUB**: semType* target (which may be REF type from the first element). Note the result is the common type; adjustments are implicit.
+
+Also: expected type context: `expect(if, wish)` should return wish (the expected type), not the branch types.
+
+Now, answer with:
+1. The spec rule restated.
+2. `canCoerce` (adjustment table).
+3. `lub` accumulate with source order and promotion; code sketch.
+4. Usage points and expected-type distinction.
+5. Notes: unsuffixed literals default i32 when no expected (already infer does that); never ignored; ERROR guard.
+
+Keep it focused. Maybe mention that for Phase 3, they can initially implement canCoerce as: never + typeEqual + (&mut T → &T same referent); then Phase 4 extends deref chains. But the runtime-value-merges test also needs &mut→&; no deref chains in that test? It has `if first { &b } else { &mut c }` (same referent i32) and `break &b` / `&mut a` (same). So minimal version enough for Phase 3. Reference-lub suite (Phase 4) has `[&mut &1, &mut &mut 2]` deref cases. So phase 3 minimal = never + equal + &mut T→&T. Phase 4 full = deref chains.
+
+Given the user asked "告诉我 LUB 怎么写", give both: minimal now + full table for later. Provide code for minimal and outline for full.
+
+Also mention the promotion rule because tests like `[&mut 1, &123]` (first mut, second shared) need it.
+
+Let me write in Chinese, concise but complete.
+
+LUB 的规则来自 spec 这一段，先记住三条：
+
+1. **按源码顺序**扫结果，先忽略 never；
+2. 第一个非 never 的类型作为当前目标 `T`；之后每个 `U`：
+   - `U` 能隐式调整到 `T` → 保持 `T`；
+   - 否则 `T` 能调整到 `U`，**且之前所有结果也都能调整到 `U`** → 改用 `U`；
+   - 都不行 → UB（测试不出现，直接报错即可）；
+3. 全是 never → never。
+
+**先写 `canCoerce(from, to)`（隐式调整判断）**。Phase 3 的最小版：
+
+```cpp
+bool Checker::canCoerce(semType* from, semType* to) {
+    if (isNever(from)) return true;
+    if (semantic::typeEqual(from, to)) return true;
+    // &mut T -> &T （同一个 referent，共享化）
+    if (from->kind_ == semType::kTypeKind::REF &&
+        to->kind_ == semType::kTypeKind::REF &&
+        from->isMut_ && !to->isMut_ &&
+        semantic::typeEqual(from->elem_, to->elem_)) {
+        return true;
+    }
+    return false;   // Phase 4 再补 &Box<T> -> &T 之类的 deref 链
+}
+```
+
+Phase 4 再把它扩成完整的 coercion 表（`&S`/`&mut S` 沿 `&`/`&mut`/`Box` 逐层解引用到目标 referent，mutable 目标要求外层 `&mut` 且路径上没有共享引用，Vec 不解引用）。先最小版就能过 `runtime-value-merges` 里的 `if ... { &mut a } else { &b }` 和 break 的 `&b`/`&mut a`。
+
+**再写 `lub`（收一个列表，按顺序 accumulate）**：
+
+```cpp
+semType* Checker::lub(const std::vector<semType*>& types) {
+    std::vector<semType*> seen;       // 保留原始结果，规则 2 的 "之前所有结果" 要用
+    semType* target = nullptr;
+    for (auto* u : types) {
+        if (isNever(u)) continue;
+        if (u->kind_ == semType::kTypeKind::ERROR) return u;   // 别级联报错
+        if (target == nullptr) { target = u; seen.push_back(u); continue; }
+        if (canCoerce(u, target)) { seen.push_back(u); continue; }
+        if (canCoerce(target, u)) {
+            bool all = true;
+            for (auto* s : seen) {
+                if (!canCoerce(s, u)) { all = false; break; }
+            }
+            if (all) { target = u; seen.push_back(u); continue; }
+        }
+        error("no common type for branch results");
+        return semantic::makeError();
+    }
+    return target == nullptr ? semantic::makeNever() : target;
+}
+```
+
+用的时候把源码顺序的原始类型传进去，比如：
+
+```cpp
+// if 有 else、无 expected
+return lub({infer(fi->then_), infer(fi->else_)});
+
+// loop 的所有 break（没有 expected 时）
+return lub(info.breaks_);        // breaks_ 里全 never → never
+```
+
+**三个使用点**：
+
+1. `infer(if)` 有 else：`lub({then, else})`；无 else → `matches(then, unit)`，返回 unit；
+2. `expect(if, wish)` 有 expected：不走 LUB，两个分支分别 `expect(branch, wish)`，返回 `wish`；
+3. `checkLoop` 无 expected：`lub(info.breaks_)`；有 expected：`wish`（break 值在 break 分支已经按 wish 检查过）。
+
+**注意**：
+
+- 无 expected 的无后缀整数字面量已经由 `infer` 默认成 i32，LUB 不用管；
+- `lub` 只负责"没有 expected 时找公共类型"；`let x: u32 = if ...` 这种有 expected 的位点用 one-to-one `expect`，不要先 LUB 再比；
+- Phase 4 把 `canCoerce` 补全后：赋值右值、调用实参、`return`、结构体字段、`let` 初始化这些 one-to-one coercion 位点，把现在的 `typeEqual/matches` 换成"`typeEqual` 或 `canCoerce`"，就顺带把引用自动调整接上了。
+
+---
+
+## User
+
+我大概写好了，你看看。然后修哪些地方？
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 14.5s)
+
+_Thinking:_
+
+The user says they roughly wrote LUB (and canCoerce). They ask me to review and what to fix.
+
+I need to read the current code: canCoerce, lub, infer(if), expect(if), checkLoop changes. Then build, run the Phase 3 suites, and report fixes. Let me read the relevant code.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && grep -n \"canCoerce\\|lub(\" compiler/src/semantic/checker.cpp compiler/src/semantic/checker.h; echo ===; sed -n '/bool Checker::canCoerce/,/^}/p; /semType\\* Checker::lub/,/^}/p' compiler/src/semantic/checker.cpp; echo ===; sed -n '/if (auto fi = dynamic_cast<ifExpr/,/^    }/p' compiler/src/semantic/checker.cpp; echo ===; sed -n '/semType\\* Checker::checkLoop/,/^}/p' compiler/src/semantic/checker.cpp; echo ===; sed -n '/if (auto block = dynamic_cast<blockExpr/,/^    }/p; /if (auto loop = dynamic_cast<loopExpr/,/^    }/p' compiler/src/semantic/checker.cpp | head -20"
+}
+```
+
+**Output:**
+```
+compiler/src/semantic/checker.cpp:540:semType* Checker::lub(std::vector<semType*> types) {
+compiler/src/semantic/checker.cpp:728:            return lub({infer(fi->then_), infer(fi->else_)});
+compiler/src/semantic/checker.cpp:1033:    return lub(info.breaks_);
+compiler/src/semantic/checker.h:19:    semType* lub(std::vector<semType*> types);
+===
+semType* Checker::lub(std::vector<semType*> types) {
+    std::vector<semType*> all;
+    semType* t = nullptr; // strange name in spec
+    for (auto u : types) {
+        if (isNever(u)) {
+            continue;
+        }
+        if (u->kind_ == semType::kTypeKind::ERROR) {
+            return u;
+        }
+        if (t == nullptr) {
+            t = u;
+            all.push_back(u);
+            continue;
+        }
+        if (canImplicitlyTurn(u, t)) {
+            all.push_back(u);
+        }
+        else if(canImplicitlyTurn(t, u)) {
+            bool can = true;
+            for (auto now : all) {
+                can &= canImplicitlyTurn(now, u);
+            }
+            if (can) {
+                t = u;
+                all.push_back(u);
+                continue;
+            }
+        }
+        else {
+            error("lub failed");
+            return semantic::makeError();
+        }
+    }
+    return t == nullptr ? semantic::makeNever() : t;
+}
+===
+    if (auto fi = dynamic_cast<ifExpr*>(expr); fi) {
+        expect(fi->cond_, semantic::makeBuiltin("bool"));
+        if (fi->else_ != nullptr) {
+            semType* rhs = infer(fi->else_);
+            return lub({infer(fi->then_), infer(fi->else_)});
+        }
+        else {
+            if (!matches(infer(fi->then_), semantic::makeUnit())) {
+                error("ifExpr then is not unit");
+                return semantic::makeError();
+            }
+            return semantic::makeUnit();
+        }
+    }
+    if (auto fi = dynamic_cast<ifExpr*>(expr); expr) {
+        expect(fi->cond_, semantic::makeBuiltin("bool"));
+        expect(fi->then_, wish);
+        if (fi->else_) {
+            expect(fi->else_, wish);
+        }
+        return wish;
+    }
+===
+semType* Checker::checkLoop(loopExpr* loop, semType* wish) {
+    loops_.push_back(loopInfo{wish, {}});
+    checkBlock(loop->block_, semantic::makeUnit());
+    loopInfo info = loops_.back();
+    loops_.pop_back();
+    if (info.breaks_.empty()) {
+        return semantic::makeNever();
+    }
+    if (wish != nullptr) {
+        return wish;
+    }
+    return lub(info.breaks_);
+}
+===
+    if (auto block = dynamic_cast<blockExpr*>(expr); block) {
+        return checkBlock(block, nullptr);
+    }
+    if (auto loop = dynamic_cast<loopExpr*>(expr); loop) {
+        return checkLoop(loop, nullptr);
+    }
+    if (auto block = dynamic_cast<blockExpr*>(expr); block) {
+        return checkBlock(block, wish);
+    }
+    if (auto loop = dynamic_cast<loopExpr*>(expr); loop) {
+        return checkLoop(loop, wish);
+    }
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 19.0s)
+
+_Thinking:_
+
+Let me review:
+
+1. **`canImplicitlyTurn`** is used but grep only showed `canCoerce` in my search; the function they wrote is named `canImplicitlyTurn`. Let me read it. Need to check implementation.
+
+2. **`lub` bug**: In the `canImplicitlyTurn(u, t)` branch, they don't `continue`; they push and fall through to... let's trace:
+```cpp
+if (canImplicitlyTurn(u, t)) {
+    all.push_back(u);
+}
+else if (canImplicitlyTurn(t, u)) { ... continue; }
+else { error; return; }
+```
+After the first if, no continue; the code after the if/else-if/else block? There's nothing after — loop iterates next. Actually after the if-chain, the for loop continues naturally. So fine. But after `else if (...) { if (can) { t = u; all.push_back(u); continue; } }` — if `can` is false, falls out of the else-if block and continues the for loop WITHOUT error! That's a bug: if promotion fails, it should report UB, but instead silently keeps old target. Need `else { error; return makeError(); }` after the `if (can)` check, or restructure:
+```cpp
+else if (canImplicitlyTurn(t, u)) {
+    bool can = all...;
+    if (!can) { error("lub failed"); return makeError(); }
+    t = u; all.push_back(u);
+}
+else { error; return; }
+```
+Also in the first branch, should `all.push_back(u)` — yes, keep original results for future promotion checks. But note: `all` includes results coerced to target; if later target promotes to u, all original results must turn to u; they store originals, good. However, they push u even when it coerces to t; that's correct as original.
+Also when `t = u` in promotion, they push u into `all` (it's also an original) — fine.
+
+3. **`infer(if)` bug**: 
+```cpp
+if (else_) {
+    semType* rhs = infer(fi->else_);   // unused, and evaluates else twice below
+    return lub({infer(fi->then_), infer(fi->else_)});
+}
+```
+It infers else twice (once assigned to unused rhs). Remove the first line. Also order: they call infer(else) before infer(then) in the lub initializer? C++ evaluation order of initializer_list elements is left-to-right: infer(then) then infer(else). Good (source order). But the extra `infer(else_)` happens BEFORE that, potentially emitting errors twice. Remove.
+   Also `lub` requires source-order types; then, else — correct.
+
+4. **`expect(if)`**: 
+```cpp
+if (auto fi = dynamic_cast<ifExpr*>(expr); expr) {   // ← condition checks `expr`, not `fi`!
+    expect(fi->cond_, bool);
+    expect(fi->then_, wish);
+    if (fi->else_) expect(fi->else_, wish);
+    return wish;
+}
+```
+**BUG**: `if (auto fi = dynamic_cast<ifExpr*>(expr); expr)` — the condition should be `fi`. Since `expr` is always non-null, this branch matches ANY expression that reaches this point in expect (after int literal and block and loop checks), treats it as ifExpr and calls `fi->cond_` on nullptr → crash/garbage. Wait — `fi` would be nullptr if expr isn't an ifExpr; then `fi->cond_` dereferences null → segfault. Actually this `expect` snippet is at the top of expect? Let me see placement: the output shows after loop check in expect? The order in the file: `expect` has intLit, block, loop, then this if with `; expr`? The snippet printed two `if (auto fi...)`: the first is infer(if), the second is expect(if). The expect one uses `; expr` → bug. Must be `; fi`.
+   Also in expect(if): if no else and wish is non-null non-unit? `expect(then, wish)` would check then against wish, but spec says if without else requires then unit, and the expression's type is unit. If wish is u32, should error (unit vs u32). Returning wish would be wrong. Should:
+```cpp
+if (fi->else_) {
+    expect(then, wish); expect(else, wish); return wish;
+} else {
+    expect(then, unit);   // or expect(then, wish?) — spec: then must be unit/never
+    return unit;          // and if wish != null && !matches(unit,wish) → checkBlock? 
+}
+```
+Actually if wish provided and if has no else: the if expression type is unit; expected type might be unit (e.g., `let x: () = if c {}`). If wish is non-unit → error "expected u32 found ()". So:
+```cpp
+expect(then_, unit);   // uses expect which matches never
+if (wish && !matches(unit, wish)) { error; return makeError(); }
+return unit;
+```
+But careful: `expect(then_, unit)` requires then block unit/never. Good.
+
+5. **`checkLoop`**: uses lub(info.breaks_) — good. But if wish != nullptr returns wish even if all breaks never; minor. Also when `info.breaks_.empty()` returns never before checking wish: spec: loop with no break is never (coerces to anything) → returning never is fine even with wish (matches never true). Good.
+
+6. **`canImplicitlyTurn`**: need to read. Let me grep. Also check signature (semType*). Then check its correctness (minimal refs?).
+
+7. **`lub` parameter by value** — copies vector; fine but could const ref.
+
+8. **Array/other usage**: lub only used in if and loop.
+
+Let me read canImplicitlyTurn.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && sed -n '/canImplicitlyTurn/,/^}/p' compiler/src/semantic/checker.cpp | head -40; echo ===; grep -n \"canImplicitlyTurn\" compiler/src/semantic/checker.h; echo ===; sed -n '/semType\\* Checker::expect/,/^}/p' compiler/src/semantic/checker.cpp | tail -30"
+}
+```
+
+**Output:**
+```
+static bool canImplicitlyTurn(semType* from, semType* to) {
+    if (isNever(from)) {
+        return true;
+    }
+    if (semantic::typeEqual(from, to)) {
+        return true;
+    }
+    if (from->kind_ == semType::kTypeKind::REF && 
+        to->kind_ == semType::kTypeKind::REF &&
+        from->isMut_ && !to->isMut_ && semantic::typeEqual(from->elem_, to->elem_)) {
+            return true;
+    }
+    return false;
+}
+        if (canImplicitlyTurn(u, t)) {
+            all.push_back(u);
+        }
+        else if(canImplicitlyTurn(t, u)) {
+            bool can = true;
+            for (auto now : all) {
+                can &= canImplicitlyTurn(now, u);
+            }
+            if (can) {
+                t = u;
+                all.push_back(u);
+                continue;
+            }
+        }
+        else {
+            error("lub failed");
+            return semantic::makeError();
+        }
+    }
+    return t == nullptr ? semantic::makeNever() : t;
+}
+===
+===
+        else {
+            semType* cur = semantic::makeBuiltin(suf);
+            if (!semantic::typeEqual(cur, wish)) {
+                error("wish an suffixed integer to be another type");
+                return semantic::makeError();
+            }
+            return wish;
+        }
+    }
+    if (auto block = dynamic_cast<blockExpr*>(expr); block) {
+        return checkBlock(block, wish);
+    }
+    if (auto loop = dynamic_cast<loopExpr*>(expr); loop) {
+        return checkLoop(loop, wish);
+    }
+    if (auto fi = dynamic_cast<ifExpr*>(expr); expr) {
+        expect(fi->cond_, semantic::makeBuiltin("bool"));
+        expect(fi->then_, wish);
+        if (fi->else_) {
+            expect(fi->else_, wish);
+        }
+        return wish;
+    }
+    semType* type = infer(expr);
+    if (!semantic::typeEqual(type, wish)) {
+        error("expect type mismatch");
+        return semantic::makeError();
+    }
+    return wish;
+}
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 24.8s)
+
+_Thinking:_
+
+Now I have all issues. Let me also build and run tests to see current status. But first compile: the `if (auto fi = dynamic_cast<ifExpr*>(expr); expr)` compiles (fi unused if expr non-if? It's used inside; runtime crash). Let me build and run Phase 3 suites to see.
+
+Bugs:
+1. `expect(ifExpr)`: condition `expr` instead of `fi` → null deref for any non-if expression reaching that point in expect. E.g., `expect(binaryExpr, wish)` → falls to this branch (since not intLit/block/loop) → fi = nullptr → `fi->cond_` → segfault. This would crash on almost every expect of binary expressions! But maybe expect order: binary would hit this branch and crash. Did they test? Build passes; tests would crash. Let me verify by running quickly. Also note `lub` is only called with types; `canImplicitlyTurn` static (not declared in header) — fine.
+2. `expect(if)` no-else branch wrong: returns wish and expects then against wish; should expect then unit and result unit (with wish check).
+3. `infer(if)` double-infers else (unused rhs); remove.
+4. `lub`: promotion failure (`can == false`) doesn't error, silently keeps old target. Add error. Also `all.push_back(u)` missing in the `canImplicitlyTurn(u,t)` branch? They do push. But in the promotion-failure case, nothing. Fix.
+5. `canImplicitlyTurn` minimal version: fine for Phase 3; Phase 4 extends.
+6. `expect` fallback at end uses `typeEqual(type, wish)` not `matches` — so never results (return/break) in expect contexts would be rejected. E.g., `let n: i32 = if flag { return 7; } else { 3 };` — expect(if, i32) handles branches; then block `{return 7;}` with wish i32 → checkBlock tail absent, reachable false → never; checkBlock `matches(never, i32)` true → returns never. Good. But `let x: i32 = return 1;` → expect(returnExpr, i32) → falls to fallback → infer(return) = never; typeEqual(never, i32) false → error. Should use `matches(type, wish)` instead. Fix.
+7. `expect(intLit)` unsuffixed with non-integer wish: error — but e.g. `let x: usize = ...` fine. Also bool literal expectation falls to fallback (infer bool, typeEqual). Fine.
+
+Also check `lub` with ERROR: returns u (ERROR) — good.
+Also `lub` all-never → never. Good.
+Also `lub` with zero types → never. Fine.
+
+8. In `infer(if)`, after lub, if lub returns ERROR no issue.
+
+9. `lub` takes vector by value; fine.
+
+10. `expect(if)` with wish==nullptr: `expect(then_, nullptr)` → infer(then); `expect(else_, nullptr)` → infer(else); returns wish = nullptr! That's wrong: expect called with wish nullptr should ideally delegate to infer; but expect's first line `if (wish == nullptr) return infer(expr);` — yes! At top: `if (wish == nullptr) return infer(expr);`. So expect(if, nullptr) goes to infer(if) before reaching this branch. Good. So the if-branch only runs with wish != nullptr.
+
+So the no-else case with wish non-unit should error: if expression type unit, expected wish e.g. u32 → mismatch. Implement:
+```cpp
+if (fi->else_) { expect(then, wish); expect(else, wish); return wish; }
+expect(fi->then_, semantic::makeUnit());   // then must be unit/never
+if (!matches(semantic::makeUnit(), wish)) { error(...); return makeError(); }
+return semantic::makeUnit();
+```
+Careful: `expect(then_, unit)` checks then block; if then is a block with tail 1 → error (correct: if without else requires unit).
+
+11. Also `fi->then_` is blockExpr*, `expect(then_, wish)` with wish non-null: expect(block, wish) → checkBlock(block, wish) — good for then; for else_ which may be ifExpr or block: expect(else_, wish) → if else is ifExpr, recursion with wish; good. Else block: checkBlock wish. Good.
+
+12. `infer(if)` without else: matches(then, unit) — good; return unit.
+
+Let me build/run to confirm the crash from bug 1, then report. Let me run a tiny test: `fn main() { let x: i32 = 1 + 2; }` — expect(binary, i32) → hits if branch with expr non-null → fi=null → crash. Let's test with timeout. Also `let x: bool = true;` → expect(boolLit, bool) → not intLit/block/loop → if branch fi=null → crash. Wait, boolLit goes to fallback in the current expect? The if-branch comes before fallback, so yes crash. But then all tests would crash... Maybe the branch was added after their last test run. Let me build and run quick.
+
+Let me run build + a tiny test + Phase 3 suites (may crash).
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && cmake --build target/build -j 2>&1 | grep -E \"error|Built target\" | head -3 && printf 'fn main() { let x: bool = true; }\\n' > /tmp/opencode/t.rx && timeout 5 ./target/build/rxcc --stage semantic /tmp/opencode/t.rx; echo \"rc=$?\"",
+  "timeout": 180000
+}
+```
+
+**Output:**
+```
+[100%] Built target rxcc
 timeout: the monitored command dumped core
-/bin/bash: line 1: 149325 Segmentation fault      timeout 10 /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/target/build/rxcc --stage semantic --dump-ast case2.rx
+/bin/bash: line 1: 228108 Segmentation fault      timeout 5 ./target/build/rxcc --stage semantic /tmp/opencode/t.rx
 rc=139
 
 ```
 
 ---
 
-## Assistant (Build · DeepSeek V4.1 Flash · 17.9s)
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 19.1s)
 
 _Thinking:_
 
-A **segfault** on `fn f(a: i32, b: i32, c: i32) { a >> b << c; }`! Not a hang — the earlier command timed out because... hmm, now with timeout 10 it segfaulted quickly (rc=139). The earlier 120s timeout maybe hit a hang before crash? Or the crash dump generation took long? Anyway: segfault on this input — a real crash.
+Confirmed: segfault on `let x: bool = true;` due to the `if (auto fi = ...; expr)` bug. This is the top priority.
 
-But wait, in the differential test, the stmt case for `a >> b << c` returned ("OK", something) — or did it? Let me re-check: results printed:
-```
---- stmt: OK
-(extract failed)
-```
-Hmm, that suggests subprocess.run returned normally. But maybe in that run it didn't crash because... the source differed? In diff test the statement context is inside `fn f(...)` with more params and prelude. Let me reproduce with the full prelude statement case. The difference: my case2.rx has params (a,b,c) only. The diff case has many params. Hmm, don't see why it matters.
+Let me report all fixes:
 
-Wait, maybe the diff test's stmt case for `a >> b << c` actually produced a dump where extraction failed because ExprStmt label wasn't found — meaning the dump had something else. And no crash. Let me directly run the diff-generated case file. The diff test writes case.rx each iteration; last iteration's file is `1u32+2u32`. Let me manually construct the exact prelude + `a >> b << c;` and run.
+1. **`expect` 里 `dynamic_cast<ifExpr*>` 的条件写成 `expr`** — always true → null deref. Fix `; fi)`.
+2. **`expect(if)` 无 else 分支** — currently expects then against wish and returns wish; wrong. Should check then against unit, return unit, and check wish matches unit.
+3. **`infer(if)` 重复 infer else** — remove unused `rhs` line.
+4. **`lub` 提升失败时没报错** — if `can == false`, currently silently continues; add error/return. Restructure.
+5. **`expect` fallback 用 `typeEqual`** — should use `matches` so never (return/break) is accepted: `if (!matches(type, wish))`.
+6. Minor: `canImplicitlyTurn` is static and not declared in header — fine; Phase 4 extend.
 
-Actually, let me first check: is the crash in the AST builder or in main's dump? The builder visitStatementShiftExpression etc. could create a malformed tree with cycles! E.g., binaryExpr with lhs/rhs pointing to itself → infinite recursion in dump → stack overflow → segfault. Or the parse tree construction. The dump recursion could infinite-loop.
+Also potential: `lub` first branch should `continue`? It naturally continues. Fine.
 
-Wait, rc=139 = SIGSEGV. "dumped core". Could be stack overflow from infinite recursion. In `visitStatementShiftExpression` for `a >> b << c`:
+Let me also verify after fixing these the suites; but the user asked "修哪些地方?" — enumerate. Should I apply the fixes? Last time they said "我大概写好了，你看看。然后修哪些地方？" — they're asking what to fix. I'll list with exact patches; they can apply. Given the segfault, quick fixes are easy.
 
-Grammar statementShiftExpression:
+Let me write the response with the exact code changes.
+
+For lub restructure:
+```cpp
+if (canImplicitlyTurn(u, t)) {
+    all.push_back(u);
+    continue;
+}
+if (canImplicitlyTurn(t, u)) {
+    bool can = true;
+    for (auto now : all) can &= canImplicitlyTurn(now, u);
+    if (can) {
+        t = u;
+        all.push_back(u);
+        continue;
+    }
+}
+error("lub failed");
+return semantic::makeError();
 ```
-statementShiftExpression
-    : statementAdditiveExpression
-    | (statementClosedAdditiveExpression SHL | statementAdditiveExpression shiftRight)
-      (closedAdditiveExpression SHL | additiveExpression shiftRight)* additiveExpression
-    ;
+(Note spec: promotion requires all earlier; correct.)
+
+For expect(if):
+```cpp
+if (auto fi = dynamic_cast<ifExpr*>(expr); fi) {
+    expect(fi->cond_, semantic::makeBuiltin("bool"));
+    if (fi->else_ != nullptr) {
+        expect(fi->then_, wish);
+        expect(fi->else_, wish);
+        return wish;
+    }
+    expect(fi->then_, semantic::makeUnit());
+    if (!matches(semantic::makeUnit(), wish)) {
+        error("if without else has unit type, expected something else");
+        return semantic::makeError();
+    }
+    return semantic::makeUnit();
+}
 ```
-Hmm, but the statement context here: `a >> b << c;` — wait, the actual rule used for a statement expression might be `statementExpression`, which has its own shift rule:
-Let me look at statementExpression rules (lines 500-560). From the earlier sed: 
+
+For fallback:
+```cpp
+semType* type = infer(expr);
+if (!matches(type, wish)) { error(...); return makeError(); }
+return type;   // hmm, return wish or type?
 ```
-statementExpression: statementAssignmentExpression;
+For expect fallback, returning `wish` vs `type`: if coerced, the expression's type is... for one-to-one coercion sites, the checked expression gets the expected type (coercion). For literals they return wish. For other expressions, if `typeEqual`, same; if never, returning wish makes sense (never coerces to expected; the "result type" is expected?). In Rust type checking, coercing `!` to T yields T. So return wish. But if matches via never, returning wish is fine. Keep `return wish;`.
+Actually if type is ERROR (typeEqual returns true), returning wish avoids cascading. Good.
+
+Also infer(if) double-eval fix.
+
+Also `matches` usage in `checkLoop` wish? fine.
+
+One more: in `expect`, the `ifExpr` branch placement before fallback is right; but the condition bug also means the earlier `if (auto block...)` / `if (auto loop...)` fine.
+
+Let me also mention `canImplicitlyTurn` minimal is OK for now; Phase 4 extension.
+
+Write concise response.
+
+有个**段错误**先修，另外几处逻辑问题：
+
+**1. `expect` 里的 `if` 分支条件写错了（崩溃元凶）**：
+
+```cpp
+if (auto fi = dynamic_cast<ifExpr*>(expr); expr) {   // ← 条件用了 expr，永远为真
+```
+
+只要 `expect` 走到这里且 `expr` 不是 ifExpr（比如 `let x: bool = true;`），`fi` 就是 nullptr，下一行 `fi->cond_` 直接段错误。我本地已经复现：`fn main() { let x: bool = true; }` → SIGSEGV。改成 `; fi)`。
+
+**2. `expect(if)` 的无 else 分支逻辑不对**：现在把 then 按 `wish` 检查并返回 wish，但无 else 的 if 类型恒为 unit。改成：
+
+```cpp
+if (auto fi = dynamic_cast<ifExpr*>(expr); fi) {
+    expect(fi->cond_, semantic::makeBuiltin("bool"));
+    if (fi->else_ != nullptr) {
+        expect(fi->then_, wish);
+        expect(fi->else_, wish);
+        return wish;
+    }
+    expect(fi->then_, semantic::makeUnit());          // then 必须 unit/never
+    if (!matches(semantic::makeUnit(), wish)) {       // if 结果 unit，wish 也得是 unit
+        error("if without else has unit type");
+        return semantic::makeError();
+    }
+    return semantic::makeUnit();
+}
+```
+
+**3. `infer(if)` 里 else 被 infer 了两次**：
+
+```cpp
+semType* rhs = infer(fi->else_);                    // ← 没用，删掉
+return lub({infer(fi->then_), infer(fi->else_)});
+```
+
+**4. `lub` 的提升失败路径没有报错**：
+
+```cpp
+else if (canImplicitlyTurn(t, u)) {
+    bool can = true;
+    for (auto now : all) can &= canImplicitlyTurn(now, u);
+    if (can) { t = u; all.push_back(u); continue; }
+    // ← can == false 时这里什么都不做，静默保留旧 target
+}
+```
+
+应该在 `if (can)` 之外落到 `error("lub failed"); return makeError();`。重构成：
+
+```cpp
+if (canImplicitlyTurn(u, t)) { all.push_back(u); continue; }
+if (canImplicitlyTurn(t, u)) {
+    bool can = true;
+    for (auto now : all) can &= canImplicitlyTurn(now, u);
+    if (can) { t = u; all.push_back(u); continue; }
+}
+error("lub failed");
+return semantic::makeError();
+```
+
+**5. `expect` 最后的 fallback 用的是 `typeEqual`**，会把 never 拒掉：
+
+```cpp
+semType* type = infer(expr);
+if (!matches(type, wish)) { error("expect type mismatch"); return makeError(); }
+return wish;
+```
+
+否则 `let x: i32 = return 1;` 这种（never 作初始化式）会误报。
+
+**6.** `canImplicitlyTurn` 目前只覆盖 never、相等、`&mut T → &T`，Phase 3 够用；Phase 4 再扩 deref 链（`&Box<T> → &T` 等）。
+
+修完 1 之后先跑一遍 `expected-types`、`blocks-if-and-never`、`loops-and-jumps`、`loop-state-merges`、`runtime-value-merges`，再看剩余失败；`runtime-value-merges` 里还会有 struct/数组/Vec 相关的（等 Phase 4/5）。
+
+---
+
+## User
+
+修完了，我记得还要改几个地方？
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 43.3s)
+
+_Thinking:_
+
+The user says they fixed the LUB/expect issues. They ask "我记得还要改几个地方？" — they remember there were a few more things to change. From my previous review of the six failing tests, the remaining items were:
+
+1. `loops-and-jumps/rej-continue-outside-a-loop` — add loop check to continue branch.
+2. `expected-types/acc-...` — ERROR cascade guards in deref/cast/unary/binary (so unimplemented features don't cause false rejects).
+3. `expected-types/rej-a-fixed-array-target-rejects-a-mismatched-element` — minimal array expected handling in `expect`.
+4. `blocks-if-and-never/rej-a-non-final-block-statement-without-semicolon-must-be-unit` — needs AST change: add `hasSemi_` to exprStmt and check in checkStatement.
+5. runtime-value-merges — wait for Phase 4/5.
+
+Also possibly `lub` should be used for arrays later.
+
+Let me first verify current fixes and run the suites to see what's left. Then tell them the remaining changes. Let me build and run the Phase 3 suites.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && cmake --build target/build -j 2>&1 | grep -E \"error|warning|Built target\" | head -3 && make test FILTER=official:semantic:expected-types,official:semantic:blocks-if-and-never,official:semantic:loops-and-jumps,official:semantic:loop-state-merges,official:semantic:runtime-value-merges STAGE=semantic 2>&1 | grep -E \"^\\s*[0-9]+\\)|passed|failed\" | head -12",
+  "timeout": 300000
+}
+```
+
+**Output:**
+```
+[100%] Built target rxcc
+. passed  F failed
+1) official:semantic:blocks-if-and-never/rej-a-non-final-block-statement-without-semicolon-must-be-unit.rx@semantic
+2) official:semantic:expected-types/acc-no-inference-through-operators-or-borrows-is-required.rx@semantic
+3) official:semantic:expected-types/rej-a-fixed-array-target-rejects-a-mismatched-element.rx@semantic
+4) official:semantic:loops-and-jumps/rej-continue-outside-a-loop.rx@semantic
+5) official:semantic:loops-and-jumps/rej-a-condition-cannot-jump-to-an-outer-loop.rx@semantic
+6) official:semantic:runtime-value-merges/acc-input-dependent-reference-aggregate-and-owner-results.rx@semantic
+======================== 6 failed, 15 passed in 22.30s =========================
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 14.7s)
+
+_Thinking:_
+
+Current failures: 6, mostly the ones I predicted, plus a new one: `loops-and-jumps/rej-a-condition-cannot-jump-to-an-outer-loop.rx`. Let me look at that test. Also check `expected acc` still failing — likely ERROR cascade (deref/cast). Let me look at the tests:
+
+1. `rej-a-non-final-block-statement-without-semicolon-must-be-unit` — AST hasSemi change.
+2. `expected-types/acc-no-inference...` — ERROR cascade guards.
+3. `rej-a-fixed-array-target...` — array expect.
+4. `rej-continue-outside-a-loop` — continue check.
+5. `rej-a-condition-cannot-jump-to-an-outer-loop` — break/continue in a condition cannot target outer loop? Let me read.
+6. runtime-value-merges — Phase 4/5.
+
+Let me cat the new test and also check the error output of expected acc (which error is firing). Run rxcc on it to see stderr.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && cat tests/official/semantic/loops-and-jumps/rej-a-condition-cannot-jump-to-an-outer-loop.rx; echo ===; ./target/build/rxcc --stage semantic tests/official/semantic/expected-types/acc-no-inference-through-operators-or-borrows-is-required.rx 2>&1 | head -12"
+}
+```
+
+**Output:**
+```
+use rx::core::*;
+
+fn main() {
+    loop {
+        while continue {}
+    }
+}
+===
+error occurred!
+castExpr lhs is neither int nor bool
+error occurred!
+castExpr lhs is neither int nor bool
+error occurred!
+castExpr lhs is neither int nor bool
+error occurred!
+attempted to deref a non-reference type
+error occurred!
+castExpr lhs is neither int nor bool
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 20.6s)
+
+_Thinking:_
+
+Confirmed:
+- `expected acc` fails due to ERROR cascade in cast and deref (unimplemented array/struct/Box expressions → ERROR). Guards needed.
+- `rej-a-condition-cannot-jump-to-an-outer-loop`: `loop { while continue {} }` — `continue` inside the **condition** of a while: per spec, a jump in a condition cannot target the loop being created (the while's own loop context is not active yet in its condition). Our while branch does: `expect(cond, bool)` BEFORE pushing loop context. So `continue` in cond sees the OUTER loop context (loops_ has the outer loop) → allowed as continue (returns never), condition type never → `matches(never, bool)` true (expect fallback? Actually expect(cond, bool) → continue infer never → matches true) → no error. But the test expects rejection: the continue would target the *outer* loop; spec says conditions cannot jump to an outer loop? Let me think: In Rust, `loop { while continue {} }` — `continue` in the while condition continues the **while**, but the while loop is not yet entered? Rust rejects: "`continue` targeting a loop that is not yet initialized"? Actually the error is E0696? The spec says a condition cannot jump to an outer loop. So when checking a while condition, we must not allow break/continue to target enclosing loops; i.e., push a "barrier" context that makes jumps error (or check loop depth). The test name: "a condition cannot jump to an outer loop". So during condition checking, `continue`/`break` should not see outer loops. Implementation: push a sentinel loopInfo marked invalid/barrier before checking the condition, or track a flag `inCondition_` that makes break/continue error. Simplest: push a loopInfo with a special `barrier_` flag (or a bool) before `expect(cond)`, pop after. Then break/continue branches: if loops_.back() is a barrier (or any context marked no-jump), error "cannot jump to an outer loop". But note the while's *body* should allow continue targeting the while: after pushing the while context. For `while` body we already push unit context; fine.
+  - Also for `if` conditions inside loops? In Rust, `loop { if continue {} }` — `continue` in the if condition: does it target the loop? In Rust, `if continue {}` is allowed? Hmm. The spec/test specifically says "a condition cannot jump to an outer loop" — which conditions? Probably loop conditions (while) only? Let me check the test suite for similar: maybe `loop { if continue {} }`? Let me grep. The Rust behavior: `if continue {}` — a `continue` in an `if` condition inside a loop is allowed? Actually in Rust, conditions are expressions; break/continue in them: `while break {}` errors "break with value"? Hmm. The Rx spec likely has a rule: break/continue in a condition cannot target the loop whose condition it is; but in `loop { if continue {} }`, the continue is in an if condition, not a loop condition; it targets the outer loop and is allowed? Let me check the test suite name: "rej-a-condition-cannot-jump-to-an-outer-loop". Maybe the rule is about `while` condition because the while loop itself isn't active yet, so "outer loop" refers to the enclosing `loop`. For `if` conditions inside a loop, the loop is active, so allowed. So only while condition needs a barrier. Let me look for other tests in loops-and-jumps. Let me list files and grep for continue/break in conditions.
+
+Let me also think about `loop` conditions: `loop` has no condition. while condition only. So add barrier for while cond.
+
+Implementation options:
+- Add `bool barrier_` to loopInfo (symbol.h change) or use a separate counter/flag `int jumpBarrier_` or push `loopInfo{nullptr, {}, true}`.
+- Simpler: add member `bool inLoopCondition_ = false;` and in break/continue branches: `if (loops_.empty() || inLoopCondition_)`? No: if in while condition inside a loop, break/continue should be rejected even though loops_ non-empty. But `if` conditions inside loops are fine. So set the flag only while checking the while condition; break/continue branch checks the flag → error. But nested: while condition inside a loop body → flag true only during cond evaluation; any break/continue inside a block expression nested in the condition also blocked (probably correct per rule).
+- However `break` in while condition: `while break {}`? also blocked.
+- Use a counter/flag saved/restored.
+
+So fix: in while branch: `inLoopCondition_ = true; expect(cond, bool); inLoopCondition_ = false;` (save/restore for nesting). In break/continue: `if (loops_.empty()) error; else if (inLoopCondition_) error("cannot jump to outer loop");`.
+
+Wait, the error message: "a condition cannot jump to an outer loop". Fine.
+
+Now, the remaining fixes list:
+1. `continue` outside loop check (they haven't added? Let me verify current continue branch; the failure persists). Let me check.
+2. ERROR guards in cast/deref/unary/binary (for expected acc).
+3. Array expect minimal (fixed-array target test).
+4. AST hasSemi flag + checkStatement rule (non-final block statement).
+5. While-condition barrier (new test).
+
+Let me verify the current continue branch and whether they added the check. Also check if expected acc still errors only from cast/deref. From the stderr: 4 cast errors + 1 deref. Guards fix.
+
+Let me also check the fixed-array test requirement: add expect(arrayExpr) minimal.
+
+And check `blocks rej` test: needs AST flag.
+
+Let me now write the response with the remaining fixes. The user asked "我记得还要改几个地方？" — answer: 5 places (continue, while-condition barrier, ERROR guards, array expect, exprStmt semi flag). Note runtime-value-merges waits for Phase 4/5.
+
+Let me check current continue branch to be precise.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && sed -n '/if (auto con = dynamic_cast<continueExpr/,/^    }/p' compiler/src/semantic/checker.cpp; echo ===; grep -rn \"continue\\|break\" tests/official/semantic/loops-and-jumps/*.rx | head -20"
+}
+```
+
+**Output:**
+```
+    if (auto con = dynamic_cast<continueExpr*>(expr); con) {
+        return semantic::makeNever();
+    }
+===
+tests/official/semantic/loops-and-jumps/acc-continue-rechecks-the-condition-and-inner-breaks-leave-only-the-inner-loop.rx:11:            continue;
+tests/official/semantic/loops-and-jumps/acc-continue-rechecks-the-condition-and-inner-breaks-leave-only-the-inner-loop.rx:17:                break;
+tests/official/semantic/loops-and-jumps/acc-continue-rechecks-the-condition-and-inner-breaks-leave-only-the-inner-loop.rx:24:            break;
+tests/official/semantic/loops-and-jumps/acc-continue-rechecks-the-condition-and-inner-breaks-leave-only-the-inner-loop.rx:26:        break sum;
+tests/official/semantic/loops-and-jumps/acc-continue-rechecks-the-condition-and-inner-breaks-leave-only-the-inner-loop.rx:31:        break false;
+tests/official/semantic/loops-and-jumps/rej-a-condition-cannot-jump-to-an-outer-loop.rx:5:        while continue {}
+tests/official/semantic/loops-and-jumps/rej-a-jump-in-a-while-condition-cannot-target-that-while.rx:4:    while break {}
+tests/official/semantic/loops-and-jumps/rej-a-while-cannot-accept-a-break-value.rx:5:        break 1;
+tests/official/semantic/loops-and-jumps/rej-break-outside-a-loop.rx:4:    break;
+tests/official/semantic/loops-and-jumps/rej-continue-outside-a-loop.rx:4:    continue;
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 25.3s)
+
+_Thinking:_
+
+More tests:
+- `rej-a-jump-in-a-while-condition-cannot-target-that-while.rx`: `while break {}` — break in condition cannot target that while. With a barrier for while conditions, this errors (good).
+- `rej-a-while-cannot-accept-a-break-value.rx`:
+```rust
+loop {
+    while break 1 {}   // or while ... { break 1; }? let me read
+}
+```
+It says "a while cannot accept a break value". Let me read the file. Probably `while true { break 1; }` → break with value in while → error. Our while context expected unit → break branch expect(1, unit) errors. Good, likely passing already (not in failure list). Let me check.
+- `rej-break-outside-a-loop` — break outside loop; current break checks loops_.empty() → passes (not in failure list).
+- `rej-continue-outside-a-loop` — continue has no check → fails. Add.
+- `rej-a-condition-cannot-jump-to-an-outer-loop` — while condition barrier.
+- `rej-a-jump-in-a-while-condition-cannot-target-that-while` — `while break {}`: barrier → error. Currently, while cond checked before pushing context; loops_ may be empty at top-level `while break {}` → break sees loops_ empty → error anyway. Inside a loop, it would see outer → allowed wrongly; test is top-level (`while break {}` in main), loops_ empty → error already. Let me check if it's in failing list: no, so passes. The outer-loop variant with `loop { while continue {} }` fails because continue sees outer loop. So barrier needed.
+
+Design for barrier: simplest member `bool inWhileCondition_ = false;` But nested while conditions: save/restore.
+
+Implementation:
+```cpp
+// while branch
+bool saved = inLoopCondition_;
+inLoopCondition_ = true;
+expect(whi->cond_, bool);
+inLoopCondition_ = saved;
+loops_.push_back(...);
 ...
-statementShiftExpression...
+// break branch
+if (loops_.empty()) { error("break outside loop"); ... }
+if (inLoopCondition_) { error("a condition cannot jump to an outer loop"); ... }
+// continue branch similarly
 ```
-Hmm, but there are also `bitOrExpression` (non-statement) embedded in statement families: e.g. `statementShiftExpression: ... (closedAdditiveExpression SHL | additiveExpression shiftRight)* ...` uses non-statement inner rules.
+Wait: the rule "a condition cannot jump to an outer loop": for a while condition, any break/continue targeting outside is disallowed. But what about an `if` condition inside a loop? E.g., `loop { if continue {} }` — is that allowed? The test only covers while condition. Rust: `loop { if continue {} }` — I believe this is allowed? Actually, in Rust, `continue` in an `if` condition inside a loop is allowed (the loop is active). Hmm, but `break`/`continue` in a condition of `if` inside a loop: the if is not a loop; the enclosing loop is active. So allowed. The spec's rule likely: "a condition cannot jump to an outer loop" applies to loop conditions (while). Let me check the spec for exact wording. The now_todolist doesn't mention. Let me search the spec pages for "condition" and "jump". Perhaps in expressions/loop-expr.html. Let me fetch relevant page? The test names guide: "a condition cannot jump to an outer loop" and "a jump in a while condition cannot target that while". This suggests: in a while condition, jumps cannot target the while itself (not active yet) nor any outer loop (i.e., no loop context visible). So barrier for the entire while condition. For if conditions, no new loop, so outer loop remains valid. So only set barrier in while cond.
 
-The crash: let me find where. Use gdb or check if it's infinite recursion. Quick way: run with `ulimit -s`? Or use gdb batch. Is gdb installed? log.md used it. Let me run gdb backtrace.
+Implement with member `bool loopCondBarrier_ = false;` (or int depth). Save/restore.
 
-Actually let me first reproduce with the exact prelude from diff test to see if it also crashes there. And also test `a >> b << c;` vs `let z = a >> b << c;` (expression context worked? diff said expr OK producing Binary << b a). So the crash is specific to the statement family rule parse/builder.
+Now, remaining fixes list:
+1. `continue` outside loop check + barrier check.
+2. While condition barrier (`loop { while continue {} }`).
+3. ERROR guards in cast/deref/unary/binary (fixes expected acc).
+4. Array expect minimal (fixed-array target).
+5. exprStmt `hasSemi_` AST change + checkStatement rule.
+6. runtime-value-merges: wait Phase 4/5.
 
-Let me run gdb.
+Let me also check `rej-a-while-cannot-accept-a-break-value` passes (not in list). Fine.
 
-A segfault — real crash on `a >> b << c;` as a statement. Let me get a backtrace.
+Now write the answer listing the remaining changes. They asked "我记得还要改几个地方？" — list them concisely with exact code.
 
-**Tool: bash**
+For AST change:
+- ast.h exprStmt: add `bool hasSemi_ = true;`
+- ast_builder.cpp visitStatement:
+  - for expressionWithBlock: `now->hasSemi_ = (ctx->SEMI() != nullptr);`
+  - for statementExpression: always true (`ctx->SEMI() != nullptr` anyway).
+  Let me check current visitStatement: 
+```cpp
+if (ctx->expressionWithBlock()) {
+    auto now = make<exprStmt>();
+    now->expr_ = anyExpr(visit(ctx->expressionWithBlock()));
+    return static_cast<Stmt*>(now);
+}
+if (ctx->statementExpression()) { ... }
+```
+Add hasSemi_ assignments.
+- checkStatement: for exprStmt, infer type; if `!expr->hasSemi_` and expr is block-like (blockExpr, ifExpr, whileExpr, loopExpr) and !matches(t, unit) → error "non-final block statement must be unit". Actually the rule applies to any expressionWithBlock used as a statement without semicolon (not only non-final). But AST builder turns the last block-expr without semi into tail, so exprStmt without semi only occurs for non-final. So check any exprStmt with `hasSemi_ == false`: if its expr is block-like and type not unit/never → error. We can simply check `!hasSemi_` regardless of node type (statementExpression always has semi). So:
+```cpp
+semType* t = infer(expr->expr_);
+if (!expr->hasSemi_ && !matches(t, unit)) error("...");
+return t;
+```
+But careful: if the expression is a block-like with type i32 and no semi as non-final → error. Good.
+  Note: the AST change affects AST dump (no dump of semi). Fine.
 
-**Input:**
-```json
-{
-  "command": "which gdb && cd /tmp/opencode/ast-check/diff && timeout 60 gdb -batch -ex run -ex bt --args /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/target/build/rxcc --stage semantic --dump-ast case2.rx 2>&1 | tail -40",
-  "timeout": 90000
+Array expect minimal:
+```cpp
+if (auto arr = dynamic_cast<arrayExpr*>(expr); arr) {
+    if (wish->kind_ == ARRAY) {
+        if (arr->args_.size() != wish->arrayLength_) { error; return makeError(); }
+        for (auto* a : arr->args_) expect(a, wish->elem_);
+        return wish;
+    }
+    // 没有 expected 的数组 infer 留 Phase 5（返回 ERROR 也行）
+}
+```
+Careful order: expect checks wish first; wish non-null here. Place before fallback. For expected-types acc: `let a: [u32; 2] = [6, 7];` → elements 6,7 unsuffixed with elem u32 → expect literal → u32. Good. `let b: [u32; 2] = [8; 2];` → repeatedArray; not handled by array branch; infer(repeatedArray)=ERROR → typeEqual(ERROR, array) true → passes silently; acceptable for now (Phase 5 implements). Wait, but `expect(repeatedArray, [u32;2])` falls to fallback infer ERROR → matches(ERROR, wish) → typeEqual ERROR true → returns wish. OK.
+  For the negative `[1u32, 2i32]` with wish [u32;2]: element 2i32 → expect(2i32, u32) → suffixed mismatch → error. Good.
+
+ERROR guards:
+- cast: if ltype ERROR → return rtype (silently); if rtype ERROR → return makeError perhaps. rtype from transformType always concrete unless type error. Add ltype guard.
+- deref: if t ERROR → return makeError silently.
+- unary: if type ERROR → return makeError.
+- binary: after inferring ltype/rtype, if either ERROR → return makeError (after evaluating both to report errors). But the current structure computes types inside each op branch. Add a general guard early? For binary, we can at the start of each relevant branch: `if (ltype->kind_ == ERROR || rtype->kind_ == ERROR) return makeError();` Actually ltype/rtype are computed inside branches; simplest add checks in each branch or compute at top. They compute per branch. Add helper `static bool isErrorType(semType*)` and guard after each infer pair. The failing cases: cast (4 times) and deref (once) per stderr. Maybe binary errors don't appear because unimplemented arrays/structs feed into cast only. So minimal: cast + deref guards fix the acc. But add unary/binary too for robustness.
+- Also `expect` fallback with ERROR: typeEqual(ERROR, wish) true → fine.
+- `if` cond expect: ERROR cond → expect fallback typeEqual(ERROR,bool) true → fine.
+
+Continue check:
+```cpp
+if (auto con = dynamic_cast<continueExpr*>(expr); con) {
+    if (loops_.empty() || inLoopCondition_) { error("continue outside a loop / in condition"); return makeError(); }
+    return makeNever();
+}
+```
+Message maybe generic.
+
+Break: add `if (inLoopCondition_)` error too.
+
+While condition barrier: add member and save/restore:
+```cpp
+bool saved = jumpBarrier_;
+jumpBarrier_ = true;
+expect(whi->cond_, bool);
+jumpBarrier_ = saved;
+```
+
+Note: `loop { while continue {} }`: outer loop ctx pushed; in while cond, jumpBarrier true → continue branch errors. Good.
+
+Now, let me write the response. Also mention the current test status 15/6 → after fixes expect 20/21? Let's see: fixes address tests 2,3,4,5 (blocks semi, expected acc, array, continue, condition). runtime-value-merges remains (Phase 4/5). So 20/21? The five suites total 21 tests (15+6). After fixes, all except runtime acc → 20/21.
+
+Keep concise. Also mention where to add helpers.
+
+对，还差这几处（按当前 6 个失败对应）：
+
+**1. `continue` 没检查是否在 loop 里**（`rej-continue-outside-a-loop`）：
+
+```cpp
+if (auto con = dynamic_cast<continueExpr*>(expr); con) {
+    if (loops_.empty()) { error("continue outside loop"); return semantic::makeError(); }
+    if (jumpBarrier_) { error("a condition cannot jump to an outer loop"); return semantic::makeError(); }
+    return semantic::makeNever();
 }
 ```
 
-**Output:**
-```
-/usr/bin/gdb
-This GDB supports auto-downloading debuginfo from the following URLs:
-  <https://debuginfod.ubuntu.com>
-Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
-Debuginfod has been disabled.
-To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
-[Thread debugging using libthread_db enabled]
-Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+**2. while 的条件里不能跳外层 loop**（`rej-a-condition-cannot-jump-to-an-outer-loop`：`loop { while continue {} }`）
 
-Program received signal SIGSEGV, Segmentation fault.
-0x00005555555b8645 in ASTVisitor::visitStatementShiftExpression(RxParser::StatementShiftExpressionContext*) ()
-#0  0x00005555555b8645 in ASTVisitor::visitStatementShiftExpression(RxParser::StatementShiftExpressionContext*) ()
-#1  0x00005555555db329 in RxParser::StatementShiftExpressionContext::accept(antlr4::tree::ParseTreeVisitor*) ()
-#2  0x00005555555afd44 in ASTVisitor::visitStatementBitAndExpression(RxParser::StatementBitAndExpressionContext*) ()
-#3  0x00005555555e1e42 in RxParser::StatementBitAndExpressionContext::accept(antlr4::tree::ParseTreeVisitor*) ()
-#4  0x00005555555add84 in ASTVisitor::visitStatementBitXorExpression(RxParser::StatementBitXorExpressionContext*) ()
-#5  0x00005555555dd962 in RxParser::StatementBitXorExpressionContext::accept(antlr4::tree::ParseTreeVisitor*) ()
-#6  0x00005555555acd94 in ASTVisitor::visitStatementBitOrExpression(RxParser::StatementBitOrExpressionContext*) ()
-#7  0x00005555555e21e2 in RxParser::StatementBitOrExpressionContext::accept(antlr4::tree::ParseTreeVisitor*) ()
-#8  0x00005555555b842c in ASTVisitor::visitStatementComparisonExpression(RxParser::StatementComparisonExpressionContext*) ()
-#9  0x00005555555dd222 in RxParser::StatementComparisonExpressionContext::accept(antlr4::tree::ParseTreeVisitor*) ()
-#10 0x00005555555b0924 in ASTVisitor::visitStatementLogicalAndExpression(RxParser::StatementLogicalAndExpressionContext*) ()
-#11 0x00005555555dabe9 in RxParser::StatementLogicalAndExpressionContext::accept(antlr4::tree::ParseTreeVisitor*) ()
-#12 0x00005555555ae584 in ASTVisitor::visitStatementLogicalOrExpression(RxParser::StatementLogicalOrExpressionContext*) ()
-#13 0x00005555555e78e2 in RxParser::StatementLogicalOrExpressionContext::accept(antlr4::tree::ParseTreeVisitor*) ()
-#14 0x00005555555b80fc in ASTVisitor::visitStatementAssignmentExpression(RxParser::StatementAssignmentExpressionContext*) ()
-#15 0x00005555555daa19 in RxParser::StatementAssignmentExpressionContext::accept(antlr4::tree::ParseTreeVisitor*) ()
-#16 0x00005555555a543f in ASTVisitor::visitStatementExpression(RxParser::StatementExpressionContext*) ()
-#17 0x00005555555e5842 in RxParser::StatementExpressionContext::accept(antlr4::tree::ParseTreeVisitor*) ()
-#18 0x00005555555c000b in antlr4::tree::AbstractParseTreeVisitor::visit(antlr4::tree::ParseTree*) ()
-#19 0x00005555555a95fe in ASTVisitor::visitStatement(RxParser::StatementContext*) ()
-#20 0x00005555555e8762 in RxParser::StatementContext::accept(antlr4::tree::ParseTreeVisitor*) ()
-#21 0x00005555555a7324 in ASTVisitor::visitBlockExpression(RxParser::BlockExpressionContext*) ()
-#22 0x00005555555e49c2 in RxParser::BlockExpressionContext::accept(antlr4::tree::ParseTreeVisitor*) ()
-#23 0x00005555555b3714 in ASTVisitor::visitFunctionDefinition(RxParser::FunctionDefinitionContext*) ()
-#24 0x00005555555ecfdf in RxParser::FunctionDefinitionContext::accept(antlr4::tree::ParseTreeVisitor*) ()
-#25 0x00005555555a50cc in ASTVisitor::visitItem(RxParser::ItemContext*) ()
-#26 0x00005555555d49f6 in RxParser::ItemContext::accept(antlr4::tree::ParseTreeVisitor*) ()
-#27 0x00005555555a8fa0 in ASTVisitor::visitCrate(RxParser::CrateContext*) ()
-#28 0x00005555555d48c6 in RxParser::CrateContext::accept(antlr4::tree::ParseTreeVisitor*) ()
-#29 0x00005555555a4126 in main ()
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 29.5s)
-
-_Thinking:_
-
-The segfault is directly in `ASTVisitor::visitStatementShiftExpression` (the very first frame). So for the statement context `a >> b << c;`, the parse tree has a statementShiftExpression shape that the builder mishandles with invalid indexing.
-
-Let me analyze `visitStatementShiftExpression`:
+加个成员 `bool jumpBarrier_ = false;`，while 分支：
 
 ```cpp
-std::any ASTVisitor::visitStatementShiftExpression(RxParser::StatementShiftExpressionContext *ctx) {
-    if (ctx->additiveExpression().size() == 0u) {
-        return anyExpr(visit(ctx->statementAdditiveExpression()));
-    }
-    if (ctx->SHL().size() != 0u) {
-        auto operands = ctx->closedAdditiveExpression();
-        auto ops = ctx->SHL();
-        Expr* left = anyExpr(visit(ctx->statementClosedAdditiveExpression()));
-        for (int i = 0; i < ops.size() - 1; i++) {
-            ...
-            now->rhs_ = anyExpr(visit(operands[i]));   // operands may be empty!
-        }
-        ...
-    }
-    else {
-        auto operands = ctx->additiveExpression();
-        auto ops = ctx->shiftRight();
-        Expr* left = anyExpr(visit(ctx->statementAdditiveExpression()));
-        for (int i = 0; i < ops.size(); i++) {
-            ...
-            now->rhs_ = anyExpr(visit(operands[i]));   // operands index mismatch!
-        }
-        return left;
-    }
-}
+bool saved = jumpBarrier_;
+jumpBarrier_ = true;
+expect(whi->cond_, semantic::makeBuiltin("bool"));
+jumpBarrier_ = saved;
+// 再 push 自己的 loopInfo 检查 body
 ```
 
-Grammar:
-```
-statementShiftExpression
-    : statementAdditiveExpression
-    | (statementClosedAdditiveExpression SHL | statementAdditiveExpression shiftRight)
-      (closedAdditiveExpression SHL | additiveExpression shiftRight)* additiveExpression
-    ;
-```
+break 分支也加同样的 `jumpBarrier_` 检查（`while break {}` 那种）。`if` 的条件**不要**加 barrier——if 不是 loop，里面的 continue 指向外层 loop 是合法的。
 
-For statement `a >> b << c`:
-- First segment: `statementAdditiveExpression shiftRight` → statementAdditiveExpression = a, shiftRight = `>>`.
-- Loop segment: `closedAdditiveExpression SHL` → closedAdditiveExpression = b, SHL.
-- Final: additiveExpression = c.
+**3. `deref` / `cast` 遇到 ERROR 别再报错**（`expected-types/acc-no-inference...` 现在就是被这两个误伤，stderr 里能看到 4 条 cast + 1 条 deref）：
 
-So context accessors: statementAdditiveExpression() = [a]; shiftRight() = [>>]; closedAdditiveExpression() = [b]; SHL() = [<<]; additiveExpression() = [c].
-
-Builder: first condition `ctx->additiveExpression().size() == 0`? additiveExpression = [c] size 1 → false. Then `ctx->SHL().size() != 0` → true (size 1):
-- operands = ctx->closedAdditiveExpression() = [b]
-- ops = ctx->SHL() = [<<]
-- left = visit(statementClosedAdditiveExpression()) — **but there is no statementClosedAdditiveExpression in this parse!** ctx->statementClosedAdditiveExpression() returns nullptr → `visit(nullptr)` → crash (segfault) or anyExpr(bad). Actually `visit(nullptr)` in ANTLR AbstractParseTreeVisitor might deref null → segfault. Yes, frame #0 is in visitStatementShiftExpression → visit(nullptr).
-
-Wait, but does `ctx->statementClosedAdditiveExpression()` return a single context pointer (not vector)? In the builder, `visit(ctx->statementClosedAdditiveExpression())` with no index → returns nullptr if absent → visit(nullptr) → segfault. Confirmed mechanism.
-
-For the working case `a << b >> c;` in 25: parse: first segment `statementClosedAdditiveExpression SHL` (a <<), loop segment `additiveExpression shiftRight` (b >>), final additive (c). statementClosedAdditiveExpression exists; builder SHL branch: operands=closedAdditive=[] (empty; statementClosedAdditive consumed a), ops=[<<], left=visit(statementClosedAdditive=a); loop i<0 skipped; final now = a << additiveExpression(0)=b → returns a<<b (ignores >>c; already known bug, no crash).
-
-So the segfault is another manifestation of the same broken visitor: when the first operator is `>>` (so statementClosedAdditiveExpression absent) but SHL appears later, the builder blindly calls visit(ctx->statementClosedAdditiveExpression()) → nullptr crash.
-
-Are there similar crashes in the condition/conditionBreak non-statement variants? `visitConditionShiftExpression` SHL branch:
 ```cpp
-auto operands = ctx->conditionClosedAdditiveExpression();
+// deref
+semType* t = infer(der->operand_);
+if (t->kind_ == semType::kTypeKind::ERROR) return semantic::makeError();   // 静默
 ...
-Expr* left = anyExpr(visit(operands[0]));   // ← operands may be empty → out-of-range UB/crash
-```
-For `if a >> b << c { }` (condition context): first segment = `conditionAdditiveExpression shiftRight`, loop = `conditionClosedAdditiveExpression SHL`, final conditionAdditiveExpression. So conditionClosedAdditiveExpression = [b] (non-empty) → operands[0]=b; no crash, but wrong result. Could it be empty? If the expression starts with `>>` then `<<`? e.g. `a >> b << c` always has a closedAdditive in loop segments (b). To get conditionClosedAdditiveExpression empty while SHL non-empty and shiftRight non-empty: e.g. `a << b` only SHL, but then shiftRight empty and conditionClosedAdditive = [a]? For `a << b << c`: conditionClosedAdditive=[a,b]; fine. SHL branch only entered when SHL non-empty; non-statement condition/expression variants use `operands[0]` — could operands be empty if the first segment is `additive shiftRight` and no loop `closedAdditive SHL`? Then SHL() would be empty → else branch. So SHL branch ⇒ at least one SHL ⇒ grammar puts SHL after `closedAdditiveExpression` (loop) or `conditionClosedAdditiveExpression` (first segment). If first segment is `additive shiftRight` and later `closedAdditive SHL`, operands non-empty. If first segment `closedAdditive SHL`, operands non-empty. So no empty in condition variant. OK.
-
-`visitConditionBreakShiftExpression` SHL branch:
-```cpp
-if (ctx->conditionAdditiveExpression().size() == 0u) return visit(conditionBreakAdditiveExpression);
-if (ctx->SHL().size() != 0u) {
-    auto operands = ctx->conditionClosedAdditiveExpression();
-    auto ops = ctx->SHL();
-    Expr* left = visit(ctx->conditionBreakClosedAdditiveExpression());  // may be null!
-```
-Grammar conditionBreakShiftExpression:
-```
-: conditionBreakAdditiveExpression
-| (conditionBreakClosedAdditiveExpression SHL | conditionBreakAdditiveExpression shiftRight)
-  (conditionClosedAdditiveExpression SHL | conditionAdditiveExpression shiftRight)* conditionAdditiveExpression
-```
-For `break a >> b << c;`: first segment `conditionBreakAdditiveExpression shiftRight`, loop `conditionClosedAdditiveExpression SHL`, final conditionAdditiveExpression. Then ctx->conditionAdditiveExpression().size() = 1 (final c), conditionBreakClosedAdditiveExpression is nullptr → `visit(nullptr)` → crash! So `break a >> b << c;` likely segfaults too. We saw in 29 `break a << b >> a;` worked (wrong result). The reverse order crashes.
-
-Similarly `visitStatementClosedShiftExpression`: 
-```cpp
-if (ctx->closedAdditiveExpression().size() == 0u) return visit(statementClosedAdditiveExpression);
-if (ctx->shiftRight().size() != 0u) { ... left = visit(ctx->statementAdditiveExpression()); ... }
-else { ... left = visit(ctx->statementClosedAdditiveExpression()); ... }
-```
-Grammar statementClosedShiftExpression:
-```
-: statementClosedAdditiveExpression
-| (statementClosedAdditiveExpression SHL | statementAdditiveExpression shiftRight)
-  (closedAdditiveExpression SHL | additiveExpression shiftRight)* closedAdditiveExpression
-```
-In the shiftRight branch, statementAdditiveExpression exists (first segment if `>>`). In SHL-only branch... could statementClosedAdditiveExpression be absent while SHL present? First segment SHL requires statementClosedAdditiveExpression, so present. Fine. But the else branch uses `ctx->statementClosedAdditiveExpression()` (no index) — present in SHL case. OK.
-
-What about conditionClosedShiftExpression:
-```
-: (conditionClosedAdditiveExpression SHL | conditionAdditiveExpression shiftRight)* conditionClosedAdditiveExpression
-```
-If `shiftRight().size()!=0`: left = visit(conditionAdditiveExpression(0))?? Let me re-read the code:
-```cpp
-if (ctx->shiftRight().size() != 0u) {
-    auto operands = ctx->conditionAdditiveExpression();
-    auto ops = ctx->shiftRight();
-    Expr* left = anyExpr(visit(operands[0]));   // ← if first segment is closedAdditive SHL, conditionAdditiveExpression might be empty → crash?
-```
-For `if a << b >> c {}` closed context (e.g., inside parentheses then compared?): parse closedShift: first segment `conditionClosedAdditiveExpression SHL`, loop `conditionAdditiveExpression shiftRight`, final conditionClosedAdditiveExpression. shiftRight non-empty, conditionAdditiveExpression = [b] (loop) → operands[0]=b → no crash, but wrong. If the only shift is `>>` with a closed final: `(a >> b)` as closed: first segment `conditionAdditiveExpression shiftRight` → conditionAdditiveExpression=[a] → fine.
-
-Edge where conditionAdditiveExpression empty and shiftRight non-empty: impossible since every shiftRight is preceded by a conditionAdditiveExpression in that rule. Wait the first segment is `conditionClosedAdditiveExpression SHL | conditionAdditiveExpression shiftRight`. So shiftRight ⇒ preceding conditionAdditiveExpression. So operands[0] exists whenever shiftRight non-empty. OK.
-
-So the crash cases are exactly where a builder uses `visit(ctx->someContext())` without checking presence and the context may be absent:
-1. `visitStatementShiftExpression` SHL branch: `visit(ctx->statementClosedAdditiveExpression())` — absent when first segment is `statementAdditive shiftRight` and a later `closedAdditive SHL` exists. Repro: `a >> b << c;` → segfault.
-2. `visitConditionBreakShiftExpression` SHL branch: `visit(ctx->conditionBreakClosedAdditiveExpression())` — absent when first segment is `conditionBreakAdditive shiftRight` and later SHL. Repro: `loop { break a >> b << c; }` → likely segfault.
-3. Also `visitConditionBreakClosedShiftExpression` shiftRight branch uses `visit(conditionBreakAdditiveExpression())`... let me check: in that function, code:
-```cpp
-if (ctx->shiftRight().size() != 0u) { ... left = visit(ctx->conditionBreakAdditiveExpression()); ...}
-else { ... left = visit(ctx->conditionBreakClosedAdditiveExpression()); ...}
-```
-`conditionBreakAdditiveExpression` exists if first segment is shiftRight — but if first segment is `conditionBreakClosedAdditiveExpression SHL` (i.e., first op is SHL), then shiftRight may still be non-empty (later `>>`) while conditionBreakAdditiveExpression... is it absent? Grammar:
-```
-conditionBreakClosedShiftExpression
-    : conditionBreakClosedAdditiveExpression
-    | (conditionBreakClosedAdditiveExpression SHL | conditionBreakAdditiveExpression shiftRight)
-      (conditionClosedAdditiveExpression SHL | conditionAdditiveExpression shiftRight)* conditionClosedAdditiveExpression
-    ;
-```
-If first segment is SHL (conditionBreakClosedAdditiveExpression), and later segments include `conditionAdditiveExpression shiftRight`, then conditionBreakAdditiveExpression() = ? The loop segments use `conditionAdditiveExpression` (not conditionBreak), so conditionBreakAdditiveExpression is absent. Then builder shiftRight branch: `visit(ctx->conditionBreakAdditiveExpression())` → nullptr → crash! Repro: `loop { break a << b >> c; }` — wait, that's conditionBreak**Shift**Expression (open) not Closed. The closed variant is used when the break value is followed by something requiring closed (e.g., `break a << b >> c;` inside loop — is break's operand open or closed rule? The break grammar: `BREAK expression?` in nonBlockPrimary, but conditionBreak* families for `break` in condition contexts (e.g., `loop { break ... }` uses conditionBreak?). Hmm, from frame trace, break uses conditionBreak families. Which one (open or closed) depends on whether it's a "closed" position.
-
-Let me just empirically test all 8 shift families for crashes:
-- expression: `let z = a >> b << c;` → worked (wrong tree).
-- closed expression: `let z = (a >> b << c);`? closedShiftExpression used where? closed positions are before `<`/`<<`... Hmm hard to reach directly. Closed shifts appear in CLOSED contexts like left of `<`: e.g., `if (a >> b << c) < x {}`? Complex.
-- condition: `if a >> b << c {}` → ?
-- conditionClosed: maybe via `if (a >> b << c) < x {}`.
-- conditionBreak: `loop { break a >> b << c; }` → ?
-- conditionBreakClosed: via `loop { break (a >> b << c) < x; }`? The closed variant is used when break operand is followed by `<`.
-- statement: `a >> b << c;` → CRASH confirmed.
-- statementClosed: via `(a >> b << c) < x;` as statement? Hmm, statement context closed used for left side of `<`.
-
-Let me systematically test crash variants. Write a small script with several snippets, run each with timeout 5, record rc. Note the earlier 120s "timeout" was strange: the segfault should be immediate. The first run took >120s — maybe "dumped core" writing the core dump was slow (huge process?). With `timeout 10` it segfaulted quickly. Actually the shell said "timeout: the monitored command dumped core" — that means timeout reported it dumped core... at 10s. Hmm, perhaps the segfault is an infinite recursion that eventually overflows the stack (takes time & memory). The gdb backtrace showed #0 directly in visitStatementShiftExpression — could be depth from recursive dump? No, stack shows a single visit call chain, then crash in #0 itself — likely `visit(nullptr)` dereference. Immediate. The first 120s hang might have been core dump writing (process memory could be ~1GB due to ANTLR?). Anyway.
-
-Let me test crash candidates quickly with a script. Snippets (each in its own file):
-
-1. `a >> b << c;`
-2. `loop { break a >> b << c; }`
-3. `loop { break a << b >> c; }`
-4. `if a >> b << c { }`
-5. `if a << b >> c { }`
-6. `let z = a >> b << c;`
-7. `let z = a << b >> c;`
-8. `while a >> b << c { }`
-9. `(a >> b << c) < d;` (statement closed)
-10. `if (a >> b << c) < d { }` (condition closed)
-11. `loop { break (a >> b << c) < d; }` (conditionBreak closed)
-12. `let z = (a >> b << c) < d;` (closed via parenthesized? parens use full expression, then comparison — hmm, closed variant needed before `<` where left side is a cast? The `closed` rules are used when the left operand of `<`/`<<` must end with a closed cast type. E.g., `a as u32 < b` failed because closedCastType. The closed chain is entered from comparisonExpression's second alt: `closedBitOrExpression LT bitOrExpression`. So to enter closedShift, we need an expression that is the left side of `<` and contains casts? Actually closedBitOr → ... → closedShift: it's used whenever left of `<` involves the closed chain. The parser decides based on lookahead; any expression before `<` may use closed variants. E.g., `a >> b << c < d`? Hmm.
-
-Let me just test a bunch and see rcs. Build a quick script.
-
-A segfault on `a >> b << c;`. Let me map all crash variants across the 8 shift visitors.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cd /tmp/opencode/ast-check && mkdir -p crash && cat > crash/gen.sh <<'EOS'\n#!/bin/bash\nRXCC=\"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/target/build/rxcc\"\ndeclare -a cases=(\n\"a >> b << c;\"\n\"a << b >> c;\"\n\"loop { break a >> b << c; }\"\n\"loop { break a << b >> c; }\"\n\"if a >> b << c { }\"\n\"if a << b >> c { }\"\n\"while a >> b << c { }\"\n\"let z = a >> b << c;\"\n\"let z = a << b >> c;\"\n\"let z = (a >> b << c) < d;\"\n\"if (a >> b << c) < d { }\"\n\"loop { break (a >> b << c) < d; }\"\n\"(a >> b << c) < d;\"\n)\ni=0\nfor body in \"${cases[@]}\"; do\n  i=$((i+1))\n  printf 'fn f(a: i32, b: i32, c: i32, d: i32) {\\n    %s\\n}\\n' \"$body\" > \"crash/c$i.rx\"\n  timeout 5 \"$RXCC\" --stage semantic --dump-ast \"crash/c$i.rx\" > \"crash/c$i.out\" 2> \"crash/c$i.err\"\n  rc=$?\n  echo \"rc=$rc  case$i: $body\"\ndone\nEOS\nbash crash/gen.sh; ulimit -c 0",
-  "timeout": 180000
-}
+// cast
+if (ltype->kind_ == semType::kTypeKind::ERROR) return rtype;                // 静默
 ```
 
-**Output:**
-```
-crash/gen.sh: line 19: 149635 Segmentation fault      timeout 5 "$RXCC" --stage semantic --dump-ast "crash/c$i.rx" > "crash/c$i.out" 2> "crash/c$i.err"
-rc=139  case1: a >> b << c;
-rc=0  case2: a << b >> c;
-rc=0  case3: loop { break a >> b << c; }
-rc=0  case4: loop { break a << b >> c; }
-rc=0  case5: if a >> b << c { }
-rc=0  case6: if a << b >> c { }
-rc=0  case7: while a >> b << c { }
-rc=0  case8: let z = a >> b << c;
-rc=0  case9: let z = a << b >> c;
-rc=0  case10: let z = (a >> b << c) < d;
-rc=0  case11: if (a >> b << c) < d { }
-rc=0  case12: loop { break (a >> b << c) < d; }
-rc=0  case13: (a >> b << c) < d;
+`unary` / `binary` 也顺手加同样的 guard（操作数 ERROR 直接返回 ERROR），后面 Phase 5 未实现节点就不会连锁误报。
 
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 15.1s)
-
-_Thinking:_
-
-Only case 1 (`a >> b << c;` as a statement) segfaults. Cases 3-7 didn't crash (break and condition variants). Interesting — my predicted crash for `break a >> b << c;` didn't happen. Why? Let me look at the dumps for case 3 to see what happened. Maybe `break` uses a different rule (the open conditionBreakShiftExpression which uses `ctx->conditionBreakClosedAdditiveExpression()` missing → but that didn't crash?). Let me check the builder again:
-
-visitConditionBreakShiftExpression:
-```cpp
-if (ctx->conditionAdditiveExpression().size() == 0u) { return visit(ctx->conditionBreakAdditiveExpression()); }
-if (ctx->SHL().size() != 0u) {
-    auto operands = ctx->conditionClosedAdditiveExpression();
-    auto ops = ctx->SHL();
-    Expr* left = anyExpr(visit(ctx->conditionBreakClosedAdditiveExpression()));
-```
-For `break a >> b << c`: conditionBreakShiftExpression parse: first segment `conditionBreakAdditiveExpression shiftRight` (a >>), loop `conditionClosedAdditiveExpression SHL` (b <<), final conditionAdditiveExpression (c). conditionAdditiveExpression().size() = ? final c → 1, so not early return. SHL non-empty → left = visit(ctx->conditionBreakClosedAdditiveExpression()) → nullptr → should crash. But rc=0. Hmm, maybe break inside loop uses the *conditionBreak* rule differently, or maybe `ctx->conditionBreakClosedAdditiveExpression()` returns something? For `a >> b << c`, grammar alternatives: the first segment could parse as `conditionBreakClosedAdditiveExpression SHL`? No—first op is `>>` not `<<`.
-
-Wait, maybe the parse chose the loop differently: `(conditionBreakClosedAdditiveExpression SHL | conditionBreakAdditiveExpression shiftRight)` — for `a >> b << c`, first segment could be `conditionBreakAdditiveExpression(a) shiftRight(>>)`, loop `conditionClosedAdditiveExpression(b) SHL(<<)`, final `conditionAdditiveExpression(c)`. Then conditionBreakClosedAdditiveExpression absent. But rc=0. Let me check the actual dump/output for case 3. Also maybe the parse of `break a >> b << c` used the *first* alternative `conditionBreakAdditiveExpression` entirely? No, additive can't include shifts.
-
-Maybe ANTLR's `ctx->conditionBreakClosedAdditiveExpression()` returns nullptr and `visit(nullptr)` in ANTLR base visitor returns... `AbstractParseTreeVisitor::visit(ParseTree *tree)` does `tree->accept(this)` → null deref → crash. Should crash. Unless the C++ generated accessor `conditionBreakClosedAdditiveExpression()` doesn't return nullptr but... it does return nullptr if absent.
-
-Let me actually look at case3 output.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cd /tmp/opencode/ast-check/crash && for i in 1 2 3 4 5 6 7 8 9 13; do echo \"===== c$i\"; cat c$i.out; done 2>/dev/null | head -120"
-}
-```
-
-**Output:**
-```
-===== c1
-===== c2
-Fn f(a, b, c, d)
-  Type ()
-  Block
-    ExprStmt
-      Binary <<
-        Path a
-        Path b
-===== c3
-Fn f(a, b, c, d)
-  Type ()
-  Block
-    Tail
-      Loop
-        Block
-          ExprStmt
-            Break
-              Binary <<
-                Path b
-                Path a
-===== c4
-Fn f(a, b, c, d)
-  Type ()
-  Block
-    Tail
-      Loop
-        Block
-          ExprStmt
-            Break
-              Binary <<
-                Path a
-                Path b
-===== c5
-Fn f(a, b, c, d)
-  Type ()
-  Block
-    Tail
-      If
-        Binary <<
-          Path b
-          Path a
-        Block
-===== c6
-Fn f(a, b, c, d)
-  Type ()
-  Block
-    Tail
-      If
-        Binary <<
-          Path a
-          Path b
-        Block
-===== c7
-Fn f(a, b, c, d)
-  Type ()
-  Block
-    Tail
-      While
-        Binary <<
-          Path b
-          Path a
-        Block
-===== c8
-Fn f(a, b, c, d)
-  Type ()
-  Block
-    Let z
-      Binary <<
-        Path b
-        Path a
-===== c9
-Fn f(a, b, c, d)
-  Type ()
-  Block
-    Let z
-      Binary <<
-        Path a
-        Path b
-===== c13
-Fn f(a, b, c, d)
-  Type ()
-  Block
-    ExprStmt
-      Binary <
-        Binary <<
-          Path b
-          Path a
-        Path d
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 23.2s)
-
-_Thinking:_
-
-Interesting: case 3 (`break a >> b << c;`) produced `Binary << (Path b, Path a)` — reversed operands and no crash. So the break context used which visitor? `visitConditionBreakShiftExpression` SHL branch:
-- operands = conditionClosedAdditiveExpression = [b]
-- left = visit(conditionBreakClosedAdditiveExpression)... if that were nullptr, crash. But output is `b << a`: left = b, rhs = a. Where did rhs a come from? Let me re-read the code:
+**4. `expect` 补最小数组处理**（`rej-a-fixed-array-target-rejects-a-mismatched-element`）：
 
 ```cpp
-if (ctx->SHL().size() != 0u) {
-    auto operands = ctx->conditionClosedAdditiveExpression();
-    auto ops = ctx->SHL();
-    Expr* left = anyExpr(visit(ctx->conditionBreakClosedAdditiveExpression()));
-    for (int i = 0; i < ops.size() - 1; i++) { ... }
-    auto now = make<binaryExpr>();
-    now->op_ = ops[ops.size() - 1]->getText();
-    now->lhs_ = left;
-    now->rhs_ = anyExpr(visit(ctx->conditionAdditiveExpression(0)));
-    return now;
-}
-```
-For `b << a`: left=b, rhs=a=conditionAdditiveExpression(0). So conditionAdditiveExpression(0) = a?? That means the context lists differ from my assumption: maybe the parse is: conditionBreakClosedAdditiveExpression = a? No wait — left = b. Hmm: left = visit(conditionBreakClosedAdditiveExpression()). If that returned `b`, then closedAdditive list might be empty. Let me reconsider the parse for `break a >> b << c`:
-
-Grammar conditionBreakShiftExpression:
-```
-: conditionBreakAdditiveExpression
-| (conditionBreakClosedAdditiveExpression SHL | conditionBreakAdditiveExpression shiftRight)
-  (conditionClosedAdditiveExpression SHL | conditionAdditiveExpression shiftRight)* conditionAdditiveExpression
-```
-Hmm, maybe ANTLR parses it as: first segment `conditionBreakClosedAdditiveExpression SHL`?? But the first token sequence is `a >>`... no. Unless the `>>` is handled as `shiftRight` attached after `conditionBreakAdditiveExpression`, and then `<<` after `conditionClosedAdditiveExpression`, final `c`. Then:
-- conditionBreakClosedAdditiveExpression = absent
-- conditionBreakAdditiveExpression = [a?]
-- conditionClosedAdditiveExpression = [b]
-- conditionAdditiveExpression = [c]
-
-But output shows b << a with rhs = conditionAdditiveExpression(0) = a?! That means conditionAdditiveExpression contains [a]? Maybe the parse is different: first segment `conditionBreakAdditiveExpression shiftRight` = a >>; loop `(conditionAdditiveExpression shiftRight)`? no more `>>`... hmm.
-
-Actually maybe the loop matched `conditionAdditiveExpression shiftRight` for `a >>`?? The first segment alternative `conditionBreakAdditiveExpression shiftRight` is tried first. Hmm.
-
-I think I'm overanalyzing the exact context lists. The key finding stands: all mixed shifts are broken (wrong AST), and the statement open variant (`a >> b << c;`) additionally crashes with SIGSEGV because it calls `visit(nullptr)`. Specifically frame #0 was `visitStatementShiftExpression`.
-
-Let me confirm the crash mechanism by reading generated parser context class for statementShiftExpression to see accessor names. Actually gdb showed crash directly in visitStatementShiftExpression; from code, `visit(ctx->statementClosedAdditiveExpression())` — in the SHL branch. For `a >> b << c;` parse: first segment `statementAdditiveExpression shiftRight` (a >>) then loop `closedAdditiveExpression SHL` (b <<) then final additive (c). statementClosedAdditiveExpression absent → nullptr → `visit(nullptr)` → segfault. That's exactly case 1. For `a << b >> c;` case 2: statementClosedAdditiveExpression = a exists → no crash, wrong tree a<<b.
-
-Why didn't `break` crash despite analogous code? Perhaps because break's parse put a in `conditionBreakClosedAdditiveExpression`?? Output b<<a suggests left=visit(conditionBreakClosedAdditiveExpression)=b!? So conditionBreakClosedAdditiveExpression=b and conditionAdditiveExpression(0)=a? That would mean parse: first segment `conditionBreakClosedAdditiveExpression SHL` with conditionBreakClosedAdditiveExpression=b?? That doesn't match token order a>>b<<c. Unless ANTLR matched: first segment `conditionBreakAdditiveExpression(a) shiftRight(>>)`; loop `conditionClosedAdditiveExpression(b) SHL(<<)`; final conditionAdditiveExpression(c). Then `visit(conditionBreakClosedAdditiveExpression())` is nullptr → crash. But no crash and output b<<a. So maybe the *statement context* uses visitStatementShiftExpression for break too? No, case 3's Break child would go through conditionBreak rules per grammar.
-
-Hold on — maybe case 3 didn't use the grammar I think. `break` inside a block statement: the statement is `loop { ... }`? Wait the loop body contains `break a >> b << c;` as a statement — how is break parsed there? Inside a block, `statement: statementExpression SEMI`, and statementExpression includes `statementBreak*`? Hmm wait, there are separate statement rules for break? Actually looking at the grammar, statementExpression → statementAssignmentExpression → ... → statementPostfixExpression/primary, and `BREAK expression?` appears in nonBlockPrimary for ordinary expression contexts. The conditionBreak families are for break operands. But within a loop body block, `break ...;` is a statement expression — which family? From the gdb trace of case1, statementExpression → statementAssignmentExpression → statementLogicalOr → ... → statementShiftExpression. So statement context. For break inside block, `break a >> b << c;` — the `break` is parsed as part of statementPostfixExpression? The statement primary includes break with operand parsed by conditionBreak* rules perhaps (because inside loops, break's operand uses conditionBreak to prevent bare struct). So case 3 break operand: conditionBreakExpression → ... → conditionBreakShiftExpression. The crash would be in visitConditionBreakShiftExpression if it calls visit(nullptr). But it didn't crash and produced b<<a.
-
-Let me look at visitConditionBreakShiftExpression code again from the earlier sed output:
-
-```cpp
-std::any ASTVisitor::visitConditionBreakShiftExpression(...) {
-    if (ctx->conditionAdditiveExpression().size() == 0u) {
-        return anyExpr(visit(ctx->conditionBreakAdditiveExpression()));
+if (auto arr = dynamic_cast<arrayExpr*>(expr); arr) {
+    if (wish->kind_ == semType::kTypeKind::ARRAY) {
+        if (arr->args_.size() != wish->arrayLength_) {
+            error("array literal length mismatch"); return semantic::makeError();
+        }
+        for (auto* a : arr->args_) expect(a, wish->elem_);
+        return wish;
     }
-    if (ctx->SHL().size() != 0u) {
-        auto operands = ctx->conditionClosedAdditiveExpression();
-        auto ops = ctx->SHL();
-        Expr* left = anyExpr(visit(ctx->conditionBreakClosedAdditiveExpression()));
-        ...
-```
-
-Hmm wait, `visit(ctx->conditionBreakClosedAdditiveExpression())` — what does `conditionBreakClosedAdditiveExpression` mean here? The grammar rule is `conditionBreakClosedShiftExpression` / `conditionBreakClosedAdditiveExpression` is a rule? The grammar has conditionBreakClosedAdditiveExpression rule (line 460-ish). If the parse placed `a` there? No...
-
-Actually maybe I misread which accessor: maybe it's `ctx->conditionBreakClosedShiftExpression()` vs something. Let me not guess; instead, determine the actual parse tree for case 3 via --dump-tree, and read the exact builder code for the function that ran. But for the purposes of the report, the essential findings are:
-- Mixed shifts produce wrong ASTs (documented with cases).
-- `a >> b << c;` as a statement segfaults (crash).
-That's enough; the fix is to rewrite all 8 shift visitors to walk children in order (and handle optional contexts), which resolves both.
-
-But let me double-check whether other statement-family rules have similar `visit(optionalContext)` null crashes for mixed shifts, and whether the official test suite contains a statement `>> then <<` mixed shift that would crash. We ran all 236 official tests through dump and no real crashes (only the 13 throw-0 messages). So official tests don't hit it. Good.
-
-Let me also check `crash c1` stderr: empty (crash before printing). Confirm.
-
-Now, is there any other expression shape that crashes? Let me fuzz a bit: mixed shifts in all families with variants:
-- `a >> b << c << d` etc.
-- `a >> b >> c << d`
-- `a << b >> c >> d`
-Also mixed with additive: `a >> b + c << d`.
-Let me extend the crash generator with more mixed variants across statement/condition/break contexts to enumerate crashes precisely. Also `cast` + closed contexts.
-
-Let me run a broader battery: 20 mixed shift variants × 4 contexts, record rc and first line of output. This characterizes the crash surface.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cd /tmp/opencode/ast-check && cat > crash/gen2.sh <<'EOS'\n#!/bin/bash\nRXCC=\"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/target/build/rxcc\"\ndeclare -a exprs=(\n\"a >> b << c\"\n\"a << b >> c\"\n\"a >> b << c << d\"\n\"a >> b >> c << d\"\n\"a << b >> c >> d\"\n\"a >> b + c << d\"\n\"a << b + c >> d\"\n)\ndeclare -a ctxs=(\"EXPR\" \"COND\" \"BRK\" \"STMT\")\ni=0\nfor e in \"${exprs[@]}\"; do\n  for t in \"${ctxs[@]}\"; do\n    i=$((i+1))\n    case $t in\n      EXPR) body=\"let z = $e;\";;\n      COND) body=\"if $e > 0 { }\";;\n      BRK)  body=\"loop { break $e; }\";;\n      STMT) body=\"$e;\";;\n    esac\n    printf 'fn f(a: i32, b: i32, c: i32, d: i32) {\\n    %s\\n}\\n' \"$body\" > \"crash/g$i.rx\"\n    timeout 5 \"$RXCC\" --stage semantic --dump-ast \"crash/g$i.rx\" > \"crash/g$i.out\" 2> \"crash/g$i.err\"\n    rc=$?\n    echo \"rc=$rc [$t] $e\"\n  done\ndone\nEOS\nbash crash/gen2.sh 2>/dev/null; ulimit -c 0",
-  "timeout": 180000
 }
 ```
 
-**Output:**
-```
-rc=0 [EXPR] a >> b << c
-rc=0 [COND] a >> b << c
-rc=0 [BRK] a >> b << c
-rc=139 [STMT] a >> b << c
-rc=0 [EXPR] a << b >> c
-rc=0 [COND] a << b >> c
-rc=0 [BRK] a << b >> c
-rc=0 [STMT] a << b >> c
-rc=0 [EXPR] a >> b << c << d
-rc=0 [COND] a >> b << c << d
-rc=0 [BRK] a >> b << c << d
-rc=139 [STMT] a >> b << c << d
-rc=0 [EXPR] a >> b >> c << d
-rc=0 [COND] a >> b >> c << d
-rc=0 [BRK] a >> b >> c << d
-rc=139 [STMT] a >> b >> c << d
-rc=0 [EXPR] a << b >> c >> d
-rc=0 [COND] a << b >> c >> d
-rc=0 [BRK] a << b >> c >> d
-rc=0 [STMT] a << b >> c >> d
-rc=0 [EXPR] a >> b + c << d
-rc=0 [COND] a >> b + c << d
-rc=0 [BRK] a >> b + c << d
-rc=139 [STMT] a >> b + c << d
-rc=0 [EXPR] a << b + c >> d
-rc=0 [COND] a << b + c >> d
-rc=0 [BRK] a << b + c >> d
-rc=0 [STMT] a << b + c >> d
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 17.0s)
-
-_Thinking:_
-
-Pattern: STMT context crashes when the first shift is `>>` and a later `<<` exists (because `statementClosedAdditiveExpression` is null in the SHL branch) — 4/4 such cases crash. The condition/break/expr variants don't crash (they use other accessors that happen to be non-null) but all produce wrong trees.
-
-So findings:
-1. **All mixed `<<`/`>>` chains produce wrong ASTs** (operators lost/reordered/operands swapped). Examples:
-   - `a << b >> c` → `a << b` (drops `>> c`)
-   - `a >> b << c` → `b << a` (swapped!)
-   - `a << b >> c << a` → `(a << c) << b`
-2. **Statement context `a >> b << c;` (first shift `>>`, later `<<`) segfaults** (null `statementClosedAdditiveExpression` passed to visit) — only statement-open family; 4 variants confirmed.
-
-Both caused by the 8 hand-written shift visitors. Fix: walk `ctx->children` in order and fold left-assoc (or merge operand/op lists by token index), instead of the two-accessor-list split.
-
-Now let me also check for any other latent crash of the same `visit(ctx->optionalContext())` pattern in the builder. Let me grep for `visit(ctx->` calls followed by `anyExpr(` where the context accessor might return nullptr (accessors for optional single elements). Hard to grep reliably. Let me look at functions that call `visit(ctx->xxx())` inside branches where that child may be absent. The crash pattern: builder assumes some grammar alternative based on other lists' sizes.
-
-Candidates: all 8 shift functions (done), plus maybe:
-- visitConditionBreakBitOrExpression/Xor/And (the `conditionBreakX ...` chain variants with initial operand) — they check `ctx->conditionAdditiveExpression().size() == 0` etc. and use `conditionBreak...` fallback. Our differential test covered `a & b | c ^ d` in all contexts including break — no mismatch, so those are fine at least for simple chains. But mixed bit ops with the initial-break rule could have similar issue: e.g., `break a | b ^ c`? The differential test included `a & b | c ^ d` in brk context and matched. OK.
-- statementBitOr/Xor/And: `statementBitOrExpression: statementBitXorExpression PIPE (bitXorExpression PIPE)* closedBitXorExpression | ...`; differential test passed.
-- closed variants of bitOr/Xor/And: reached in `<` left contexts; differential closed tests? Case 13 `(a >> b << c) < d;` worked (via parens, likely open chain). Hard to reach closed bit ops without casts. Not worth chasing; the same pattern could exist but no evidence.
-
-Also potential null-visit in `visitBlockExpression`'s `visit(stmt->expressionWithBlock())` — checked non-null before.
-
-`visitStatement`? Let me read visitStatement to ensure no null deref. Lines 615-640. Let me read.
-
-Also the `visitItem` / `visitCrate` for use declarations. Let me read visitCrate and visitItem quickly.
-
-Then wrap up: I have enough for the report. But let me also check one more class: **constValue paths with parens** `((true))` → works. **`-(1)`** works.
-
-Also the `refExpr::num_` dead field: value-initialized to 0 by make_unique, so not UB. But note the dump prints `n=0` always. Also `ast.h` modified in git status — maybe the user added defaults? Let me check current ast.h around refExpr. Earlier grep showed `bool isMut_; int num_; Expr* operand_;` no defaults. Fine — value-init covers it.
-
-Let me read visitStatement/visitCrate/visitItem to complete the review of dispatch logic.
-
-**Tool: read**
-
-**Input:**
-```json
-{
-  "filePath": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/frontend/ast_builder.cpp",
-  "limit": 45,
-  "offset": 1
-}
-```
-
-**Output:**
-```
-<path>/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/frontend/ast_builder.cpp</path>
-<type>file</type>
-<content>
-1: #include "ast_builder.h"
-2: 
-3: std::any ASTVisitor::visitCrate(RxParser::CrateContext *ctx) {
-4:     auto now = make<Crate>();
-5:     auto items = ctx->item();
-6:     for (auto dw : items) {
-7:         now->items_.push_back(anyItem(visit(dw)));
-8:     }
-9:     return static_cast<Crate*>(now);
-10: }
-11: 
-12: std::any ASTVisitor::visitItem(RxParser::ItemContext *ctx) {
-13:     auto func = ctx->functionDefinition();
-14:     auto stru = ctx->structDefinition();
-15:     auto cons = ctx->constantItem();
-16:     auto impl = ctx->inherentImpl();
-17:     if (func) {
-18:         return visit(func);
-19:     }
-20:     if (stru) {
-21:         return visit(stru);
-22:     }
-23:     if (cons) {
-24:         return visit(cons);
-25:     }
-26:     if (impl) {
-27:         return visit(impl);
-28:     }
-29:     return static_cast<Item*>(nullptr);
-30: }
-31: 
-32: std::any ASTVisitor::visitUseDeclaration(RxParser::UseDeclarationContext *ctx) {
-33:     // Do nothing, use is discarded.
-34:     throw "visitUseDeclaration";
-35:     return visitChildren(ctx);
-36: }
-37: 
-38: std::any ASTVisitor::visitUseTree(RxParser::UseTreeContext *ctx) {
-39:     // Do nothing, use is discarded.
-40:     throw "visitUseTree";
-41:     return visitChildren(ctx);
-42: }
-43: 
-44: std::any ASTVisitor::visitUsePath(RxParser::UsePathContext *ctx) {
-45:     // Do nothing, use is discarded.
-
-(Showing lines 1-45 of 2964. Use offset=46 to continue.)
-</content>
-```
-
-**Tool: read**
-
-**Input:**
-```json
-{
-  "filePath": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/frontend/ast_builder.cpp",
-  "limit": 30,
-  "offset": 615
-}
-```
-
-**Output:**
-```
-<path>/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/frontend/ast_builder.cpp</path>
-<type>file</type>
-<content>
-615: std::any ASTVisitor::visitStatement(RxParser::StatementContext *ctx) {
-616:     if (ctx->letStatement()) {
-617:         return anyStmt(visit(ctx->letStatement()));
-618:     }
-619:     if (ctx->expressionWithBlock()) {
-620:         auto now = make<exprStmt>();
-621:         now->expr_ = anyExpr(visit(ctx->expressionWithBlock()));
-622:         return static_cast<Stmt*>(now);
-623:     }
-624:     if (ctx->statementExpression()) {
-625:         auto now = make<exprStmt>();
-626:         now->expr_ = anyExpr(visit(ctx->statementExpression()));
-627:         return static_cast<Stmt*>(now);
-628:     }
-629:     return static_cast<Stmt*>(nullptr);
-630: }
-631: /*
-632: statement
-633:     : SEMI
-634:     | letStatement
-635:     | expressionWithBlock SEMI?
-636:     | statementExpression SEMI
-637:     ;
-638: */
-639: 
-640: std::any ASTVisitor::visitExpressionWithBlock(RxParser::ExpressionWithBlockContext *ctx) {
-641:     if (ctx->LOOP()) {
-642:         auto now = make<loopExpr>();
-643:         now->block_ = static_cast<blockExpr*>(anyExpr(visit(ctx->blockExpression())));
-644:         return static_cast<Expr*>(now);
-
-(Showing lines 615-644 of 2964. Use offset=645 to continue.)
-</content>
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 24.2s)
-
-_Thinking:_
-
-`visitItem` handles use declarations by falling through: `useDeclaration` is one of item alternatives; since func/stru/cons/impl are all null, returns nullptr Item*. But then `visitCrate` does `now->items_.push_back(anyItem(visit(dw)))` — pushing a null Item* into items_. `anyItem` = any_cast<Item*>(any) — the visit returns `static_cast<Item*>(nullptr)` as std::any; anyItem gives nullptr; push_back(nullptr). So the crate's items_ contains nullptr entries for use declarations!
-
-Then downstream: dumpCrate iterates `for (auto* it : c->items_) dumpItem(it, 0);` — dumpItem checks `if (!it) return;` so fine. Collect: `for (Item* item : all) { registerFuncAndConst(item, ...); if (auto stru = dynamic_cast<structItem*>(item); stru) ... }` — dynamic_cast on nullptr is fine (returns nullptr). So nulls are harmless but they do pollute items_. Is this a design issue? For `use rx::core::*;` the AST contains a null item. Semantically harmless (they skip it), but it's a smell; and any *future* code iterating items_ must null-check. Also `visitItem` returning nullptr instead of skipping means items_.size() counts use lines. Worth flagging as minor: either skip nulls in visitCrate or return a dedicated node. Also `visitItem` return nullptr could be problematic if something does `anyItem` and derefs. Not currently.
-
-Also `visitStatement` returning nullptr for empty `;` → visitBlockExpression pushes it into stmts_? Let's see: visitBlockExpression loops statements; for non-last statements it pushes `anyStmt(visit(stmt))` which may be nullptr. So `stmts_` can contain null Stmt* for empty `;`. dumpBlock: `for (auto* s : b->stmts_) if (s) dumpStmt(s, d);` — handles null. Collect doesn't touch stmts. check phase later must null-check! This is a latent trap. E.g., `fn f() { ; let x = 1; }` → stmts_ = [nullptr, letStmt]. Any checker loop `for (Stmt* s : stmts_) checkStmt(s);` without null check → crash. Worth flagging.
-
-Let me empirically confirm nulls in stmts_ / items_: `fn f() { ; }` dump showed? In 07 the `;` produced no node (correct if null skipped). But the vector likely contains nullptr. I could verify via a tiny C++ test? Not easily. But from code: visitBlockExpression pushes anyStmt(visit(stmt)) for non-last statements; visitStatement returns NULL for SEMI → push_back(nullptr). Yes, confirmed by code. Same for use in items_.
-
-Note: for the last statement, if it's `;` (SEMI), the else branch pushes visit(stmt) = nullptr. Fine.
-
-So report item: AST vectors can contain nullptr entries (use declarations in items_, empty `;` statements in block stmts_). Harmless for dump (checks null), but semantic stage must null-check (or better, skip at build time). This is a real trap for the check phase.
-
-Hmm wait — for items_: `visitCrate` pushes anyItem(visit(dw)) for every item; `use` → visitItem returns nullptr → items_ has nullptr. Let me verify with a quick program that has `use` and check dump? Dump skips nulls, can't see. But code is clear.
-
-Now let me also verify the `visitItem` for use: the grammar `item: useDeclaration | functionDefinition | ...`; yes.
-
-Are there other visit functions returning nullptr on valid syntax? `visitStatement` SEMI. `visitItem` use. `visitBlockExpression` doesn't push null for the last statement... it pushes anyStmt for non-last; for last non-tail it pushes too. Fine.
-
-What about `visitAssociatedItem` returning nullptr for neither fn nor const? grammar ensures one of them.
-
-OK. Let me also double check the `visitStructDefinition` field type when field type is missing? grammar requires. Fine.
-
-Now, let me consider the **known shift bug fix requirements** for the report and the **verification conclusion**:
-- AST for all ordinary constructs (operators except mixed shifts, types, items, statements, control flow, paths, const values, lifetimes/use discarded, statement boundaries) is correct — verified via 33 handcrafted cases + full official suite dump (0 unknown nodes, 0 real crashes) + differential test across 4 grammar families (37 expressions; only shifts differ/crash).
-- Bugs found:
-  1. Mixed `<<`/`>>` chains: wrong AST in all 8 shift visitors (examples).
-  2. Statement open shift `a >> ... << ...;` segfault (visit(nullptr)).
-  3. Minor/latent: null entries in `Crate::items_` for use declarations and in `blockExpr::stmts_` for empty `;` statements — semantic/check code must null-check or builder should skip.
-  4. Minor: `refExpr::num_` never assigned (always 0 due to value-init; dump prints meaningless `n=0`); either set it (1/2) or remove.
-  5. Minor: `Param.isMut_` for `&mut self` is true (the `mut` belongs to the reference type, not the binding); dump prints "mut self" for both `mut self` and `&mut self`. Semantically the type is correct; check-phase code shouldn't use Param.isMut_ to distinguish. (Actually this might be considered a bug: for `&mut self`, binding is not mut. But AST-wise, isMut_ conflates; when the checker handles receivers, it should rely on type_ (REF isMut) for reference receivers. Note it.)
-
-Wait, is #5 actually a bug worth reporting? Let me think about what `Param.isMut_` should mean: `fn f(mut x: i32)` → binding x is mutable → isMut_=true. `fn set(&mut self, ...)` → `self` is a shared... no, `self: &mut Self` binding is NOT mut (you can't reassign `self`), but you can write through it. Rust: `&mut self` does not allow assigning to `self` itself. So Param.isMut_=true for `&mut self` is semantically wrong if interpreted as binding mutability; for `mut self` it's right. Does anything depend on it? The future checker for assignment to `self` would wrongly allow `self = ...`? Actually for by-reference receivers, `self` as a place... assignment `self = S{}` where self: &mut Self — rebinding self isn't allowed in Rust unless `mut self`? Hmm, in Rust `fn f(&mut self) { self = ...; }`? Actually you can assign to `*self` but not `self` (binding is immutable). Tests likely don't cover. It's a latent semantic bug. Worth a minor note.
-
-Now, should I check the `--dump-tree` for case1 to explain the crash? Not necessary.
-
-I have completed the verification task. Let me finalize todos and write the report. The report should include:
-1. Method: corpus 33 files in /tmp/opencode/ast-check + full official suite dump + differential test.
-2. What's verified correct (broad list).
-3. Bugs found with minimal repros:
-   - mixed shifts wrong (all 8 visitors), examples table.
-   - statement `a >> b << c;` segfault (visit(nullptr)); note same null-context risk pattern.
-   - null entries in items_/stmts_ (latent trap for check phase).
-   - minor: refExpr::num_, Param.isMut_ for &mut self.
-4. Suggested fix direction for shifts (walk children in order), without writing code (course rules: they write it). Maybe sketch briefly.
-5. Note the earlier "internal error" messages were just main.cpp's throw 0 hack.
-
-Should I mention exactly which files/lines? The shift functions at lines 914, 952, 1380, 1418, 1858, 1901, 2352, 2395. And `visitStatementShiftExpression` crash. Provide repro files in /tmp/opencode/ast-check.
-
-Also I should double check whether "statement `a >> b << c;` crashes" would affect official tests — no; but it's a real bug. Note that the checks I ran: official suite dump had 0 real crashes (the 13 internal errors were the collect/throw-0 path; wait, why did those 13 negative tests print "internal error"? Because main.cpp `throw 0` → catch(...) prints "internal error". Yes.)
-
-Actually hold on: when did the 13 tests error? Those are collect-detected negatives (duplicate names etc.) that the user implemented. The dump still worked. Fine.
-
-Wait, one more: the full-suite run had 13 "INTERNAL" including `rej-a-reference-is-not-a-struct-impl-target.rx`, `rej-impl-target-must-be-a-user-struct.rx`, `rej-no-array-inherent-impl.rx`, `rej-no-container-inherent-impl.rx` — the user's collect reports impl target non-struct. Yes.
-
-Let me update the todo list and produce the final report. Keep it structured but not overly long. Include commands/paths.
-
-Actually, before finalizing, let me double-check the shift crash on official test suite doesn't exist by grepping official tests for mixed shifts: earlier grep for `>>` and `<<` in shifts suite showed only single shifts. Let me quickly grep all official semantic tests for lines containing both `<<` and `>>` in one expression... Actually `a << b >> c` might appear in comprehensive tests. Let me grep for regex `<<[^;]*>>` and `>>[^;]*<<` in tests.
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic\"; grep -rnE \"<<[^;]*>>|>>[^;]*<<\" . --include=*.rx | head -20; echo \"--- mixed-shift hits above (if any)\""
-}
-```
-
-**Output:**
-```
-./loop-state-merges/acc-rotations-swaps-and-multiple-loop-edges.rx:57:        h = (h << 5u32) | (h >> 27u32);
---- mixed-shift hits above (if any)
-
-```
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "cd /tmp/opencode/ast-check && grep -c \"Expr?\\|Stmt?\\|Item?\" official/*.ast 2>/dev/null | grep -v \":0\" | head; echo \"--- unknown nodes: none if empty\"; ls official/*.ast | wc -l; ls /mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/tests/official/semantic -name '*.rx' | wc -l"
-}
-```
-
-**Output:**
-```
---- unknown nodes: none if empty
-236
-0
-ls: invalid option -- 'e'
-Try 'ls --help' for more information.
-
-```
-
----
-
-## Assistant (Build · DeepSeek V4.1 Flash · 16.8s)
-
-_Thinking:_
-
-One official test has both `<<` and `>>` on the same line: `h = (h << 5u32) | (h >> 27u32);` — but they're parenthesized separately and combined with `|`, so each is a single shift within its own parens; no mixed chain. Not affected.
-
-The second command had issues (the grep -c with multiple files prints filenames; the `ls` failed because of `-name`? no, the second ls used path with `-name` incorrectly? Actually `ls path -name '*.rx'` is wrong usage. Let me count properly: 236 ast files; official semantic .rx count. Let me count via find. Not critical; the first run already said "ran 236". And unknown nodes 0.
-
-Now finalize. Let me also verify the two null-vector claims by a small experiment? I can't inspect items_/stmts_ without code modification. But code reading is definitive:
-- visitCrate: push_back(anyItem(visit(dw))) — visitItem returns nullptr for use.
-- visitBlockExpression: push anyStmt(visit(stmt)) for non-last; visitStatement returns nullptr for SEMI.
-
-I'll report these as latent.
-
-Let me also confirm the crash case in the actual test corpus path: `case2.rx` in diff was the crash (a >> b << c;). 
-
-One more check: is there a similar null crash when statement starts with `>>` and later `<<` for the **closed statement** variant (e.g., `(a >> b << c) < d;` was case 13 → worked, no crash). Fine.
-
-Update todos: all completed. Write report.
-
-Report structure (Chinese):
-
-验证方法 (3层):
-1. 手写 33 个覆盖语法的用例 + dump 人工核对（覆盖 items/types/exprs/stmts/control/paths/const/lifetime/statement-boundary/四套 family）
-2. 官方 semantic 全量 236 个 dump：0 unknown node（Expr?/Stmt?/Item?），0 真崩溃；13 条 "internal error" 只是 main.cpp 的 throw 0 hack 打出来的
-3. 差分测试：37 个表达式 × 4 个语法家族（expression/condition/break/statement），同一表达式四个上下文产生的 AST 应一致 → 除 shift 外全部一致
-
-结论：绝大多数 AST 正确（列出验证过的点），发现 2 个真 bug + 2 个小问题：
-
-**Bug 1（严重）: 混合 << >> 全错** — 8 个 visitor (lines)。表格例子。
-**Bug 2（严重）: statement 上下文 `a >> b << c;` 段错误** — visit(nullptr)；gdb 栈帧 #0 visitStatementShiftExpression。4 个变体全崩（首个 shift 是 >> 且后面有 <<）。
-  - 与 Bug 1 同一个根因：把交替的 SHL/shiftRight 用两组分离的 accessor 列表处理，并假设某个 child 一定存在。
-  - 修法提示：按 ctx->children 顺序折叠（operand/op 交替），op 文本从 SHL/(shiftRight->getText()) 取；或按 token index 合并。
-**小问题 1**: items_/stmts_ 里有 nullptr（use、空 `;`）——dump 跳过了，但 check 阶段必须 null-check 或 builder 里 skip。
-**小问题 2**: refExpr::num_ 从不赋值（value-init=0，dump 的 n=0 是死的）；要么删要么在 && 时设 2。
-**小问题 3**: Param.isMut_ 在 `&mut self` 时为 true（mut 其实属于引用类型）；`mut self` 与 `&mut self` dump 无法区分，检查器别用 isMut_ 判断 receiver 可变性。
-
-Also mention: `a as u32 < b` is a grammar-level syntax error (by design), need parens — not a bug.
-
-Files: /tmp/opencode/ast-check/ (corpus, official dumps, diff_test.py, crash/).
-
-I should keep the answer readable, with code refs file:line. Let me write it.
-
-**Tool: todowrite**
-
-**Input:**
-```json
-{
-  "todos": [
-    {
-      "content": "盘点 ast_builder.cpp 里剩余的 throw stub 与可疑 visit 实现",
-      "priority": "high",
-      "status": "completed"
-    },
-    {
-      "content": "在 /tmp/opencode/ast-check 构造覆盖全部语法的 .rx 语料",
-      "priority": "high",
-      "status": "completed"
-    },
-    {
-      "content": "跑 --dump-ast 全量抓输出并做结构不变量检查",
-      "priority": "high",
-      "status": "completed"
-    },
-    {
-      "content": "逐例人工核对关键 AST（优先级、结合性、语句边界、类型、常量、路径）",
-      "priority": "high",
-      "status": "completed"
-    },
-    {
-      "content": "报告确认结论/发现的 bug",
-      "priority": "medium",
-      "status": "completed"
-    }
-  ]
-}
-```
-
-**Output:**
-```
-[
-  {
-    "content": "盘点 ast_builder.cpp 里剩余的 throw stub 与可疑 visit 实现",
-    "status": "completed",
-    "priority": "high"
-  },
-  {
-    "content": "在 /tmp/opencode/ast-check 构造覆盖全部语法的 .rx 语料",
-    "status": "completed",
-    "priority": "high"
-  },
-  {
-    "content": "跑 --dump-ast 全量抓输出并做结构不变量检查",
-    "status": "completed",
-    "priority": "high"
-  },
-  {
-    "content": "逐例人工核对关键 AST（优先级、结合性、语句边界、类型、常量、路径）",
-    "status": "completed",
-    "priority": "high"
-  },
-  {
-    "content": "报告确认结论/发现的 bug",
-    "status": "completed",
-    "priority": "medium"
+放在 `expect` 的 fallback 之前。完整数组 infer（LUB 元素）留给 Phase 5。
+
+**5. 非末尾无分号 block 语句必须 unit**（`rej-a-non-final-block-statement...`）——这个要动 AST：
+
+- `ast.h` 的 `exprStmt` 加 `bool hasSemi_ = true;`
+- `ast_builder.cpp` 的 `visitStatement` 里：
+  ```cpp
+  if (ctx->expressionWithBlock()) {
+      ...
+      now->hasSemi_ = (ctx->SEMI() != nullptr);
   }
-]
+  // statementExpression 那支恒 true
+  ```
+- `checkStatement` 的 exprStmt 分支：
+  ```cpp
+  semType* t = infer(expr->expr_);
+  if (!expr->hasSemi_ && !matches(t, semantic::makeUnit())) {
+      error("non-final block statement without semicolon must be unit");
+  }
+  return t;
+  ```
+
+**6. `runtime-value-merges/acc-...` 先不用管**——它用到 `&mut` 的 if LUB、struct/数组/Box/Vec 方法，等 Phase 4/5 会自然覆盖。
+
+改完这 5 处，这五个 suite 应该只剩 `runtime-value-merges` 那个 acc（20/21），Phase 3 收尾后进 Phase 4。
+
+---
+
+## User
+
+我改了，你看看。
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 21.2s)
+
+_Thinking:_
+
+The user says they made the changes. I need to review the current state: check the 5 fixes, build, run the Phase 3 suites. Let me read the relevant code and run tests.
+
+Let me check:
+- continue branch with loops_/jumpBarrier_
+- while branch barrier
+- deref/cast ERROR guards
+- expect array
+- AST hasSemi_ + builder + checkStatement
+Then build and run Phase 3 suites.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && grep -n \"jumpBarrier_\\|hasSemi_\" compiler/src/semantic/checker.cpp compiler/src/semantic/checker.h compiler/src/ast/ast.h compiler/src/frontend/ast_builder.cpp | head -20; echo ===; sed -n '/if (auto con = dynamic_cast<continueExpr/,/^    }/p; /if (auto whi = dynamic_cast<whileExpr/,/^    }/p' compiler/src/semantic/checker.cpp; echo ===; cmake --build target/build -j 2>&1 | grep -E \"error|warning|Built target\" | head -5",
+  "timeout": 180000
+}
+```
+
+**Output:**
+```
+compiler/src/semantic/checker.cpp:1095:        if (!expr->hasSemi_ && !matches(type, semantic::makeUnit())) {
+compiler/src/ast/ast.h:167:    bool hasSemi_ = true;
+compiler/src/frontend/ast_builder.cpp:621:        now->hasSemi_ = (ctx->SEMI() != nullptr);
+===
+    if (auto whi = dynamic_cast<whileExpr*>(expr); whi) {
+        bool mem = inWhileCond_;
+        inWhileCond_ = true;
+        expect(whi->cond_, semantic::makeBuiltin("bool"));
+        inWhileCond_ = mem;
+        loops_.push_back(loopInfo{semantic::makeUnit(), {}});
+        checkBlock(whi->block_, semantic::makeUnit());
+        loops_.pop_back();
+        return semantic::makeUnit();
+    }
+    if (auto con = dynamic_cast<continueExpr*>(expr); con) {
+        if (loops_.empty()) {
+            error("continue outside a loop");
+            return semantic::makeError();
+        }
+        if (inWhileCond_) {
+            error("attempted to continue outer loop in a while's condition");
+            return semantic::makeError();
+        }
+        return semantic::makeNever();
+    }
+===
+[100%] Built target rxcc
+
 ```
 
 ---
 
-## Assistant (Build · DeepSeek V4.1 Flash · 16.7s)
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 35.7s)
 
 _Thinking:_
 
-Now write the final report. Be concise but complete, with repro commands. The user asked to confirm correctness or find errors. I found real bugs. Format nicely.
+Build passes. Let me check the other fixes:
+- break branch should also check inWhileCond_.
+- deref/cast ERROR guards.
+- expect array.
+- checkStatement hasSemi_ logic (line 1095).
+Then run suites.
 
-我用三层方式验证完了（全部操作在 `/tmp/opencode/ast-check/`，仓库未动）：
+Let me grep those.
 
-1. **33 个手写用例**覆盖 items/types/表达式/语句/控制流/路径/常量/lifetime/语句边界，逐个人工核对 dump；
-2. **官方 semantic 全量 236 个用例** dump：`Expr?/Stmt?/Item?` 未知节点 0 个；那 13 条 `internal error` 只是 `main.cpp` 的 `throw 0` hack 打的，不是 AST 崩溃；
-3. **差分测试**（`diff_test.py`）：37 个表达式 × 4 个语法家族（expression/condition/break/statement）——同一个表达式在四个上下文里必须得到相同的 AST，除 shift 外全部一致。
+**Tool: bash**
 
-**验证正确的部分**（举主要的）：二元运算优先级/左结合、cast 链、一元/借用/解引用、`&&x`/`&&mut x` 两层 Ref、所有类型形式（`&mut Vec<Box<i32>>`、`[[u32;2];3]`、`&&mut i32`、`(i32)` 透明、数组长度）、struct/impl/关联常量/方法/`Self::`、`Box/Vec` turbofish 路径、const 的 INT/PATH/NEG/BOOL、生命周期/where/use 丢弃、语句边界（`if {} else {} -1;` 拆两句）、块尾规则。另外 `a as u32 < b` 报语法错误是**文法故意设计的**（裸 cast 类型后不能接 `<`，要写括号或带泛型的 closedCastType），不是 bug。
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && sed -n '/if (auto bre = dynamic_cast<breakExpr/,/^    }/p' compiler/src/semantic/checker.cpp; echo ===; sed -n '/if (auto der = dynamic_cast<derefExpr/,/^    }/p; /if (auto cast = dynamic_cast<castExpr/,/^    }/p' compiler/src/semantic/checker.cpp; echo ===; sed -n '/if (auto arr = dynamic_cast<arrayExpr/,/^    }/p' compiler/src/semantic/checker.cpp; echo ===; sed -n '1085,1105p' compiler/src/semantic/checker.cpp; echo ===; make test FILTER=official:semantic:expected-types,official:semantic:blocks-if-and-never,official:semantic:loops-and-jumps,official:semantic:loop-state-merges,official:semantic:runtime-value-merges STAGE=semantic 2>&1 | grep -E \"^\\s*[0-9]+\\)|passed|failed\" | head -10",
+  "timeout": 300000
+}
+```
 
-**Bug 1（严重）：混合 `<<`/`>>` 全部算错**，涉及 8 个 visitor：
-`visitShiftExpression:914`、`visitClosedShiftExpression:952`、`visitConditionShiftExpression:1380`、`visitConditionClosedShiftExpression:1418`、`visitConditionBreakShiftExpression:1858`、`visitConditionBreakClosedShiftExpression:1901`、`visitStatementShiftExpression:2352`、`visitStatementClosedShiftExpression:2395`。
+**Output:**
+```
+    if (auto bre = dynamic_cast<breakExpr*>(expr); bre) {
+        if (loops_.empty()) {
+            error("break outside loop");
+            return semantic::makeError();
+        }
+        if (inWhileCond_) {
+            error("attempted to break outer loop in a while's condition");
+            return semantic::makeError();
+        }
+        loopInfo &top = loops_.back();
+        if (!bre->tail_ && top.expected_ && !matches(semantic::makeUnit(), top.expected_)) {
+            error("break without a value in a loop which expects one");
+        }
+        semType* type = (bre->tail_ ? (top.expected_ != nullptr ? expect(bre->tail_, top.expected_) : infer(bre->tail_)) : semantic::makeUnit());
+        top.breaks_.push_back(type);
+        return semantic::makeNever();
+    }
+===
+    if (auto cast = dynamic_cast<castExpr*>(expr); cast) {
+        semType* ltype = infer(cast->from_);
+        semType* rtype = transformType(cast->to_);
+        if (ltype->kind_ == semType::kTypeKind::ERROR) {
+            return rtype;
+        }
+        if ((!isIntegerType(ltype) && !isBoolType(ltype)) || 
+             !isIntegerType(rtype)){
+            error("castExpr lhs is neither int nor bool");
+            return semantic::makeError();
+        }
+        return rtype;
+    }
+    if (auto der = dynamic_cast<derefExpr*>(expr); der) {
+        semType* t = infer(der->operand_);
+        if (t->kind_ == semType::kTypeKind::ERROR) {
+            return semantic::makeError();
+        }
+        if (t->kind_ == semType::kTypeKind::REF) {
+            return t->elem_;
+        }
+        else {
+            error("attempted to deref a non-reference type");
+            return semantic::makeError();
+        }
+    }
+===
+    if (auto arr = dynamic_cast<arrayExpr*>(expr); arr) {
+        if (wish->kind_ == semType::kTypeKind::ARRAY) {
+            if (arr->args_.size() != wish->arrayLength_) {
+                error("array literal length mismatch");
+                return semantic::makeError();
+            }
+            for (auto arg : arr->args_) {
+                expect(arg, wish->elem_);
+            }
+            return wish;
+        }
+    }
+===
 
-| 源码 | dump 出来 |
+semType* Checker::checkStatement(Stmt* stmt) {
+    if (auto let = dynamic_cast<letStmt*>(stmt); let) {
+        semType* curType = let->type_ ? transformType(let->type_) : nullptr;
+        semType* init = expect(let->init_, curType);
+        scope_.push(let->name_, localShadowing(init, let->isMut_));
+        return isNever(init) ? init : semantic::makeUnit();
+    }
+    if (auto expr = dynamic_cast<exprStmt*>(stmt); expr) {
+        semType* type = infer(expr->expr_);
+        if (!expr->hasSemi_ && !matches(type, semantic::makeUnit())) {
+            error("non-tail block statement without semicolon attempted to be non-unit");
+            return semantic::makeError();
+        }
+        return type;
+    }
+    return semantic::makeUnit();
+}
+
+void Checker::error(std::string message) {
+    std::cerr << "error occurred!\n" << message << std::endl;
+===
+. passed  F failed
+1) official:semantic:loops-and-jumps/acc-continue-rechecks-the-condition-and-inner-breaks-leave-only-the-inner-loop.rx@semantic
+2) official:semantic:runtime-value-merges/acc-input-dependent-reference-aggregate-and-owner-results.rx@semantic
+======================== 2 failed, 19 passed in 22.49s =========================
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 19.3s)
+
+_Thinking:_
+
+Now 19 passed / 2 failed:
+1. `loops-and-jumps/acc-continue-rechecks-the-condition-and-inner-breaks-leave-only-the-inner-loop.rx` — a positive test now fails. Let me check why. It likely contains a `break` with value inside an inner loop nested in an outer loop, or a `while` condition with a break/continue that targets... Let me look at the source and the actual error.
+2. `runtime-value-merges/acc-...` — expected, Phase 4/5.
+
+Let me check failure #1. Cat the file and run rxcc to see stderr.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && cat tests/official/semantic/loops-and-jumps/acc-continue-rechecks-the-condition-and-inner-breaks-leave-only-the-inner-loop.rx; echo ===; ./target/build/rxcc --stage semantic tests/official/semantic/loops-and-jumps/acc-continue-rechecks-the-condition-and-inner-breaks-leave-only-the-inner-loop.rx 2>&1 | head"
+}
+```
+
+**Output:**
+```
+use rx::core::*;
+
+fn main() {
+    let mut i = 0;
+    let mut sum = 0;
+    while {
+        i += 1;
+        i <= 5
+    } {
+        if i == 2 {
+            continue;
+        }
+        let mut j = 0;
+        loop {
+            j += 1;
+            if j == 3 {
+                break;
+            }
+            sum += i * j;
+        }
+    }
+    let v: i32 = loop {
+        loop {
+            break;
+        }
+        break sum;
+    };
+    println_i32(i);
+    println_i32(v);
+    while loop {
+        break false;
+    } {
+        println_i32(999);
+    }
+}
+===
+error occurred!
+attempted to break outer loop in a while's condition
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 21.7s)
+
+_Thinking:_
+
+The issue: `while loop { break false; } { ... }` — a `loop` **inside the while condition**. The `break false` targets the inner `loop` (which is inside the condition), not an outer loop. Our barrier `inWhileCond_` blocks all breaks/continues in the condition, including those targeting a loop that is itself *inside* the condition. Per spec/test: "a condition cannot jump to an outer loop" — it cannot target outer loops, but a loop syntactically inside the condition is fine: `while loop { break false; } { }` is valid (the break targets the inner loop defined in the condition).
+
+So the barrier must only block jumps that would target loops **outside the condition**, not loops created within the condition. Implementation: the barrier should be a marker in the loop stack, not a global bool. When entering a while condition, push a **barrier loopInfo** (special kind) onto `loops_`. Then:
+- A break/continue targeting a loop created inside the condition pushes its own context above the barrier; when the inner loop finishes, its context pops.
+- A break/continue that would reach the barrier means it's trying to target an outer loop → error.
+- After the condition, pop the barrier.
+
+How to represent the barrier? Options:
+- Add a `bool barrier_` field to `loopInfo` (or use `expected_ == nullptr && breaks_ empty` plus a marker). Cleaner: add `bool isBarrier_ = false;`.
+- In break/continue: `if (loops_.empty()) error outside loop;` else `if (loops_.back().isBarrier_) error "cannot jump to outer loop in condition"`. Because `loops_.back()` is the innermost enclosing loop; if it's the barrier, jumping would target outside the condition. If a real loop is inside the condition, its context is above the barrier, so break targets it (allowed). When the inner loop is done, pop; the break in a subsequent expression in the same condition would see barrier → error.
+- For `while continue {}`: condition checked with barrier on stack → continue sees barrier → error. Good.
+- For `loop { while continue {} }`: outer loop context below; barrier above; continue sees barrier → error. Good.
+- For `while loop { break false; } { }`: while condition pushes barrier; then checking condition expression `loop {...}` → checkLoop pushes inner loopInfo above barrier; `break false` sees inner loop (not barrier) → allowed; inner loop computes type bool; condition end pops inner; pop barrier; body check. Valid → test passes.
+- Also `continue` inside an inner loop within the condition → targets inner loop → allowed. Reasonable.
+
+So replace `bool inWhileCond_` with a barrier entry in loops_.
+
+Implementation:
+- symbol.h loopInfo: add `bool barrier_ = false;` (member default). Or reuse existing fields: could push `loopInfo{nullptr, {}}` and treat empty expected as barrier? But `loop` with no expected also has expected nullptr (as `infer(loop)`), and a `break` inside that loop is legit. So need explicit flag.
+- In checker.h remove `bool inWhileCond_ = false;` (if exists) and use loops_.
+- while branch:
+```cpp
+loops_.push_back(loopInfo{nullptr, {}, true});   // barrier
+expect(whi->cond_, bool);
+loops_.pop_back();
+loops_.push_back(loopInfo{unit, {}});
+checkBlock(whi->block_, unit);
+loops_.pop_back();
+return unit;
+```
+- break branch:
+```cpp
+if (loops_.empty()) { error("break outside loop"); return makeError(); }
+if (loops_.back().barrier_) { error("a condition cannot jump to an outer loop"); return makeError(); }
+...
+```
+- continue branch similarly.
+- Remove inWhileCond_ references/member.
+
+Note: The barrier also prevents `break` in while condition from targeting the while itself (it's not pushed yet) or outer loops. Correct.
+
+Also `jumpBarrier_`/`inWhileCond_` member: check name. They used `inWhileCond_`. Let me check checker.h. We'll tell them to replace.
+
+Now, failure #2 runtime-value-merges: Phase 4/5, ignore.
+
+So the fix: barrier in loops_ stack instead of a global bool.
+
+Also check: current while condition: `inWhileCond_` set true around expect(cond); then body loopInfo. Replace.
+
+Let me report this fix concisely. Also note the review of other fixes: all good (break/continue/ERROR guards/array expect/hasSemi). The only issue is the barrier granularity.
+
+Additional check: `while loop { break false; } {...}` also has condition type bool (loop's break value false → bool) → expect(cond, bool) ok. Body. Good.
+
+Let me write the response.
+
+其他五处都对了，19/21。只剩一个新问题：**`inWhileCond_` 这个全局开关粒度太粗**。
+
+正例里有：
+
+```rust
+while loop { break false; } { ... }
+```
+
+`break false` 指向的是**条件表达式内部新建的 `loop`**，不是外层循环，这是合法的。但你的 `inWhileCond_ = true` 把条件期间所有 break/continue 都禁了，所以误报 "attempted to break outer loop in a while's condition"。
+
+正确做法：**不要用全局 bool，而是在 `loops_` 栈里放一个"屏障"**。规则是"条件里的跳转不能指向条件之外的 loop"，而条件内部自己创建的 loop 应该在屏障之上，允许被跳转。
+
+1. `loopInfo` 加一个字段（symbol.h）：
+
+```cpp
+struct loopInfo {
+    semType* expected_ = nullptr;
+    std::vector<semType*> breaks_;
+    bool barrier_ = false;
+};
+```
+
+2. `while` 分支改成 push/pop 屏障：
+
+```cpp
+loops_.push_back(loopInfo{nullptr, {}, true});   // 屏障
+expect(whi->cond_, semantic::makeBuiltin("bool"));
+loops_.pop_back();
+
+loops_.push_back(loopInfo{semantic::makeUnit(), {}});
+checkBlock(whi->block_, semantic::makeUnit());
+loops_.pop_back();
+return semantic::makeUnit();
+```
+
+3. `break` / `continue` 分支把 `inWhileCond_` 换成"栈顶是不是屏障"：
+
+```cpp
+if (loops_.empty()) { error("... outside loop"); return makeError(); }
+if (loops_.back().barrier_) {
+    error("a jump in a condition cannot target an outer loop");
+    return makeError();
+}
+```
+
+这样：
+
+- `loop { while continue {} }`：continue 时栈顶是屏障 → 报错 ✓
+- `while loop { break false; } {}`：条件里的 `loop` 会 push 自己的 `loopInfo` 在屏障之上，`break false` 看到的是内层 loop（不是屏障）→ 允许 ✓
+- `while false { break; }`：body 检查时栈顶是 while 自己的 loopInfo（不是屏障）→ break 允许 ✓
+
+删掉 `inWhileCond_` 成员和所有引用。改完这个，五个 Phase 3 suite 应该 20/21，只剩 `runtime-value-merges` 那个等 Phase 4/5 的 acc。
+
+---
+
+## User
+
+那你直接帮我改了。下一个 stage 呢？
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 15.2s)
+
+_Thinking:_
+
+The user asks me to directly make the change (barrier for while conditions), and asks about the next stage.
+
+Tasks:
+1. Apply the barrier fix:
+   - symbol.h: add `bool barrier_ = false;` to loopInfo.
+   - checker.h: remove `inWhileCond_` member (need to check if it exists).
+   - checker.cpp:
+     - while branch: replace inWhileCond_ usage with barrier push/pop.
+     - break branch: replace inWhileCond_ check with loops_.back().barrier_.
+     - continue branch: same.
+   - build, run Phase 3 suites.
+2. Explain next stage (Phase 4: references & mutability & coercions).
+
+Let me read the current relevant code to make exact edits. Check checker.h for inWhileCond_.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && grep -n \"inWhileCond_\\|loopInfo\" compiler/src/semantic/checker.h compiler/src/semantic/symbol.h compiler/src/semantic/checker.cpp; echo ===; sed -n '45,55p' compiler/src/semantic/symbol.h"
+}
+```
+
+**Output:**
+```
+compiler/src/semantic/checker.h:35:    std::vector<loopInfo> loops_;
+compiler/src/semantic/checker.h:38:    bool inWhileCond_ = false;
+compiler/src/semantic/symbol.h:47:struct loopInfo {
+compiler/src/semantic/symbol.h:50:    loopInfo(semType* expected = nullptr, std::vector<semType*> breaks = std::vector<semType*>()) : expected_(expected), breaks_(breaks) {}
+compiler/src/semantic/checker.cpp:745:        bool mem = inWhileCond_;
+compiler/src/semantic/checker.cpp:746:        inWhileCond_ = true;
+compiler/src/semantic/checker.cpp:748:        inWhileCond_ = mem;
+compiler/src/semantic/checker.cpp:749:        loops_.push_back(loopInfo{semantic::makeUnit(), {}});
+compiler/src/semantic/checker.cpp:762:        if (inWhileCond_) {
+compiler/src/semantic/checker.cpp:766:        loopInfo &top = loops_.back();
+compiler/src/semantic/checker.cpp:779:        if (inWhileCond_) {
+compiler/src/semantic/checker.cpp:1073:    loops_.push_back(loopInfo{wish, {}});
+compiler/src/semantic/checker.cpp:1075:    loopInfo info = loops_.back();
+===
+};
+
+struct loopInfo {
+    semType* expected_ = nullptr;
+    std::vector<semType*> breaks_;
+    loopInfo(semType* expected = nullptr, std::vector<semType*> breaks = std::vector<semType*>()) : expected_(expected), breaks_(breaks) {}
+};
+
+struct localShadowing {
+    semType* type_;
+    bool isMut_;
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 14.1s)
+
+_Thinking:_
+
+Now apply edits:
+
+1. symbol.h loopInfo: add `bool barrier_ = false;` and update constructor to accept it:
+```cpp
+struct loopInfo {
+    semType* expected_ = nullptr;
+    std::vector<semType*> breaks_;
+    bool barrier_ = false;
+    loopInfo(semType* expected = nullptr, std::vector<semType*> breaks = {}, bool barrier = false)
+        : expected_(expected), breaks_(breaks), barrier_(barrier) {}
+};
+```
+Careful with line length; fine.
+
+2. checker.h remove `bool inWhileCond_ = false;`.
+
+3. checker.cpp while branch lines ~745-750:
+Current:
+```cpp
+    if (auto whi = dynamic_cast<whileExpr*>(expr); whi) {
+        bool mem = inWhileCond_;
+        inWhileCond_ = true;
+        expect(whi->cond_, semantic::makeBuiltin("bool"));
+        inWhileCond_ = mem;
+        loops_.push_back(loopInfo{semantic::makeUnit(), {}});
+        checkBlock(whi->block_, semantic::makeUnit());
+        loops_.pop_back();
+        return semantic::makeUnit();
+    }
+```
+Replace with barrier push/pop:
+```cpp
+    if (auto whi = dynamic_cast<whileExpr*>(expr); whi) {
+        loops_.push_back(loopInfo{nullptr, {}, true});
+        expect(whi->cond_, semantic::makeBuiltin("bool"));
+        loops_.pop_back();
+        loops_.push_back(loopInfo{semantic::makeUnit(), {}});
+        checkBlock(whi->block_, semantic::makeUnit());
+        loops_.pop_back();
+        return semantic::makeUnit();
+    }
+```
+
+4. break branch:
+```cpp
+        if (inWhileCond_) { error(...); return makeError(); }
+```
+→
+```cpp
+        if (loops_.back().barrier_) { error("a jump in a condition cannot target an outer loop"); return makeError(); }
+```
+Note: check `loops_.empty()` first (already there).
+
+5. continue branch similarly.
+
+Let me apply edits. Need exact strings. Read lines 740-790 to see context.
+
+**Tool: read**
+
+**Input:**
+```json
+{
+  "filePath": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp",
+  "limit": 55,
+  "offset": 740
+}
+```
+
+**Output:**
+```
+<path>/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp</path>
+<type>file</type>
+<content>
+740:             }
+741:             return semantic::makeUnit();
+742:         }
+743:     }
+744:     if (auto whi = dynamic_cast<whileExpr*>(expr); whi) {
+745:         bool mem = inWhileCond_;
+746:         inWhileCond_ = true;
+747:         expect(whi->cond_, semantic::makeBuiltin("bool"));
+748:         inWhileCond_ = mem;
+749:         loops_.push_back(loopInfo{semantic::makeUnit(), {}});
+750:         checkBlock(whi->block_, semantic::makeUnit());
+751:         loops_.pop_back();
+752:         return semantic::makeUnit();
+753:     }
+754:     if (auto loop = dynamic_cast<loopExpr*>(expr); loop) {
+755:         return checkLoop(loop, nullptr);
+756:     }
+757:     if (auto bre = dynamic_cast<breakExpr*>(expr); bre) {
+758:         if (loops_.empty()) {
+759:             error("break outside loop");
+760:             return semantic::makeError();
+761:         }
+762:         if (inWhileCond_) {
+763:             error("attempted to break outer loop in a while's condition");
+764:             return semantic::makeError();
+765:         }
+766:         loopInfo &top = loops_.back();
+767:         if (!bre->tail_ && top.expected_ && !matches(semantic::makeUnit(), top.expected_)) {
+768:             error("break without a value in a loop which expects one");
+769:         }
+770:         semType* type = (bre->tail_ ? (top.expected_ != nullptr ? expect(bre->tail_, top.expected_) : infer(bre->tail_)) : semantic::makeUnit());
+771:         top.breaks_.push_back(type);
+772:         return semantic::makeNever();
+773:     }
+774:     if (auto con = dynamic_cast<continueExpr*>(expr); con) {
+775:         if (loops_.empty()) {
+776:             error("continue outside a loop");
+777:             return semantic::makeError();
+778:         }
+779:         if (inWhileCond_) {
+780:             error("attempted to continue outer loop in a while's condition");
+781:             return semantic::makeError();
+782:         }
+783:         return semantic::makeNever();
+784:     }
+785:     if (auto ret = dynamic_cast<returnExpr*>(expr); ret) {
+786:         if (ret->tail_) {
+787:             expect(ret->tail_, currentRet_);
+788:         }
+789:         else if (currentRet_ != nullptr && !matches(currentRet_, semantic::makeUnit())) {
+790:             error("returned an unit in a function with a return type");
+791:         }
+792:         return semantic::makeNever();
+793:     }
+794:     if (auto cast = dynamic_cast<castExpr*>(expr); cast) {
+
+(Showing lines 740-794 of 1128. Use offset=795 to continue.)
+</content>
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 14.1s)
+
+_Thinking:_
+
+Now apply the edits:
+
+1. symbol.h loopInfo with barrier.
+2. checker.h remove inWhileCond_.
+3. checker.cpp while/break/continue.
+
+Let me do all edits.
+
+**Tool: edit**
+
+**Input:**
+```json
+{
+  "filePath": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/symbol.h",
+  "newString": "struct loopInfo {\n    semType* expected_ = nullptr;\n    std::vector<semType*> breaks_;\n    bool barrier_ = false;\n    loopInfo(semType* expected = nullptr, std::vector<semType*> breaks = std::vector<semType*>(), bool barrier = false) : expected_(expected), breaks_(breaks), barrier_(barrier) {}\n};",
+  "oldString": "struct loopInfo {\n    semType* expected_ = nullptr;\n    std::vector<semType*> breaks_;\n    loopInfo(semType* expected = nullptr, std::vector<semType*> breaks = std::vector<semType*>()) : expected_(expected), breaks_(breaks) {}\n};"
+}
+```
+
+**Output:**
+```
+Edit applied successfully.
+```
+
+**Tool: edit**
+
+**Input:**
+```json
+{
+  "filePath": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.h",
+  "newString": "    std::vector<loopInfo> loops_;",
+  "oldString": "    std::vector<loopInfo> loops_;\n    bool inWhileCond_ = false;"
+}
+```
+
+**Error:**
+```
+Could not find oldString in the file. It must match exactly, including whitespace, indentation, and line endings.
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 13.2s)
+
+_Thinking:_
+
+The header edit failed; the lines may not be adjacent as I assumed. Let me read checker.h around lines 30-40.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && sed -n '28,42p' compiler/src/semantic/checker.h"
+}
+```
+
+**Output:**
+```
+    semType* infer(Expr* expr);
+    semType* expect(Expr* expr, semType* wish);
+
+    void error(std::string message);
+
+    globalTable table_;
+    scopeStack scope_;
+    std::vector<loopInfo> loops_;
+    semType* currentRet_ = nullptr;
+    std::string currentStruct_;
+    bool inWhileCond_ = false;
+    bool reject_ = false;
+};
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 14.1s)
+
+**Tool: edit**
+
+**Input:**
+```json
+{
+  "filePath": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.h",
+  "newString": "    semType* currentRet_ = nullptr;\n    std::string currentStruct_;\n    bool reject_ = false;",
+  "oldString": "    semType* currentRet_ = nullptr;\n    std::string currentStruct_;\n    bool inWhileCond_ = false;\n    bool reject_ = false;"
+}
+```
+
+**Output:**
+```
+Edit applied successfully.
+```
+
+**Tool: edit**
+
+**Input:**
+```json
+{
+  "filePath": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp",
+  "newString": "    if (auto whi = dynamic_cast<whileExpr*>(expr); whi) {\n        loops_.push_back(loopInfo{nullptr, {}, true});\n        expect(whi->cond_, semantic::makeBuiltin(\"bool\"));\n        loops_.pop_back();\n        loops_.push_back(loopInfo{semantic::makeUnit(), {}});\n        checkBlock(whi->block_, semantic::makeUnit());\n        loops_.pop_back();\n        return semantic::makeUnit();\n    }",
+  "oldString": "    if (auto whi = dynamic_cast<whileExpr*>(expr); whi) {\n        bool mem = inWhileCond_;\n        inWhileCond_ = true;\n        expect(whi->cond_, semantic::makeBuiltin(\"bool\"));\n        inWhileCond_ = mem;\n        loops_.push_back(loopInfo{semantic::makeUnit(), {}});\n        checkBlock(whi->block_, semantic::makeUnit());\n        loops_.pop_back();\n        return semantic::makeUnit();\n    }"
+}
+```
+
+**Output:**
+```
+Edit applied successfully.
+```
+
+**Tool: edit**
+
+**Input:**
+```json
+{
+  "filePath": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp",
+  "newString": "        if (loops_.back().barrier_) {\n            error(\"attempted to break an outer loop in a while's condition\");\n            return semantic::makeError();\n        }",
+  "oldString": "        if (inWhileCond_) {\n            error(\"attempted to break outer loop in a while's condition\");\n            return semantic::makeError();\n        }"
+}
+```
+
+**Output:**
+```
+Edit applied successfully.
+```
+
+**Tool: edit**
+
+**Input:**
+```json
+{
+  "filePath": "/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler/compiler/src/semantic/checker.cpp",
+  "newString": "        if (loops_.back().barrier_) {\n            error(\"attempted to continue an outer loop in a while's condition\");\n            return semantic::makeError();\n        }",
+  "oldString": "        if (inWhileCond_) {\n            error(\"attempted to continue outer loop in a while's condition\");\n            return semantic::makeError();\n        }"
+}
+```
+
+**Output:**
+```
+Edit applied successfully.
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 40.1s)
+
+_Thinking:_
+
+Now build and run the Phase 3 suites.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && cmake --build target/build -j 2>&1 | grep -E \"error|warning|Built target\" | head -3 && make test FILTER=official:semantic:expected-types,official:semantic:blocks-if-and-never,official:semantic:loops-and-jumps,official:semantic:loop-state-merges,official:semantic:runtime-value-merges STAGE=semantic 2>&1 | grep -E \"^\\s*[0-9]+\\)|passed|failed\" | head -8",
+  "timeout": 300000
+}
+```
+
+**Output:**
+```
+[100%] Built target rxcc
+. passed  F failed
+1) official:semantic:runtime-value-merges/acc-input-dependent-reference-aggregate-and-owner-results.rx@semantic
+======================== 1 failed, 20 passed in 22.17s =========================
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 60.5s)
+
+_Thinking:_
+
+20/21: only `runtime-value-merges/acc-...` failing, which needs structs/arrays/Box/Vec/refs (Phase 4/5). So Phase 3 is essentially complete (the one acc depends on later features; but it's in a Phase 3 suite... the todo lists runtime-value-merges under Phase 3). Hmm. The test uses:
+- `if first { &mut a } else { &b }` → LUB with refs (done)
+- loop breaks with refs (done)
+- struct Packet + struct init + field access (Phase 5)
+- arrays + indexing + assignment (Phase 5)
+- Box::<i32>::new + deref (Phase 5)
+- Vec methods (Phase 5)
+So it can't pass until Phase 5. Note that the suite assignment in the todo is approximate; tell the user it's blocked on Phase 5.
+
+Let me also run the full semantic suite to see the overall count and check for regressions. Then summarize Phase 3 completion and explain Phase 4 (what to do, order).
+
+Run full semantic.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && make test FILTER=official:semantic STAGE=semantic 2>&1 | tail -2",
+  "timeout": 300000
+}
+```
+
+**Output:**
+```
+======================= 86 failed, 150 passed in 45.29s ========================
+make: *** [Makefile:25: test] Error 1
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 25.9s)
+
+_Thinking:_
+
+Overall semantic: 150 passed / 86 failed (up from 91/145 before Phase 3). Phase 3 delivered +59.
+
+Now explain Phase 4: references and mutability + coercion.
+
+From now_todolist_3.md Phase 4:
+- REF 类型、coercion（`&mut→&`、解引用路径、never）、place/可变性、coercion 位点。
+- Tests: `references-and-mutability`, `reference-coercions`, `reference-lub`, `scalar-reference-operators`, `vec-index-mutability`.
+
+What to implement:
+1. **Coercion (`coerceTo`)** at one-to-one sites:
+   - Sites: annotated let init, assignment RHS, call args, return/function tail, struct field init (Phase 5), const init (done via typeEqual).
+   - `coerceTo(Expr* e, semType* target)` = expect with adjustment: infer/expect the expression's own type, then apply `canImplicitlyTurn`; error if not. In practice, implement `expect` to accept `matches || canImplicitlyTurn(type, wish)`. But careful: expected-type propagation for literals should still work; order: for intLit branch as now; for block/if/loop propagate; else infer then check `matches(type, wish) || canImplicitlyTurn(type, wish)`.
+   - Also extend `canImplicitlyTurn` to full coercion table:
+     - never → any
+     - equal
+     - `&mut T → &T`
+     - `&S | &mut S → &T`: follow builtin derefs (&U→U, &mut U→U, Box<U>→U) until referent equals T.
+     - `&mut S → &mut T`: outer &mut, follow derefs with no shared reference along path.
+     - Vec no deref.
+2. **Place/mutability full**:
+   - `isPlaceable`: already; add `refExpr`? No—refExpr isn't a place (borrow result is a value). Field/index/deref/local done.
+   - `isMutablePlaceable`:
+     - local binding isMut.
+     - field/index: recurse; if receiver type is `&T` shared → false; if `&mut T` → mutable; Box follows place; Vec index rules.
+     - deref: operand type REF mut → true; shared → false; BOX → depends on the *place* of the box (if box is a mutable place, *box is mutable).
+     - Through shared ref cannot recover (even if binding mut).
+   - Assignment/compound already use it; extend.
+3. **`&mut e` / `&e` place checks**:
+   - `&mut e`: e must be mutable place (except borrowed temporaries like `&mut 1`? Tests reference-lub use `&mut 1`, `&mut &1` — borrowing literals. Spec says `&mut e` requires e a mutable place; but temporaries? The spec's reference-lub examples treat `&mut 1` as valid. So literals/temporaries are borrowable as `&mut`. Need to allow rvalue places for borrows? In Rust, `&mut 1` is allowed (temporary). So do NOT enforce place for literals; only when e is a place-shaped expression (variable/field/index/deref) check mutability. Simplest: if `isPlaceable(e)`, require isMutablePlaceable for `&mut`; if not place (rvalue), allow (temporary). For `&e` similarly no check needed.
+   - Hmm, but `&x` where x immutable is fine (shared). `&mut x` where x immutable → error. So: for `&mut`, if isPlaceable(operand) then require isMutablePlaceable; else allow (temporary).
+4. **Scalar-reference operators** (`scalar-reference-operators` suite):
+   - Arithmetic/comparison with one layer `&T` operands: already digOneRef for many; comparisons need mut matching ("各层 mut 匹配的引用"): for `< <= > >=`, if both operands are REF, their isMut must match? The spec: "两边同为整数/bool（各层 mut 匹配的引用也行）". So comparison with refs requires same mutability on both sides. Currently comparisons use `digOneRef` both? They compare `ltype` (unstripped lhs!) with `digOneRef(rhs)` — bug for lhs ref: `let a=&1; let b=&2; a < b`: ltype REF(i32), rhs stripped i32 → mismatch error. Need to strip both and check mut match. Also arithmetic: "两边同一个整数类型（或一层 &T）" — one layer allowed on either/both; mut matching not specified, maybe allowed regardless. Tests will tell.
+   - Equality of references (`==`): compare REF types directly; typeEqual handles mut/referent. Capability PartialEq for refs: `&T`/`&mut T` PartialEq if T: PartialEq (Phase 6 maybe).
+   - Assignment to `*p` through `&mut` vs `&` handled by isMutablePlaceable.
+5. **`vec-index-mutability`**: Vec index implicit borrow rules: reading needs shared; writing/mutable borrow requires mutable index step; details: `v[0] = 5` where v is `Vec<T>` mutable; `let e = &v[0]`; `&mut v[0]` requires v mutable; also `v[0]` through `&Vec` not writable; through `&mut Vec` writable. Implement in isMutablePlaceable index branch when receiver type is Vec (or index on array): if receiver place mutable, index is mup; if receiver type REF mut → index mutable; REF shared → not. Vec indexing "implicit borrow" nuance: `v[0]` place mutability derives from v's place; but for `Vec`, indexing goes through Deref; the todo says details per suite. Phase 5 for Vec methods/indexing? Vec type exists in semantic Type (VEC) but expressions `v[0]` infer not implemented yet (indexExpr missing!). Wait current infer has no indexExpr/fieldExpr/structInit; Phase 5. But `vec-index-mutability` is in Phase 4 per todo; however vec index requires Vec builtins? The suite uses `Vec::<i32>::new()` and `v[0]`, so it needs Vec::new + index. That's a lot; maybe Phase 4/5 overlap. The todo puts vec-index-mutability in Phase 4, but realistically Vec handling comes with Phase 5. We can tell the user to do refs first, then vec-index with Phase 5.
+6. **reference-lub suite**: LUB with refs/deref coercions (extend canImplicitlyTurn).
+7. **reference-coercions suite**: `&mut → &`, `&Box<T> → &T`, arg/return/let sites.
+
+Order for Phase 4:
+1. Extend `canImplicitlyTurn` to the full coercion table.
+2. Wire coercion into `expect`/one-to-one sites: `expect` fallback: `matches(type,wish) || canImplicitlyTurn(type,wish)`; return wish. This is the "coercion site" behavior. Also update struct field/array sites later.
+3. Full `isMutablePlaceable` (shared-ref barrier, Box, deref) and `&mut` borrow check.
+4. Fix scalar-reference-operators (strip refs on both sides for arithmetic/comparison, mut matching for comparisons).
+5. vec-index mutability later with Phase 5 (needs Vec/index).
+
+Tests: references-and-mutability, reference-coercions, reference-lub, scalar-reference-operators, vec-index-mutability.
+
+Also mention current full status: 150/236 passed.
+
+After Phase 4 estimate: +? references suites have ~? Let me not compute.
+
+Now write the summary: barrier fix applied + tests (20/21, full 150 passed). Then Phase 4 plan in order.
+
+Also mention runtime-value-merges acc blocked on Phase 5 (struct/array/Box/Vec).
+
+Let me write concisely.
+
+改好了，build 通过：
+
+- `loopInfo` 加了 `barrier_`，`while` 条件用 push/pop 屏障，`break`/`continue` 检查栈顶是不是屏障；
+- 删掉了 `inWhileCond_`。
+
+结果：五个 Phase 3 suite **20/21**，只剩 `runtime-value-merges` 那个 acc——它用了 struct 构造、数组索引、`Box::new`、`Vec` 方法，属于 Phase 5，先留着。全量 semantic 从 91 涨到 **150 passed / 86 failed**，Phase 3 基本收工。
+
+---
+
+**下一个 stage：Phase 4（引用与可变性）**
+
+按依赖顺序：
+
+1. **补全 `canImplicitlyTurn`（coercion 表）**——现在是 never/相等/`&mut T → &T`，要加：
+   - `&S` / `&mut S` → `&T`：沿 `&U→U`、`&mut U→U`、`Box<U>→U` 逐层解引用，直到 referent 等于 T；
+   - `&mut S` → `&mut T`：外层必须是 `&mut`，且路径上不能经过共享引用；
+   - Vec 不解引用；Box 本身不能直接变 `T`/`&T`。
+2. **把 coercion 接到 one-to-one 位点**：`expect` 的 fallback 从
+   ```cpp
+   if (!typeEqual(type, wish)) error(...)
+   ```
+   改成
+   ```cpp
+   if (!matches(type, wish) && !canImplicitlyTurn(type, wish)) error(...)
+   ```
+   这样带类型标注的 `let`、赋值右侧、调用实参、`return`、函数尾（struct 字段等 Phase 5 再接）都会自动支持 `&mut T → &T`、`&Box<T> → &T`。
+3. **完整 `isMutablePlaceable`**：
+   - 字段/索引：基址可变才算可变；**穿过 `&T` 后不可恢复**（`let mut r = &x; r.field = ...` 要拒）；
+   - `*p`：`&mut T` 可写、`&T` 不可写、`Box<T>` 看 Box 这个 place 是否可变；
+   - 局部：看 `localShadowing::isMut_`。
+4. **借用检查**：`&mut e` 时，如果 `e` 是 place 形状，要求 `isMutablePlaceable(e)`；`e` 是字面量/临时值（`&mut 1`）则放行（reference-lub 的正例会用到）。
+5. **scalar-reference-operators**：算术/位运算/比较的操作数都允许一层 `&T`（现在是 lhs 没剥、只有 rhs 剥）：
+   - 算术/位运算：两边各自 `digOneRef` 后同类型即可；
+   - 比较 `< <= > >=`：两边各自剥一层后同类型，并且**引用的 mut 要匹配**（`&i32` vs `&mut i32` 不能比）；
+   - `== !=`：直接 `typeEqual`，引用按整体类型比。
+6. **`vec-index-mutability`** 依赖 `Vec::new`、`indexExpr`、Vec 方法，和 Phase 5 交叉，建议放到 Phase 5 一起做，不要卡在 Phase 4。
+
+对应 suite：`references-and-mutability`、`reference-coercions`、`reference-lub`、`scalar-reference-operators`；`vec-index-mutability` 最后补。先做 1–3，跑 `references-and-mutability` 和 `reference-coercions` 看反馈。
+
+---
+
+## User
+
+估计一下我这个 semantic 写了百分之多少了。后面几个 stage 分别有哪些难点？
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 67.1s)
+
+_Thinking:_
+
+The user asks: estimate what percentage of the semantic work is done, and what are the difficulties of the remaining stages.
+
+I should give a progress estimate based on:
+- Test outcomes: 150/236 passed in official semantic suite (63.6% by test count), but test count isn't equal to work. Also the collect + Phase 2 + Phase 3 done; remaining Phase 4, 5, 6.
+- Code volume: checker.cpp currently ~1130 lines? Let me check. Earlier we estimated final ~2200-2700 lines. Current ~? Let me count.
+- Work breakdown by effort: collect ~25% (3 passes, const eval, types, name registration), check Phase 2 ~20%, Phase 3 ~10%, so maybe ~55-60% of semantic work done. Remaining Phase 4 ~15-20%, Phase 5 ~20-25%, Phase 6 ~5-8%. Also integration/debug time.
+
+Let me get the current line count and test count to ground the estimate.
+
+Then discuss difficulties per remaining stage:
+
+Phase 4 (references/mutability/coercion):
+- Hardest conceptually: place/mutability through references; coercion table (deref chains, mut matching); one-to-one coercion sites; method receiver auto-ref (Phase 5 interaction); reference LUB; scalar reference operators (mut matching); rules subtle and easy to over/under-reject.
+- Debug pain: many suite tests, interactions with existing code (expect changes could affect Phase 2/3 tests).
+- Vec index mutability deferred.
+
+Phase 5 (aggregates/methods/builtins):
+- Biggest volume: field access with auto-deref; index (array/Vec) with expected usize and mutability; struct init (field completeness/duplicates/order/types); array literal LUB/repeat arrays; method lookup algorithm (candidate chain: T, &T, &mut T, Box<U>; Vec no deref); receiver adjustments/mutability; builtins (Box/Vec new/clone/len/is_empty/push/remove; Box deref; Vec index implicit borrow); calls with assoc functions (2-seg paths, Self::); generic args validation; Box::<T> / Vec::<T> in types and paths; interaction with coercion (arguments).
+- Most line-heavy and fiddly; high risk of regressions.
+
+Phase 6 (derive/layout/entry):
+- Derive capability recursive checks with cycle guard (Copy→Clone, Eq→PartialEq, field capabilities); recursive layout (by-value cycles); main entry checks; impl legality left; maybe zero-sized? Protected names done.
+- Conceptually simple but recursion/cycle handling needs care; capability table has many type categories (&T, &mut T, Box, Vec, arrays, structs).
+- Also `==`/`!=` capability requirement (PartialEq) is tied to Phase 6; currently Phase 2 allows equality on same type. Tests in copy-clone-and-equality/recursive-traits.
+- Entry: main signature.
+
+Also mention remaining test suites mapping and current failing counts per area. Maybe run a quick breakdown? We know 86 failed. Could compute which suites fail? Might be informative but not necessary. Maybe run full semantic to list counts? It takes 45s. We already have 150/86. The remaining failures are concentrated in references, arrays, methods, structs, constants? Let's quickly get per-suite failure counts? The test runner output only lists first N? We could run and grep failure list; 86 lines. Might be useful for the estimate but verbose. Maybe skip.
+
+Percentage estimate: 
+- By code volume: current checker.cpp ~1130 lines; estimated final 2200-2700 → ~45%? But collect and basic check are the foundation; the remaining phases are more lines. Let me count current lines.
+- By effort: collect ~30%, Phase2/3 ~25%, remaining Phase4/5/6 ~45%. So ~55% done? Hmm.
+- By test pass: 150/236 = 64%, but many remaining tests are concentrated in hard suites; also passing tests can hide unimplemented checks (e.g., positives pass because ERROR-compatible). So test count overestimates. I'd say **~55–60%** of semantic work done, with the remaining 40–45% being the hardest (methods/builtins/places).
+
+Let me get current line count and maybe count failing suites quickly. Then answer.
+
+Actually, let me run a quick command to count checker.cpp lines (non-blank) and maybe list failing suite names with counts from a full run (45s). The user asks percentage; data helps. Let me run full semantic and parse failure list per suite. The test runner prints numbered failure list; with 86 failures, output manageable. Let me run and aggregate via grep/awk. Could take ~60s. Worth it? Maybe just count lines and use known status. I'll do both in one command.
+
+Let me run full semantic and capture output to /tmp, then summarize failures by suite top-level (e.g., references-and-mutability, arrays...). Then answer.
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"/mnt/c/Users/Lenovo/Desktop/大二上/Compiler/rx-compiler\" && wc -l compiler/src/semantic/checker.cpp && grep -cv '^\\s*$' compiler/src/semantic/checker.cpp; make test FILTER=official:semantic STAGE=semantic > /tmp/opencode/sem.log 2>&1; tail -2 /tmp/opencode/sem.log; grep -oE \"official:semantic:[a-z-]+/\" /tmp/opencode/sem.log | sort | uniq -c | sort -rn | head -20",
+  "timeout": 300000
+}
+```
+
+**Output:**
+```
+1126 compiler/src/semantic/checker.cpp
+1095
+======================= 86 failed, 150 passed in 47.41s ========================
+make: *** [Makefile:25: test] Error 1
+     12 official:semantic:copy-clone-and-equality/
+     10 official:semantic:vec-index-mutability/
+      7 official:semantic:structs-and-fields/
+      6 official:semantic:vec-operations/
+      5 official:semantic:methods-and-self/
+      4 official:semantic:reference-coercions/
+      4 official:semantic:recursive-layout/
+      4 official:semantic:entry/
+      4 official:semantic:arrays/
+      3 official:semantic:scalar-reference-operators/
+      3 official:semantic:references-and-mutability/
+      3 official:semantic:nested-containers/
+      3 official:semantic:invalid-impls-and-generics/
+      3 official:semantic:box-and-moves/
+      2 official:semantic:trait-dispatch-and-reference-equality/
+      2 official:semantic:recursive-traits/
+      2 official:semantic:evaluation-order-and-temporaries/
+      2 official:semantic:constant-errors/
+      1 official:semantic:runtime-value-merges/
+      1 official:semantic:constants-and-paths/
+
+```
+
+---
+
+## Assistant (Build · DeepSeek V4.1 Flash 1017 · 24.6s)
+
+_Thinking:_
+
+Current stats:
+- checker.cpp: 1126 lines (1095 non-blank).
+- Full semantic: 150/236 passed (63.6%), 86 failed.
+- Failure distribution:
+  - copy-clone-and-equality 12 (Phase 6)
+  - vec-index-mutability 10 (Phase 4/5)
+  - structs-and-fields 7 (Phase 5)
+  - vec-operations 6 (Phase 5)
+  - methods-and-self 5 (Phase 5)
+  - reference-coercions 4 (Phase 4)
+  - recursive-layout 4 (Phase 6)
+  - entry 4 (Phase 6)
+  - arrays 4 (Phase 5)
+  - scalar-reference-operators 3 (Phase 4)
+  - references-and-mutability 3 (Phase 4)
+  - nested-containers 3 (Phase 5)
+  - invalid-impls-and-generics 3 (mostly done? some Phase 6)
+  - box-and-moves 3 (Phase 5)
+  - trait-dispatch-and-reference-equality 2 (Phase 6/5)
+  - recursive-traits 2 (Phase 6)
+  - evaluation-order-and-temporaries 2 (Phase 5?)
+  - constant-errors 2 (check phase: repeat length)
+  - runtime-value-merges 1 (Phase 5)
+  - constants-and-paths 1 (check phase arrays)
+  - plus likely more not shown (head 20).
+
+Interesting: some constants-and-paths/constant-errors failures remain (repeat length in expressions — check phase, should be handled now? The failure was `rej-repeat-length-cannot-name-a-local` etc. Since checkStatement now handles let; repeat array infer not implemented — Phase 5. So arrays-related.)
+
+Percentage estimate:
+- Test count: 63.6% passing, but some passes are "fake" (unimplemented nodes return ERROR which is compatible). So actual completeness lower than test %.
+- Code volume: 1095 non-blank vs estimated final 2200-2700 → ~42-50%.
+- Effort: collect ~25%, Phase2 ~20%, Phase3 ~8% → ~53% done; remaining Phase4 (~15%), Phase5 (~25%), Phase6 (~7%). Roughly **55%**.
+
+Which estimate to give? Probably ~55-60% by workload; tests 64% but misleading. Explain why test percentage overstates: unimplemented features are ERROR-compatible, so many positives pass without being checked; negatives are the real signal. E.g., arrays/structs positives may pass trivially until implemented, so 150 passing doesn't mean those features work.
+
+Difficulties per remaining stage:
+
+Phase 4 (refs/mutability/coercion):
+- Full coercion table (deref chains through &/&mut/Box, mut restrictions, Vec no deref).
+- Place/mutability through shared refs (no recovery), Box ownership, `&mut` borrow requirements, temporaries.
+- Scalar reference operators: one-layer ref operands, mut matching for comparisons.
+- Wiring coercion into expect without breaking Phase 2/3 (regression risk).
+- Tests: references-and-mutability(3), reference-coercions(4), reference-lub?, scalar-reference-operators(3), vec-index-mutability(10, partly Phase 5).
+
+Phase 5 (aggregates/methods/builtins):
+- Biggest: struct init/field access with auto-deref; index (array/Vec) expected usize; array literal LUB/repeat; method lookup algorithm; receiver auto-borrow/mutability; builtins Box/Vec; 2-segment paths (S::new, Self::f, Box::<T>::new); turbofish; Vec methods; nested containers; moves/eval order. 
+- Hardest bugs: method lookup candidate chain + autoref, Box/Vec deref differences, Vec index mutability (10 tests), struct field init order/types, array repeat evaluating value once (semantic type only).
+- Tests count: structs(7)+vec-index(10)+vec-ops(6)+methods(5)+arrays(4)+nested(3)+box(3)+evaluation-order(2)+runtime-merges(1)+... ~40+ tests.
+
+Phase 6 (derive/layout/entry):
+- copy-clone-and-equality 12: capability table + recursive structs + derive requirements (Copy→Clone, Eq→PartialEq), `==` requires PartialEq, `.clone()` requires Clone.
+- recursive-layout 4: by-value cycles; indirection breaks (Box/Vec/ref); inline arrays count.
+- entry 4: main signature checks.
+- recursive-traits 2, trait-dispatch-and-reference-equality 2.
+- Conceptually simpler but recursion with cycle guard, capability table details; ~20 tests.
+
+Also mention constants/repeat-length leftovers (2-3) belong to arrays check phase; will resolve in Phase 5.
+
+Estimate percentages: 
+- Done: collect 100%, check basics/expected/never ~90% (Phase 2/3).
+- Overall semantic: ~55% effort; ~64% tests.
+- Remaining: Phase 4 ~15%, Phase 5 ~25%, Phase 6 ~7%, buffer/debug ~5%.
+
+Time: not asked, but percentage. Maybe give "by tests 64%, by workload ~55%, by lines ~40-45%". Then difficulty ranking: Phase 5 > Phase 4 > Phase 6.
+
+Keep concise with a table. Mention that failure counts map to stages. Let me write.
+
+**完成度三个口径：**
+
+| 口径 | 数值 |
 |---|---|
-| `a << b >> c` | `a << b`（丢了 `>> c`） |
-| `a >> b << c` | `b << a`（操作数还反了） |
-| `a << b >> c << a` | `(a << c) << a` |
-| `break a >> b << c;` | `b << a` |
+| 官方 semantic 用例 | 150 / 236 ≈ **64%** |
+| 代码量（按预估最终 2200–2700 行） | 1095 非空 ≈ **40–50%** |
+| 按工作量（含调试） | **约 55%** |
 
-根因：文法把 shift 链表示成 `(closedAdditive SHL | additive shiftRight)* additive` 的**交替**序列，而 visitor 用 `ctx->SHL()` 和 `ctx->shiftRight()` 两组分离的列表各自拼，天然丢掉交替顺序。正确做法是按 `ctx->children` 的源码顺序走（operand/op 交替），左折叠，op 文本从 SHL 或 `shiftRight->getText()`（`">>"`）取。
+测试数偏高，因为未实现的节点返回 ERROR、`typeEqual` 对 ERROR 放行——大量 positive 是"没查"混过去的，negative 才是真实进度。剩余 86 个失败的分布很能说明问题：
 
-**Bug 2（严重）：statement 上下文 `a >> b << c;` 直接段错误**（gdb 栈顶就是 `visitStatementShiftExpression`）。触发条件：语句里第一个 shift 是 `>>`、后面还有 `<<`（`a >> b << c;`、`a >> b >> c << d;`、`a >> b + c << d;` 共 4 个变体全崩）。原因是 SHL 分支里 `visit(ctx->statementClosedAdditiveExpression())`，而这种 parse 里该 child 不存在 → `visit(nullptr)`。条件/break 家族没崩但结果同样是错的（Bug 1）。复现文件在 `/tmp/opencode/ast-check/crash/`。
+```
+copy-clone-and-equality 12   ← Phase 6
+vec-index-mutability    10   ← Phase 4/5
+structs-and-fields       7   ← Phase 5
+vec-operations           6   ← Phase 5
+methods-and-self         5   ← Phase 5
+reference-coercions      4   ← Phase 4
+recursive-layout         4   ← Phase 6
+entry                    4   ← Phase 6
+arrays                   4   ← Phase 5
+scalar-reference-ops     3   ← Phase 4
+references-and-mutability 3  ← Phase 4
+nested-containers        3   ← Phase 5
+box-and-moves            3   ← Phase 5
+invalid-impls            3   ← Phase 6 收尾
+...
+```
 
-**小问题（不阻塞，但提醒）**
+**各阶段的难点：**
 
-- `Crate::items_` 对 `use` 声明会 push 一个 `nullptr`（`visitItem` 落空返回 null）；`blockExpr::stmts_` 对空 `;` 也一样。dump 里都判了空所以看不出来，但**check 阶段遍历必须 null-check**，或干脆在 builder 里 skip。
-- `refExpr::num_` 从未赋值（`make_unique` value-init 保证是 0，dump 里的 `n=0` 是死字段），要么删掉要么在 `&&` 时设成 2。
-- `&mut self` 会把 `Param::isMut_` 置 true（那个 `mut` 属于引用类型而不是绑定），所以 dump 里 `mut self` 和 `&mut self` 都显示 `mut self`；检查器判断 receiver 可变性时要用 `type_` 的 REF/isMut，别用 `Param::isMut_`。
+**Phase 4（引用/可变性）——概念最容易写错，约 15% 工作量**
+- 完整 coercion 表：`&S/&mut S → &T` 要沿 `&`/`&mut`/`Box` 逐层解引用，mutable 目标还要求外层 `&mut` 且路径无共享引用；
+- place 可变性：穿过共享引用不可恢复、Box 的 mut 看 Box 这个 place、`&mut e` 对 place 的检查与"借用临时值"的例外；
+- scalar-reference-operators：操作数一层 `&T`、比较时引用 mut 必须匹配；
+- 风险：改 `expect` 接入 coercion 会波及已经过的 Phase 2/3 用例，容易回归。
 
-先修 8 个 shift visitor（顺序折叠 + 判空），Bug 1/2 一起消失。验证脚本和语料都留在 `/tmp/opencode/ast-check/`，改完可以重跑 `diff_test.py` 和 crash 套件自检。
+**Phase 5（聚合/方法/内建）——最大头，约 25% 工作量**
+- 方法查找算法（T → `&T`/`&mut T` → `Box<U>` 逐层，Vec 不解引用）+ 接收者自动借用/可变性；
+- `Box::<T>::new`、`Vec::<T>::new`、`Box::<T>::clone` 这类 2 段 path + turbofish 实参；
+- struct 构造（字段齐全/类型/重复）、字段访问自动解引用、数组字面量 LUB、repeat array；
+- Vec 方法（len/is_empty/push/remove/clone）+ Vec 索引的隐式借用（`vec-index-mutability` 10 个用例）；
+- 行数最多、交互最杂（和 coercion、place、expected 都耦合）。
+
+**Phase 6（derive/布局/入口）——概念简单但细节多，约 7% 工作量**
+- 能力表递归：Copy 要求字段全 Copy 且必须 derive Clone；Eq 要求已 derive PartialEq；`&mut T` 不是 Clone；Box/Vec/数组的传递规则；
+- 递归 struct 检查要带"正在检查"集合（`recursive-traits`）；
+- 递归布局：按值环报错，Box/Vec/引用打断环，内联数组不打断；
+- `main` 入口签名、`invalid-impls` 收尾。
+
+**建议**：Phase 4 先做 `canImplicitlyTurn` + `expect` 接入 + `isMutablePlaceable` 完整版，跑 `references-and-mutability`、`reference-coercions`、`reference-lub`、`scalar-reference-operators`；`vec-index-mutability` 和 `structs/vec/methods/arrays` 全部留到 Phase 5 一起做，避免在 Vec/字段还没实现时反复返工。
 
 ---
 

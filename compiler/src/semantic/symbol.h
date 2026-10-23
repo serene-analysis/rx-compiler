@@ -44,6 +44,13 @@ struct globalTable {
     std::map<std::string, std::map<std::string, constSignature>> associatedConsts;
 };
 
+struct loopInfo {
+    semType* expected_ = nullptr;
+    std::vector<semType*> breaks_;
+    bool barrier_ = false;
+    loopInfo(semType* expected = nullptr, std::vector<semType*> breaks = std::vector<semType*>(), bool barrier = false) : expected_(expected), breaks_(breaks), barrier_(barrier) {}
+};
+
 struct localShadowing {
     semType* type_;
     bool isMut_;

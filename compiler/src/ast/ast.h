@@ -87,6 +87,7 @@ struct methodCallExpr : Expr {
     Expr* from_;
     std::string name_;
     std::vector<Expr*> args_;
+    bool hasGenericArgs_ = false;
 };
 
 struct fieldExpr : Expr {
@@ -149,6 +150,7 @@ struct Type : Node {
     Type* elem_ = nullptr;
     bool isMut_ = false;
     ConstValue* arrayLength_ = nullptr;
+    bool hasGenerigArgs = false;
 };
 
 struct Stmt : Node {
@@ -164,6 +166,7 @@ struct letStmt : Stmt {
 
 struct exprStmt : Stmt {
     Expr* expr_;
+    bool hasSemi_ = true;
 };
 
 struct Item : Node {
@@ -190,6 +193,7 @@ struct funcItem : Item {
     std::vector<Param> parameter_;
     Type* retType_;
     Expr* body_;
+    bool hasGenericParams_ = false;
 };
 /*
 functionDefinition

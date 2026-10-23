@@ -15,8 +15,9 @@ private:
     return ret;
   }
 
-  inline Type* makeNamedType(const std::string &name, const std::vector<Type*> &types) {
+  inline Type* makeNamedType(const std::string &name, const std::vector<Type*> &types, bool hasGenericArgs) {
     auto final_type = make<Type>();
+    final_type->hasGenerigArgs = hasGenericArgs;
     if ((name == "Box" || name == "Vec") && types.size() == 1) {
       final_type->kind_ = (name == "Box" ? Type::kTypeKind::BOX : Type::kTypeKind::VEC);
       final_type->elem_ = types[0];
@@ -37,6 +38,7 @@ private:
       auto mcal = make<methodCallExpr>();
       mcal->from_ = from;
       mcal->name_ = dot->pathExprSegment()->pathIdentSegment()->getText();
+      mcal->hasGenericArgs_ = (dot->pathExprSegment()->genericArgs() != nullptr);
       auto exprs = args->expression();
       for (auto expr : exprs) {
         mcal->args_.push_back(anyExpr(visit(expr)));
