@@ -9,32 +9,45 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # ANTLR 运行时（已装在 ~/antlr4-4.13.1；HINTS 让 VSCode 插件不带 -DCMAKE_PREFIX_PATH 时也能找到）
 find_package(antlr4-runtime 4.13.1 REQUIRED HINTS "$ENV{HOME}/antlr4-4.13.1")
-find_package(Java REQUIRED COMPONENTS Runtime)
 
-# 生成 C++ 解析器到构建目录
-set(ANTLR_JAR        /usr/local/lib/antlr-4.13.1-complete.jar)
-set(WRAPPER_DIR      ${CMAKE_CURRENT_SOURCE_DIR}/grammar)
-set(ORIG_GRAMMAR_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../grammar)
-set(GEN_DIR          ${CMAKE_CURRENT_BINARY_DIR}/generated)
-file(MAKE_DIRECTORY ${GEN_DIR})
+# 默认使用仓库里已生成好的 ANTLR C++ 源码，构建不依赖 Java/ANTLR jar。
+# 改过 grammar 后本地执行：cmake -S compiler -B build -DRX_REGENERATE_ANTLR=ON
+option(RX_REGENERATE_ANTLR "Regenerate ANTLR C++ sources (requires Java and ANTLR jar)" OFF)
 
 set(GEN_SRCS
-    ${GEN_DIR}/RxLexer.cpp
-    ${GEN_DIR}/RxParser.cpp
-    ${GEN_DIR}/RxParserBaseVisitor.cpp
-    ${GEN_DIR}/RxParserBaseListener.cpp
-    ${GEN_DIR}/RxParserListener.cpp
-    ${GEN_DIR}/RxParserVisitor.cpp)
+    RxLexer.cpp
+    RxParser.cpp
+    RxParserBaseVisitor.cpp
+    RxParserBaseListener.cpp
+    RxParserListener.cpp
+    RxParserVisitor.cpp)
 
-add_custom_command(
-    OUTPUT ${GEN_SRCS}
-    COMMAND ${Java_JAVA_EXECUTABLE} -jar ${ANTLR_JAR} -Dlanguage=Cpp -visitor
-            -lib ${ORIG_GRAMMAR_DIR}
-            -o ${GEN_DIR}
-            ${WRAPPER_DIR}/RxLexer.g4 ${WRAPPER_DIR}/RxParser.g4
-    DEPENDS ${WRAPPER_DIR}/RxLexer.g4 ${WRAPPER_DIR}/RxParser.g4
-            ${ORIG_GRAMMAR_DIR}/Lexer.g4 ${ORIG_GRAMMAR_DIR}/Parser.g4
-    COMMENT "Generating ANTLR C++ sources")
+if (RX_REGENERATE_ANTLR)
+    find_package(Java REQUIRED COMPONENTS Runtime)
+    set(ANTLR_JAR /usr/local/lib/antlr-4.13.1-complete.jar CACHE FILEPATH "ANTLR complete jar")
+    set(WRAPPER_DIR      ${CMAKE_CURRENT_SOURCE_DIR}/grammar)
+    set(ORIG_GRAMMAR_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../grammar)
+    set(GEN_DIR          ${CMAKE_CURRENT_BINARY_DIR}/generated)
+    file(MAKE_DIRECTORY ${GEN_DIR})
+    list(TRANSFORM GEN_SRCS PREPEND "${GEN_DIR}/")
+    add_custom_command(
+        OUTPUT ${GEN_SRCS}
+        COMMAND ${Java_JAVA_EXECUTABLE} -jar ${ANTLR_JAR} -Dlanguage=Cpp -visitor
+                -lib ${ORIG_GRAMMAR_DIR}
+                -o ${GEN_DIR}
+                ${WRAPPER_DIR}/RxLexer.g4 ${WRAPPER_DIR}/RxParser.g4
+        DEPENDS ${WRAPPER_DIR}/RxLexer.g4 ${WRAPPER_DIR}/RxParser.g4
+                ${ORIG_GRAMMAR_DIR}/Lexer.g4 ${ORIG_GRAMMAR_DIR}/Parser.g4
+        COMMENT "Generating ANTLR C++ sources")
+else()
+    set(GEN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/generated)
+    list(TRANSFORM GEN_SRCS PREPEND "${GEN_DIR}/")
+    foreach (src ${GEN_SRCS})
+        if (NOT EXISTS ${src})
+            message(FATAL_ERROR "Missing generated ANTLR source: ${src}. Run cmake with -DRX_REGENERATE_ANTLR=ON.")
+        endif()
+    endforeach()
+endif()
 
 file(GLOB_RECURSE MY_SRCS CONFIGURE_DEPENDS src/*.cpp)
 
