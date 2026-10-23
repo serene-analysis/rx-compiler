@@ -1673,8 +1673,14 @@ semType* Checker::checkBlock(blockExpr* block, semType* wish) {
             reachable = false;
         }
     }
-    semType* ret = (block->tail_ ? expect(block->tail_, wish) : 
-                   (reachable ? semantic::makeUnit() : semantic::makeNever())); // as mentioned in spec, our wish can inflitrate into block's tail
+    semType* ret;
+    if (block->tail_) {
+        semType* tailType = expect(block->tail_, wish);
+        ret = reachable ? tailType : semantic::makeNever();
+    }
+    else {
+        ret = reachable ? semantic::makeUnit() : semantic::makeNever();
+    }
     if (wish != nullptr && !matches(ret, wish)) {
         error("blockExpr's tail_ has a different semType with our wish");
         scope_.levelDown();
