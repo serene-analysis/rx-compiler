@@ -98,9 +98,7 @@ std::any ASTVisitor::visitSelfParam(RxParser::SelfParamContext *ctx) {
     Param ret;
     ret.name_ = "self";
     ret.isSelf_ = true;
-    if(ctx->MUT()){
-        ret.isMut_ = true;
-    }
+    ret.isMut_ = (ctx->MUT() != nullptr);
     if(ctx->AMP()){
         auto ref = make<Type>();
         ref->kind_ = Type::kTypeKind::REF;

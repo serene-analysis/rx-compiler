@@ -184,8 +184,9 @@ item
 
 struct Param {
     std::string name_;
-    Type* type_;
-    bool isMut_, isSelf_;
+    Type* type_ = nullptr;
+    bool isMut_ = false;
+    bool isSelf_ = false;
 };
 
 struct funcItem : Item {
