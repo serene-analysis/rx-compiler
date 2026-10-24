@@ -1,0 +1,9 @@
+use rx::core::*;
+
+fn main() {
+    let x: bool = loop {
+        break return;
+    };
+    let y: i32 = x;
+    println_i32(y);
+}

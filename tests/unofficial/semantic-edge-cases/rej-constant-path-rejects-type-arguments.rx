@@ -1,0 +1,13 @@
+use rx::core::*;
+
+struct S {
+    x: i32,
+}
+
+impl S {
+    const N: usize = 2;
+}
+
+fn main() {
+    let x = S::<i32>::N;
+}

@@ -1,0 +1,11 @@
+use rx::core::*;
+
+struct S {
+    x: i32,
+}
+
+fn main() {
+    let mut s = S { x: 1 };
+    let r = &mut s;
+    let c = r.clone();
+}

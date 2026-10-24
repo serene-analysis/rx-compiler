@@ -38,7 +38,12 @@ private:
       auto mcal = make<methodCallExpr>();
       mcal->from_ = from;
       mcal->name_ = dot->pathExprSegment()->pathIdentSegment()->getText();
-      mcal->hasGenericArgs_ = (dot->pathExprSegment()->genericArgs() != nullptr);
+      mcal->hasGenericArgs_ = false;
+      if (auto genericArgs = dot->pathExprSegment()->genericArgs(); genericArgs) {
+        for (auto dw : genericArgs->genericArg()) {
+          mcal->hasGenericArgs_ |= (dw->typeRef() != nullptr);
+        }
+      }
       auto exprs = args->expression();
       for (auto expr : exprs) {
         mcal->args_.push_back(anyExpr(visit(expr)));

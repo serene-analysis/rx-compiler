@@ -1,0 +1,39 @@
+use rx::core::*;
+
+#[derive(Clone)]
+struct S {
+    x: i32,
+}
+
+struct Explicit {
+    x: i32,
+}
+
+impl Explicit {
+    fn clone(&self) -> i32 {
+        self.x
+    }
+}
+
+fn main() {
+    let mut x = 1;
+    let rx = &mut x;
+    let copied = rx.clone();
+    println_i32(copied);
+
+    let mut s = S { x: 5 };
+    let rs = &mut s;
+    println_i32(rs.clone().x);
+
+    let mut b = Box::<i32>::new(9);
+    let rb = &mut b;
+    let copied_b: Box<i32> = rb.clone();
+    println_i32(*copied_b);
+
+    let explicit = Box::<Explicit>::new(Explicit { x: 7 });
+    println_i32(explicit.clone());
+
+    let mut e = Explicit { x: 8 };
+    let re = &mut e;
+    println_i32(re.clone());
+}

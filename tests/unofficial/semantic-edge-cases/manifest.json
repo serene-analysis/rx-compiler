@@ -1,0 +1,80 @@
+[
+  {
+    "source": "acc-clone-through-mutable-references.rx",
+    "stage": "semantic",
+    "compilation_success": true,
+    "description": "Dot clone works through mutable references, Box containers, and explicit clone methods reached by dereference."
+  },
+  {
+    "source": "acc-box-mutable-reference-access.rx",
+    "stage": "semantic",
+    "compilation_success": true,
+    "description": "A mutable reference stored inside an immutable Box still grants mutable field and method access."
+  },
+  {
+    "source": "acc-loop-all-never-breaks-are-never.rx",
+    "stage": "semantic",
+    "compilation_success": true,
+    "description": "A loop whose break operands are all never has never type even under an expected type."
+  },
+  {
+    "source": "acc-method-lifetime-arguments.rx",
+    "stage": "semantic",
+    "compilation_success": true,
+    "description": "Lifetime arguments on a method segment are accepted."
+  },
+  {
+    "source": "acc-lifetime-type-arguments.rx",
+    "stage": "semantic",
+    "compilation_success": true,
+    "description": "Lifetime arguments on a struct type are accepted."
+  },
+  {
+    "source": "rej-ordering-does-not-dereference-box.rx",
+    "stage": "semantic",
+    "compilation_success": false,
+    "description": "Ordering comparisons do not automatically dereference Box."
+  },
+  {
+    "source": "rej-ordering-does-not-allow-nested-mutability-mismatch.rx",
+    "stage": "semantic",
+    "compilation_success": false,
+    "description": "Ordering comparisons require matching reference mutability at every layer."
+  },
+  {
+    "source": "rej-compound-assignment-rejects-mutable-reference-operand.rx",
+    "stage": "semantic",
+    "compilation_success": false,
+    "description": "Compound assignment accepts only a scalar or one shared-reference right operand."
+  },
+  {
+    "source": "rej-struct-expression-rejects-type-arguments.rx",
+    "stage": "semantic",
+    "compilation_success": false,
+    "description": "Struct expressions reject type arguments on the struct path."
+  },
+  {
+    "source": "rej-constant-path-rejects-type-arguments.rx",
+    "stage": "semantic",
+    "compilation_success": false,
+    "description": "Value paths reject type arguments on a user struct type segment."
+  },
+  {
+    "source": "rej-method-segment-rejects-type-arguments.rx",
+    "stage": "semantic",
+    "compilation_success": false,
+    "description": "Method segments reject type arguments."
+  },
+  {
+    "source": "rej-clone-of-non-clone-mutable-reference.rx",
+    "stage": "semantic",
+    "compilation_success": false,
+    "description": "A mutable reference to a non-Clone type cannot be cloned."
+  },
+  {
+    "source": "rej-main-with-lifetime-parameter.rx",
+    "stage": "semantic",
+    "compilation_success": false,
+    "description": "The main function cannot have lifetime generic parameters."
+  }
+]

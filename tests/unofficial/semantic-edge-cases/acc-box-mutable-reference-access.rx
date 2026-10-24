@@ -1,0 +1,24 @@
+use rx::core::*;
+
+struct S {
+    x: i32,
+}
+
+impl S {
+    fn set(&mut self, v: i32) {
+        self.x = v;
+    }
+}
+
+fn main() {
+    let b = Box::<&mut S>::new(&mut S { x: 0 });
+    b.x = 3;
+    b.set(5);
+    println_i32(b.x);
+
+    let mut v = Vec::<i32>::new();
+    let bv = Box::<&mut Vec<i32>>::new(&mut v);
+    bv.push(1);
+    bv[0] = 2;
+    println_i32(bv[0]);
+}

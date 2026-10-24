@@ -772,6 +772,14 @@ bool Checker::receiverMutable(Expr* expr) {
         }
         return isMutablyAccessible(expr);
     }
+    if (type->kind_ == semType::kTypeKind::BOX) {
+        if (type->elem_->kind_ == semType::kTypeKind::REF && type->elem_->isMut_) {
+            return isMutablyAccessible(expr);
+        }
+        else {
+            return isMutablePlaceable(expr);
+        }
+    }
     if (!isPlaceable(expr)) {
         return true;
     }
@@ -808,10 +816,18 @@ semType* Checker::infer(Expr* expr) {
     }
     if (auto path = dynamic_cast<pathExpr*>(expr); path) {
         if (path->path_.size() == 1) {
+            if (path->path_[0].types_.size() != 0) {
+                error("single word path should not have template types");
+                return semantic::makeError();
+            }
             std::string name = path->path_[0].name_;
             return lookupValue(name);
         }
         else if (path->path_.size() == 2) {
+            if (path->path_[0].types_.size() != 0 || path->path_[1].types_.size() != 0) { // pathExpr never ever allows template types
+                error("single word path should not have template typess");
+                return semantic::makeError();
+            }
             std::string callee = path->path_[0].name_, name = path->path_[1].name_;
             if (callee == "Self") {
                 if (currentStruct_ == "") {
@@ -1015,7 +1031,9 @@ semType* Checker::infer(Expr* expr) {
                 error("methodCallExpr called clone with no args");
                 return semantic::makeError();
             }
-            while (callee->kind_ == semType::kTypeKind::REF && !callee->isMut_) {
+            // 候选链先从 lhs 逐层解引用；先在当前可达类型上找 clone，
+            // 找不到再沿 Box/引用继续往内层找显式 clone。
+            while (callee->kind_ == semType::kTypeKind::REF) {
                 callee = callee->elem_;
             }
             bool explicitCloneable = (callee->kind_ == semType::kTypeKind::STRUCT && table_.methods[callee->name_].count("clone"));
@@ -1023,11 +1041,25 @@ semType* Checker::infer(Expr* expr) {
                 if (canClone(callee)) {
                     return callee;
                 }
-                if (lhs->kind_ == semType::kTypeKind::REF && !lhs->isMut_) {
-                    return lhs;
+                semType* probe = lhs;
+                while (probe->kind_ == semType::kTypeKind::REF || probe->kind_ == semType::kTypeKind::BOX) {
+                    probe = probe->elem_;
+                    if (probe->kind_ == semType::kTypeKind::STRUCT &&
+                        table_.methods[probe->name_].count("clone")) {
+                        explicitCloneable = true;
+                        break;
+                    }
+                    if (canClone(probe)) {
+                        return probe;
+                    }
                 }
-                error("methodCallExpr called clone implicitly but failed");
-                return semantic::makeError();
+                if (!explicitCloneable) {
+                    if (lhs->kind_ == semType::kTypeKind::REF && !lhs->isMut_) {
+                        return lhs;
+                    }
+                    error("methodCallExpr called clone implicitly but failed");
+                    return semantic::makeError();
+                }
             }
         }
         while (callee->kind_ == semType::kTypeKind::REF || callee->kind_ == semType::kTypeKind::BOX) {
@@ -1200,7 +1232,20 @@ semType* Checker::infer(Expr* expr) {
         if (!bre->tail_ && top.expected_ && !matches(semantic::makeUnit(), top.expected_)) {
             error("break without a value in a loop which expects one");
         }
-        semType* type = (bre->tail_ ? (top.expected_ != nullptr ? expect(bre->tail_, top.expected_) : infer(bre->tail_)) : semantic::makeUnit());
+        semType* type;
+        if (bre->tail_) {
+            semType* actual = infer(bre->tail_);
+            if (top.expected_ != nullptr) {
+                expect(bre->tail_, top.expected_);
+                type = isNever(actual) ? actual : top.expected_;
+            }
+            else {
+                type = actual;
+            }
+        }
+        else {
+            type = semantic::makeUnit();
+        }
         top.breaks_.push_back(type);
         return semantic::makeNever();
     }
@@ -1333,23 +1378,21 @@ semType* Checker::infer(Expr* expr) {
                 if (ltype->kind_ == semType::kTypeKind::ERROR || rtype->kind_ == semType::kTypeKind::ERROR) {
                     return semantic::makeError();
                 }
-                if (canImplicitlyTurn(rtype, ltype)) {
-                    rtype = ltype;
-                }
-                else {
-                    error("comparison rhs can't turn to lhs");
+                bool compatible = semantic::typeEqual(ltype, rtype) ||
+                    (ltype->kind_ == semType::kTypeKind::REF &&
+                     rtype->kind_ == semType::kTypeKind::REF &&
+                     !ltype->isMut_ && rtype->isMut_ &&
+                     semantic::typeEqual(ltype->elem_, rtype->elem_));
+                if (!compatible) {
+                    error("ordering operands have incompatible reference layers");
                     return semantic::makeError();
                 }
-                std::function<semType*(semType*)> eliminateAllRef = [&](semType* type) {
-                    if (type->kind_ == semType::kTypeKind::REF) {
-                        return eliminateAllRef(type->elem_);
-                    }
-                    else {
-                        return type;
-                    }
-                };
-                ltype = eliminateAllRef(ltype);
-                rtype = eliminateAllRef(rtype);
+                while (ltype->kind_ == semType::kTypeKind::REF) {
+                    ltype = ltype->elem_;
+                }
+                while (rtype->kind_ == semType::kTypeKind::REF) {
+                    rtype = rtype->elem_;
+                }
                 if (!isIntegerType(ltype) && !isBoolType(ltype)) {
                     error("arithequal lhs is neither an integer nor a boolean type");
                     return semantic::makeError();
@@ -1389,12 +1432,15 @@ semType* Checker::infer(Expr* expr) {
                 return semantic::makeError();
             }
             semType* ltype = infer(lhs);
+            semType* rtype = infer(rhs);
+            bool valid = true;
             if (inside(op, {"+=", "-=", "*=", "/=", "%="})) {
                 if (!isIntegerType(ltype)) {
                     error("arithequal lhs is not an integer type");
                     return semantic::makeError();
                 }
-                if (!semantic::typeEqual(ltype, digOneRef(infer(rhs)))) {
+                eliminateOneShared(rtype, valid);
+                if (!semantic::typeEqual(ltype, rtype)) {
                     error("arithequal lhs and rhs have different types");
                     return semantic::makeError();
                 }
@@ -1405,7 +1451,8 @@ semType* Checker::infer(Expr* expr) {
                     error("bitwiseequal lhs is neither an integer nor a boolean type");
                     return semantic::makeError();
                 }
-                if (!semantic::typeEqual(ltype, digOneRef(infer(rhs)))) {
+                eliminateOneShared(rtype, valid);
+                if (!semantic::typeEqual(ltype, rtype)) {
                     error("bitwiseequal lhs and rhs have different types");
                     return semantic::makeError();
                 }
@@ -1416,7 +1463,8 @@ semType* Checker::infer(Expr* expr) {
                     error("shiftequal lhs is not an integer type");
                     return semantic::makeError();
                 }
-                if (!isIntegerType(digOneRef(infer(rhs)))) {
+                eliminateOneShared(rtype, valid);
+                if (!isIntegerType(rtype)) {
                     error("shiftequal lhs and rhs have different types");
                     return semantic::makeError();
                 }
@@ -1453,6 +1501,10 @@ semType* Checker::infer(Expr* expr) {
         if (auto path = dynamic_cast<pathExpr*>(init->path_); path) {
             if (path->path_.size() != 1) {
                 error("structInitExpr path is not a type name");
+                return semantic::makeError();
+            }
+            if (path->path_[0].types_.size() != 0) {
+                error("structInitExpr path should not have template types");
                 return semantic::makeError();
             }
             std::string name = path->path_[0].name_;
@@ -1696,6 +1748,13 @@ semType* Checker::checkLoop(loopExpr* loop, semType* wish) {
     loopInfo info = loops_.back();
     loops_.pop_back();
     if (info.breaks_.empty()) {
+        return semantic::makeNever();
+    }
+    bool allNever = true;
+    for (auto bre : info.breaks_) {
+        allNever &= (bre->kind_ == semType::kTypeKind::NEVER);
+    }
+    if (allNever) {
         return semantic::makeNever();
     }
     if (wish != nullptr) {

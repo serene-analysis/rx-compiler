@@ -1,0 +1,14 @@
+use rx::core::*;
+
+struct View<'a> {
+    value: &'a i32,
+}
+
+fn read(view: View<'_>) -> i32 {
+    *view.value
+}
+
+fn main() {
+    let x = 3;
+    println_i32(read(View { value: &x }));
+}
