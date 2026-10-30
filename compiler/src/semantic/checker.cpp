@@ -800,7 +800,7 @@ void Checker::eliminateOneShared(semType*& type, bool& valid) {
     }
 }
 
-semType* Checker::infer(Expr* expr) {
+semType* Checker::inferImpl(Expr* expr) {
     if (auto lit = dynamic_cast<intLitExpr*>(expr); lit) {
         std::string suf = intSuffix(lit->value_);
         return suf.empty() ? semantic::makeBuiltin("i32") : semantic::makeBuiltin(suf);
@@ -1591,7 +1591,13 @@ semType* Checker::infer(Expr* expr) {
     return semantic::makeError();
 }
 
-semType* Checker::expect(Expr* expr, semType* wish) {
+semType* Checker::infer(Expr* expr) {
+    semType* type = inferImpl(expr);
+    exprType_[expr] = type ? type : semantic::makeError();
+    return type;
+}
+
+semType* Checker::expectImpl(Expr* expr, semType* wish) {
     if (wish == nullptr) {
         return infer(expr);
     }
@@ -1684,8 +1690,14 @@ semType* Checker::expect(Expr* expr, semType* wish) {
     return wish;
 }
 
+semType* Checker::expect(Expr* expr, semType* wish) {
+    semType* type = expectImpl(expr, wish);
+    exprType_[expr] = type ? type : semantic::makeError();
+    return type;
+}
+
 void Checker::checkItem(Item* item){
-    if (auto func= dynamic_cast<funcItem*>(item); func) {
+    if (auto func = dynamic_cast<funcItem*>(item); func) {
         checkFunction(func, "");
     }
     else if (auto impl = dynamic_cast<ImplItem*>(item); impl) {

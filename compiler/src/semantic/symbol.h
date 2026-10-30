@@ -64,17 +64,18 @@ struct stackShadowing {
     stackShadowing(std::string name, localShadowing shadow, int depth = 0) : name_(name), shadow_(shadow), depth_(depth) {}
 };
 
+template<typename L, typename T>
 struct scopeStack {
-    std::map<std::string, std::stack<localShadowing>> memory_;
-    std::stack<stackShadowing> stk_;
+    std::map<std::string, std::stack<L>> memory_;
+    std::stack<T> stk_;
     int currentDepth = 0;
     void levelUp() {
         currentDepth++;
         return;
     }
-    void push(std::string name, localShadowing shadow) {
+    void push(std::string name, L shadow) {
         memory_[name].push(shadow);
-        stk_.push(stackShadowing(name, shadow, currentDepth));
+        stk_.push(T(name, shadow, currentDepth));
         return;
     }
     void levelDown() {
@@ -85,7 +86,7 @@ struct scopeStack {
         currentDepth--;
         return;
     }
-    localShadowing* find(std::string name) {
+    L* find(std::string name) {
         auto dt = memory_.find(name);
         if (dt == memory_.end() || dt->second.empty()) {
             return nullptr;

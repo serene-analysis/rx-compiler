@@ -30,7 +30,9 @@ struct Checker {
     bool receiverMutable(Expr* expr);
     void eliminateOneShared(semType*& type, bool& valid);
     semType* lookupValue(std::string name);
+    semType* inferImpl(Expr* expr);
     semType* infer(Expr* expr);
+    semType* expectImpl(Expr* expr, semType* wish);
     semType* expect(Expr* expr, semType* wish);
     bool canCopy(semType* type);
     bool canClone(semType* type);
@@ -44,11 +46,14 @@ struct Checker {
     void error(std::string message);
 
     globalTable table_;
-    scopeStack scope_;
+    scopeStack<localShadowing, stackShadowing> scope_;
     enum kLayoutAndDeriveState { UNTOUCHED, CALCULATING, LAYOUTDONE, YES, NO };
     std::map<std::string, kLayoutAndDeriveState> state; // Note that this set the whole state initally aat UNTOUCHED
     std::vector<loopInfo> loops_;
     semType* currentRet_ = nullptr;
     std::string currentStruct_;
     bool reject_ = false;
+
+    // below is for IR
+    std::map<Expr*, semType*> exprType_;
 };

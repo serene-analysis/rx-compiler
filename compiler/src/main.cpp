@@ -11,6 +11,7 @@
 #include "ast/ast_dump.h"
 #include "frontend/ast_builder.h"
 #include "semantic/checker.h"
+#include "ir/generator.h"
 
 using namespace antlr4;
 
@@ -31,6 +32,7 @@ int main(int argc, char** argv) {
     bool dumpAst = false;
     std::string stage;
     std::string sourcePath;
+    std::string outputPath;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--dump-tree") {
@@ -39,12 +41,19 @@ int main(int argc, char** argv) {
             dumpAst = true;
         } else if (arg == "--stage" && i + 1 < argc) {
             stage = argv[++i];
+        } else if (arg == "-o" && i + 1 < argc) {
+            outputPath = argv[++i];
         } else {
             sourcePath = arg;
         }
     }
-    if (stage != "semantic" || sourcePath.empty()) {
-        std::cerr << "usage: rxcc --stage semantic [--dump-tree] [--dump-ast] <source.rx>\n";
+    if ((stage != "semantic" && stage != "ir") || sourcePath.empty()) {
+        std::cerr << "usage: rxcc --stage semantic|ir [--dump-tree] [--dump-ast] "
+                     "[-o output.ll] <source.rx>\n";
+        return 1;
+    }
+    if (stage == "ir" && outputPath.empty()) {
+        std::cerr << "rxcc --stage ir requires -o <output.ll>\n";
         return 1;
     }
 
@@ -86,8 +95,14 @@ int main(int argc, char** argv) {
 
         Checker checker;
         checker.checkCrate(crate);
-        return checker.reject_ ? 1 : 0;
+        if (checker.reject_) {
+            return 1;
+        }
 
+        if (stage == "ir") {
+            IRGenerator generator;
+            generator.generate(checker, crate, outputPath);
+        }
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "internal error: " << e.what() << "\n";
